@@ -517,7 +517,7 @@
       off += len;
       return el;
     }).join('');
-    return '<svg width="150" height="150" viewBox="0 0 150 150">' + circles +
+    return '<svg class="donut-svg" width="150" height="150" viewBox="0 0 150 150">' + circles +
       '<text x="75" y="82" text-anchor="middle" font-size="22" font-weight="800" fill="#1f2430">' +
       total + '</text></svg>';
   }
@@ -586,9 +586,29 @@
     var slaPct = closed30.length ? Math.round(100 * compliant.length / closed30.length) : null;
 
     function counter(label, n, danger, hash) {
-      return '<div class="card counter' + (danger ? ' danger' : '') + ' clickable" data-nav="' + hash + '">' +
+      return '<div class="card counter kpi' + (danger ? ' danger' : '') + ' clickable" data-nav="' + hash + '">' +
+        '<div class="kpi-accent"></div>' +
         '<div class="num">' + esc(String(n)) + '</div><div class="lbl">' + esc(label) + '</div></div>';
     }
+
+  /** gaugeCard(label, pct, danger, hash) — radial SLA gauge (presentational;
+   *  same data-nav click behavior as counter). */
+  function gaugeCard(label, pct, danger, hash) {
+    var r = 48, c = 2 * Math.PI * r;
+    var p = pct == null ? 0 : Math.max(0, Math.min(100, pct));
+    var off = c * (1 - p / 100);
+    var col = danger ? '#E60012' : '#1a7f4b';
+    var ring = '<svg class="gauge-svg" width="120" height="120" viewBox="0 0 120 120">' +
+      '<circle cx="60" cy="60" r="' + r + '" fill="none" stroke="#edf0f4" stroke-width="12"/>' +
+      '<circle class="gauge-ring" cx="60" cy="60" r="' + r + '" fill="none" stroke="' + col +
+      '" stroke-width="12" stroke-linecap="round" stroke-dasharray="' + c.toFixed(1) +
+      '" stroke-dashoffset="' + off.toFixed(1) + '" transform="rotate(-90 60 60)"/>' +
+      '<text x="60" y="68" text-anchor="middle" font-size="20" font-weight="800" fill="#1f2430">' +
+      (pct == null ? '—' : pct + '%') + '</text></svg>';
+    return '<div class="card counter kpi gauge-card' + (danger ? ' danger' : '') + ' clickable" data-nav="' + hash + '">' +
+      '<div class="kpi-accent"></div>' + ring +
+      '<div class="lbl">' + esc(label) + '</div></div>';
+  }
 
     /* Donut data */
     var byStatus = L.STATUSES.map(function (s) {
@@ -656,8 +676,7 @@
         counter(t('dash.myTickets'), mine.length, false, '#/tickets') +
         counter(t('dash.avgResponse'), avgRespHrs == null ? '—' : avgRespHrs.toFixed(1) + 'h', false, '#/tickets') +
         counter(t('dash.closed30'), closed30.length, false, '#/tickets') +
-        counter(t('dash.slaCompliance'), slaPct == null ? '—' : slaPct + '%',
-                slaPct != null && slaPct < 90, '#/tickets') +
+        gaugeCard(t('dash.slaCompliance'), slaPct, slaPct != null && slaPct < 90, '#/tickets') +
       '</div>' +
       '<div class="grid-2" style="margin-top:16px">' +
         donutCard(t('dash.byStatus'), byStatus) +
