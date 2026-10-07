@@ -41,6 +41,11 @@ const EXPECT_CAN = {
   'site.manage':           { admin:1, dispatcher:1, pm:1, engineer:0, customer:0 },
   'site.delete':           { admin:1, dispatcher:0, pm:0, engineer:0, customer:0 },
   'user.manage':           { admin:1, dispatcher:0, pm:0, engineer:0, customer:0 },
+  /* v2 additions */
+  'part.view':             { admin:1, dispatcher:1, pm:1, engineer:1, customer:0 },
+  'part.manage':           { admin:1, dispatcher:1, pm:0, engineer:0, customer:0 },
+  'plan.manage':           { admin:1, dispatcher:1, pm:0, engineer:0, customer:0 },
+  'contract.manage':       { admin:1, dispatcher:1, pm:0, engineer:0, customer:0 },
 };
 Object.keys(EXPECT_CAN).forEach(perm => {
   ROLES.forEach(role => {
@@ -79,13 +84,45 @@ arrEq('in_progress: eng not assignee', T('in_progress','engineer',{isAssignee:fa
 arrEq('in_progress: dispatcher',T('in_progress','dispatcher'),['resolved','assigned']);
 arrEq('in_progress: pm',        T('in_progress','pm'),        []);
 arrEq('in_progress: customer',  T('in_progress','customer'),  []);
-arrEq('resolved: admin',        T('resolved','admin'),        ['closed','in_progress']);
-arrEq('resolved: dispatcher',   T('resolved','dispatcher'),   ['closed','in_progress']);
-arrEq('resolved: pm in scope',  T('resolved','pm',{inScope:true}), ['closed']);
+arrEq('resolved: admin, customer ticket → no direct close',
+      T('resolved','admin',{source:'customer_feedback'}), ['pending_customer','in_progress']);
+arrEq('resolved: admin, internal ticket → direct close allowed',
+      T('resolved','admin',{source:'internal_discovery'}), ['pending_customer','in_progress','closed']);
+arrEq('resolved: admin, pm-logged ticket → direct close allowed',
+      T('resolved','admin',{source:'pm_logged'}), ['pending_customer','in_progress','closed']);
+arrEq('resolved: admin, no source → restrictive (no direct close)',
+      T('resolved','admin'), ['pending_customer','in_progress']);
+arrEq('resolved: dispatcher, internal ticket → direct close allowed',
+      T('resolved','dispatcher',{source:'internal_discovery'}), ['pending_customer','in_progress','closed']);
+arrEq('resolved: dispatcher, customer ticket → no direct close',
+      T('resolved','dispatcher',{source:'customer_feedback'}), ['pending_customer','in_progress']);
+arrEq('resolved: pm in scope, internal ticket → direct close',
+      T('resolved','pm',{inScope:true,source:'internal_discovery'}), ['closed']);
+arrEq('resolved: pm in scope, customer ticket → must confirm',
+      T('resolved','pm',{inScope:true,source:'customer_feedback'}), []);
 arrEq('resolved: pm NOT in scope', T('resolved','pm',{inScope:false}), []);
 arrEq('resolved: pm no ctx',    T('resolved','pm'),           []);
-arrEq('resolved: engineer assignee', T('resolved','engineer',{isAssignee:true}), []);
+arrEq('resolved: engineer assignee → request confirmation',
+      T('resolved','engineer',{isAssignee:true}), ['pending_customer']);
+arrEq('resolved: engineer assignee, internal → still no direct close',
+      T('resolved','engineer',{isAssignee:true,source:'internal_discovery'}), ['pending_customer']);
+arrEq('resolved: engineer NOT assignee', T('resolved','engineer',{isAssignee:false}), []);
 arrEq('resolved: customer',     T('resolved','customer'),     []);
+/* v2: pending_customer */
+arrEq('pending_customer: admin',     T('pending_customer','admin'),     ['closed','in_progress']);
+arrEq('pending_customer: dispatcher',T('pending_customer','dispatcher'),['closed','in_progress']);
+arrEq('pending_customer: pm in scope → closed',
+      T('pending_customer','pm',{inScope:true}), ['closed']);
+arrEq('pending_customer: pm NOT in scope',
+      T('pending_customer','pm',{inScope:false}), []);
+arrEq('pending_customer: engineer assignee → rework',
+      T('pending_customer','engineer',{isAssignee:true}), ['in_progress']);
+arrEq('pending_customer: engineer NOT assignee',
+      T('pending_customer','engineer',{isAssignee:false}), []);
+arrEq('pending_customer: customer creator → confirm close',
+      T('pending_customer','customer',{isCreator:true}), ['closed']);
+arrEq('pending_customer: customer NOT creator',
+      T('pending_customer','customer',{isCreator:false}), []);
 arrEq('closed: admin',          T('closed','admin'),          []);
 arrEq('closed: dispatcher',     T('closed','dispatcher'),     []);
 arrEq('closed: engineer',       T('closed','engineer'),       []);
@@ -100,8 +137,12 @@ ok('engineer cannot in_progress->assigned even as assignee',
    T('in_progress','engineer',{isAssignee:true}).indexOf('assigned') === -1);
 ok('engineer cannot resolved->in_progress even as assignee',
    T('resolved','engineer',{isAssignee:true}).indexOf('in_progress') === -1);
-// customer can never close own ticket even while open
+ok('engineer cannot close pending_customer even as assignee',
+   T('pending_customer','engineer',{isAssignee:true}).indexOf('closed') === -1);
+// customer can never close own ticket even while open — but CAN confirm pending_customer
 ok('customer cannot open->closed', T('open','customer',{isCreator:true}).indexOf('closed') === -1);
+ok('customer CAN pending_customer->closed on own ticket',
+   T('pending_customer','customer',{isCreator:true}).indexOf('closed') !== -1);
 
 /* ------------------------------------------------------------------ */
 /* 3. SLA — computation, states, escalation (contract §6)               */
@@ -228,14 +269,14 @@ ok('canPostInternal(null) → false', L.canPostInternal(null) === false);
 
 // transitionCtx
 const ctx = L.transitionCtx(t3, eng);
-eq('transitionCtx engineer assignee', ctx, { isAssignee:true, isCreator:false, inScope:false });
+eq('transitionCtx engineer assignee', ctx, { isAssignee:true, isCreator:false, inScope:false, source:null });
 const ctx2 = L.transitionCtx(t1, pmScope);
-eq('transitionCtx pm in scope', ctx2, { isAssignee:false, isCreator:false, inScope:true });
+eq('transitionCtx pm in scope', ctx2, { isAssignee:false, isCreator:false, inScope:true, source:null });
 const ctx3 = L.transitionCtx(t2, pmScope);
-eq('transitionCtx pm out of scope', ctx3, { isAssignee:false, isCreator:false, inScope:false });
+eq('transitionCtx pm out of scope', ctx3, { isAssignee:false, isCreator:false, inScope:false, source:null });
 const ctx4 = L.transitionCtx(t4, pmScope);
 eq('transitionCtx pm creator out-of-scope site → inScope false (scope is site-based)',
-   ctx4, { isAssignee:false, isCreator:true, inScope:false });
+   ctx4, { isAssignee:false, isCreator:true, inScope:false, source:null });
 
 /* ------------------------------------------------------------------ */
 /* 5. Display helpers                                                   */
@@ -250,7 +291,56 @@ eq('photoPath convention <ticket>/<uuid>-<sanitized>', pp, 'tid-123/fixed-uuid-M
 ok('photoPath default uid present', L.photoPath('t','f.png').indexOf('t/') === 0);
 
 /* ------------------------------------------------------------------ */
-/* 6. i18n parity — every key in en must exist in zh and vice versa     */
+/* 6. v2: isContractActive / applyContract / dayState                   */
+/* ------------------------------------------------------------------ */
+const C1 = { valid_from: '2026-01-01', valid_to: '2026-12-31',
+             response_hours: 2, onsite_enabled: true, onsite_hours: 24, resolve_hours: 48 };
+ok('contract active inside window', L.isContractActive(C1, '2026-10-07') === true);
+ok('contract inactive before valid_from', L.isContractActive(C1, '2025-12-31') === false);
+ok('contract inactive after valid_to', L.isContractActive(C1, '2027-01-01') === false);
+ok('contract active on boundary days',
+   L.isContractActive(C1, '2026-01-01') === true && L.isContractActive(C1, '2026-12-31') === true);
+ok('open-ended contract (null dates) is active',
+   L.isContractActive({ valid_from: null, valid_to: null }, '2026-10-07') === true);
+ok('null contract → false', L.isContractActive(null, '2026-10-07') === false);
+ok('contract active with only valid_from in the past',
+   L.isContractActive({ valid_from: '2020-01-01', valid_to: null }, '2026-10-07') === true);
+ok('contract inactive with only valid_to in the past',
+   L.isContractActive({ valid_from: null, valid_to: '2020-01-01' }, '2026-10-07') === false);
+ok('isContractActive defaults today to now (no throw)', typeof L.isContractActive(C1) === 'boolean');
+
+const ac = L.applyContract('2026-10-01T00:00:00Z', C1);
+eq('applyContract forces urgent + is_ltsa', { is_ltsa: ac.is_ltsa, priority: ac.priority },
+   { is_ltsa: true, priority: 'urgent' });
+eq('applyContract response = created + 2h', ac.sla_response_at, '2026-10-01T02:00:00.000Z');
+eq('applyContract onsite = created + 24h (enabled)', ac.sla_onsite_at, '2026-10-02T00:00:00.000Z');
+eq('applyContract resolve = created + 48h', ac.sla_resolve_at, '2026-10-03T00:00:00.000Z');
+const acNoOnsite = L.applyContract('2026-10-01T00:00:00Z',
+  Object.assign({}, C1, { onsite_enabled: false }));
+ok('applyContract onsite null when onsite not enabled', acNoOnsite.sla_onsite_at === null);
+ok('applyContract still urgent without onsite', acNoOnsite.priority === 'urgent');
+const acBad = L.applyContract('not-a-date', C1);
+ok('applyContract bad createdAt → null deadlines, still urgent',
+   acBad.sla_response_at === null && acBad.priority === 'urgent' && acBad.is_ltsa === true);
+const acNoC = L.applyContract('2026-10-01T00:00:00Z', null);
+ok('applyContract null contract → null deadlines', acNoC.sla_resolve_at === null);
+const acMissingHours = L.applyContract('2026-10-01T00:00:00Z', { onsite_enabled: true });
+ok('applyContract missing hours → null deadlines (no NaN)',
+   acMissingHours.sla_response_at === null && acMissingHours.sla_resolve_at === null);
+
+eq('dayState stored status wins (available)', L.dayState('available', '2026-10-10'), 'available');
+eq('dayState stored status wins (assigned)', L.dayState('assigned', '2026-10-07'), 'assigned');
+eq('dayState stored status wins (leave)', L.dayState('leave', '2026-10-07'), 'leave');
+eq('dayState Saturday → weekend', L.dayState(null, '2026-10-10'), 'weekend');   // 2026-10-10 is Saturday
+eq('dayState Sunday → weekend', L.dayState(undefined, '2026-10-11'), 'weekend'); // 2026-10-11 is Sunday
+eq('dayState Wednesday → remote', L.dayState(null, '2026-10-07'), 'remote');    // 2026-10-07 is Wednesday
+eq('dayState unknown status string → falls back to date rule',
+   L.dayState('bogus', '2026-10-07'), 'remote');
+eq('dayState null date → remote', L.dayState(null, null), 'remote');
+eq('dayState Date object works', L.dayState(null, new Date(2026, 9, 10)), 'weekend');
+
+/* ------------------------------------------------------------------ */
+/* 7. i18n parity — every key in en must exist in zh and vice versa     */
 /* ------------------------------------------------------------------ */
 (function i18nParity() {
   const src = fs.readFileSync(__dirname + '/i18n.js', 'utf8');

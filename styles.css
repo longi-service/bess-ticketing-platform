@@ -118,7 +118,7 @@ a:hover { color: var(--brand-red); }
 .field label .req { color: var(--brand-red); margin-left: 2px; }
 .field .hint { font-size: 12px; color: var(--text-muted); margin-top: 4px; }
 input[type="text"], input[type="email"], input[type="password"], input[type="tel"],
-input[type="number"], input[type="datetime-local"], select, textarea {
+input[type="number"], input[type="date"], input[type="datetime-local"], select, textarea {
   width: 100%; border: 1px solid var(--border-strong); border-radius: 6px;
   padding: 9px 11px; font-size: 14px; font-family: var(--font); background: #fff; color: var(--text);
 }
@@ -257,6 +257,74 @@ table.tbl { width: 100%; border-collapse: collapse; background: var(--surface); 
 
 /* ---------------- Misc ---------------- */
 .empty { color: var(--text-muted); text-align: center; padding: 30px 10px; font-size: 13px; }
+
+/* ---------------- v2: contract rail / badges / tree / planning / calendar ---------------- */
+.tbl tr.is-ltsa td:first-child { box-shadow: inset 3px 0 var(--brand-red); }
+.badge.status-pending_customer { background: #f3e8ff; color: #7e22ce; }
+.badge.cert-associate { background: #e8eefb; color: #2b4acb; }
+.badge.cert-professional { background: var(--brand-red-tint); color: var(--brand-red-dark); }
+.badge.contract-active { background: var(--ok-tint); color: var(--ok); }
+.badge.contract-expiring { background: var(--warn-tint); color: var(--warn); }
+.badge.contract-none { background: #eef1f4; color: var(--text-muted); }
+
+.tree-node {
+  display: flex; align-items: center; gap: 10px; padding: 9px 12px;
+  border-bottom: 1px solid var(--border);
+}
+.tree-node.clickable { cursor: pointer; }
+.tree-node.clickable:hover { background: #fafbfc; }
+.tree-node .tcode { font-weight: 700; white-space: nowrap; }
+.tree-node .tname { font-weight: 600; }
+.tree-node .grow { flex: 1; }
+
+tr.low-stock-amber td { background: #fffbeb; }
+tr.low-stock-red td { background: var(--brand-red-tint); }
+
+.donut-wrap { display: flex; gap: 18px; align-items: center; flex-wrap: wrap; }
+.donut-legend { font-size: 13px; min-width: 180px; }
+.donut-legend .li { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.donut-legend .sw { width: 12px; height: 12px; border-radius: 3px; display: inline-block; flex-shrink: 0; }
+.donut-legend .n { margin-left: auto; font-weight: 700; padding-left: 12px; }
+
+.kpi-rail { border-left: 3px solid var(--brand-red); padding-left: 14px; }
+
+.loadbar { height: 8px; background: #eef1f4; border-radius: 4px; overflow: hidden; min-width: 100px; }
+.loadbar > div { height: 100%; background: var(--brand-red); border-radius: 4px; }
+
+.plan-grid { border: 1px solid var(--border); border-radius: var(--radius); overflow: auto; }
+.plan-row { display: grid; }
+.plan-cell {
+  border-right: 1px solid var(--border); border-bottom: 1px solid var(--border);
+  padding: 6px; min-height: 46px; font-size: 12px;
+}
+.plan-head { background: #fafbfc; font-weight: 700; }
+.plan-eng { font-weight: 600; display: flex; flex-direction: column; gap: 4px; justify-content: center; }
+.cell-available { background: var(--ok-tint); }
+.cell-assigned { background: #e8eefb; }
+.cell-leave { background: var(--brand-red-tint); }
+.cell-weekend { background: #f4f5f7; color: var(--text-muted); }
+.plan-cell.clickable { cursor: pointer; }
+.plan-cell.clickable:hover { outline: 2px solid var(--brand-red); outline-offset: -2px; }
+
+.cal-grid {
+  display: grid; grid-template-columns: repeat(7, 1fr);
+  border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden;
+}
+.cal-dow { background: #fafbfc; font-weight: 700; font-size: 12px; padding: 8px; text-align: center; border-bottom: 1px solid var(--border); }
+.cal-day { min-height: 100px; border-bottom: 1px solid var(--border); border-right: 1px solid var(--border); padding: 6px; font-size: 12px; }
+.cal-day.other { background: #fafbfc; color: var(--text-muted); }
+.cal-day.today { outline: 2px solid var(--brand-red); outline-offset: -2px; }
+.cal-num { font-weight: 700; margin-bottom: 4px; }
+.cal-chip {
+  display: block; border-radius: 4px; padding: 2px 6px; margin-bottom: 3px; font-size: 11px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.cal-chip.shift-available { background: var(--ok-tint); color: var(--ok); }
+.cal-chip.shift-assigned { background: #e8eefb; color: #2b4acb; }
+.cal-chip.shift-leave { background: var(--brand-red-tint); color: var(--brand-red-dark); }
+.cal-chip.ticket { background: #eef1f4; color: var(--text); cursor: pointer; }
+.cal-chip.ticket:hover { color: var(--brand-red); }
+.cal-chip.ticket.is-ltsa { border-left: 3px solid var(--brand-red); }
 .inline-err {
   background: var(--brand-red-tint); border: 1px solid #f0c4c6; color: var(--brand-red-dark);
   border-radius: var(--radius); padding: 10px 14px; margin-bottom: 14px; font-size: 13px;

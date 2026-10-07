@@ -23,7 +23,7 @@
   /* Constants (mirror DATA_CONTRACT.md)                                 */
   /* ------------------------------------------------------------------ */
   var ROLES = ['admin', 'dispatcher', 'pm', 'engineer', 'customer'];
-  var STATUSES = ['open', 'assigned', 'in_progress', 'pending', 'resolved', 'closed'];
+  var STATUSES = ['open', 'assigned', 'in_progress', 'pending', 'pending_customer', 'resolved', 'closed'];
   var PRIORITIES = ['low', 'medium', 'high', 'urgent'];
   var SOURCES = ['customer_feedback', 'internal_discovery', 'pm_logged'];
   var LANGUAGES = ['en', 'zh'];
@@ -57,7 +57,12 @@
     'photo.upload':          ['admin', 'dispatcher', 'pm', 'engineer', 'customer'],
     'site.manage':           ['admin', 'dispatcher', 'pm'],
     'site.delete':           ['admin'],
-    'user.manage':           ['admin']
+    'user.manage':           ['admin'],
+    /* v2 additions */
+    'part.view':             ['admin', 'dispatcher', 'pm', 'engineer'],  // catalog/warehouse read
+    'part.manage':           ['admin', 'dispatcher'],                   // catalog/warehouse CRUD
+    'plan.manage':           ['admin', 'dispatcher'],                   // shift write
+    'contract.manage':       ['admin', 'dispatcher']                    // LTSA contract CRUD
   };
 
   /**
@@ -70,14 +75,15 @@
   }
 
   /* ------------------------------------------------------------------ */
-  /* Status transitions — DATA_CONTRACT.md §5                            */
+  /* Status transitions — DATA_CONTRACT.md §5 + v2 'pending_customer'      */
   /* ------------------------------------------------------------------ */
   var TRANSITIONS = {
-    open:        ['assigned', 'closed'],
-    assigned:    ['in_progress', 'open'],
-    in_progress: ['resolved', 'assigned'],
-    resolved:    ['closed', 'in_progress'],
-    closed:      []
+    open:             ['assigned', 'closed'],
+    assigned:         ['in_progress', 'open'],
+    in_progress:      ['resolved', 'assigned'],
+    resolved:         ['pending_customer', 'in_progress', 'closed'],
+    pending_customer: ['closed', 'in_progress'],
+    closed:           []
   };
 
   /**
@@ -85,12 +91,22 @@
    * user may move the ticket to. ctx: { isAssignee, isCreator, inScope }.
    * - assign / unassign / reopen / close      → dispatcher, admin
    * - accept (assigned→in_progress) / resolve → assigned engineer, or dispatcher/admin
-   * - pm may additionally close a *resolved* ticket inside their project scope
-   * - customers get no transitions at all
+   * - resolved → pending_customer ("request confirmation"): assigned
+   *   engineer, dispatcher, admin
+   * - resolved → closed (direct close): admin, dispatcher, pm (in scope) —
+   *   ONLY for internal tickets (source != 'customer_feedback'); customer
+   *   tickets must go through pending_customer
+   * - pending_customer → closed (customer confirms): customer (creator),
+   *   pm (in scope), dispatcher, admin
+   * - pending_customer → in_progress (rework): assigned engineer,
+   *   dispatcher, admin
+   * - customers get no transitions except closing their own
+   *   pending_customer ticket
    */
   function allowedTransitions(status, role, ctx) {
     ctx = ctx || {};
     var isAssignee = !!ctx.isAssignee;
+    var isCreator = !!ctx.isCreator;
     var inScope = !!ctx.inScope;
     var targets = TRANSITIONS[status] || [];
     return targets.filter(function (to) {
@@ -103,9 +119,20 @@
         case 'in_progress->resolved': return role === 'admin' || role === 'dispatcher' ||
                                              (role === 'engineer' && isAssignee);
         case 'in_progress->assigned': return role === 'admin' || role === 'dispatcher';
-        case 'resolved->closed':       return role === 'admin' || role === 'dispatcher' ||
-                                             (role === 'pm' && inScope);
+        case 'resolved->pending_customer': return role === 'admin' || role === 'dispatcher' ||
+                                             (role === 'engineer' && isAssignee);
         case 'resolved->in_progress': return role === 'admin' || role === 'dispatcher';
+        // v2: internal tickets (source != customer_feedback) may close directly;
+        // customer tickets MUST go through pending_customer. Missing source
+        // defaults to the restrictive side (no direct close).
+        case 'resolved->closed': return (role === 'admin' || role === 'dispatcher' ||
+                                             (role === 'pm' && inScope)) &&
+                                             (ctx.source || 'customer_feedback') !== 'customer_feedback';
+        case 'pending_customer->closed': return role === 'admin' || role === 'dispatcher' ||
+                                             (role === 'pm' && inScope) ||
+                                             (role === 'customer' && isCreator);
+        case 'pending_customer->in_progress': return role === 'admin' || role === 'dispatcher' ||
+                                             (role === 'engineer' && isAssignee);
         default: return false;
       }
     });
@@ -275,7 +302,7 @@
   }
 
   /**
-   * transitionCtx(ticket, user) → { isAssignee, isCreator, inScope } for
+   * transitionCtx(ticket, user) → { isAssignee, isCreator, inScope, source } for
    * allowedTransitions().
    */
   function transitionCtx(ticket, user) {
@@ -285,8 +312,84 @@
       isCreator:  !!(ticket && user && ticket.created_by === user.id),
       inScope:    !!(user && user.role === 'pm') &&
                   (scope.length === 0 ||
-                   (ticket && ticket.site_id != null && scope.indexOf(ticket.site_id) !== -1))
+                   (ticket && ticket.site_id != null && scope.indexOf(ticket.site_id) !== -1)),
+      source:     (ticket && ticket.source) || null
     };
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* v2: LTSA contracts & planning — pure helpers (DOM-free)              */
+  /* ------------------------------------------------------------------ */
+
+  /** dateOnlyStr(d) → 'YYYY-MM-DD' (UTC) or null for invalid input. */
+  function dateOnlyStr(d) {
+    if (!d) return null;
+    var dt = new Date(d);
+    if (isNaN(dt)) return null;
+    function p(n) { return String(n).padStart(2, '0'); }
+    return dt.getUTCFullYear() + '-' + p(dt.getUTCMonth() + 1) + '-' + p(dt.getUTCDate());
+  }
+
+  /**
+   * isContractActive(contract, today) → boolean.
+   * Contract-active rule: (valid_from IS NULL OR valid_from <= today) AND
+   * (valid_to IS NULL OR valid_to >= today). today defaults to now.
+   */
+  function isContractActive(contract, today) {
+    if (!contract) return false;
+    var t = dateOnlyStr(today === undefined ? new Date() : today);
+    if (!t) return false;
+    var from = contract.valid_from ? dateOnlyStr(contract.valid_from) : null;
+    var to = contract.valid_to ? dateOnlyStr(contract.valid_to) : null;
+    if (from && from > t) return false;
+    if (to && to < t) return false;
+    return true;
+  }
+
+  /**
+   * applyContract(ticketCreatedAt, contract) →
+   *   { is_ltsa, priority, sla_response_at, sla_onsite_at, sla_resolve_at }
+   * SLA deadlines from the contract's hour fields, based at ticket creation;
+   * the onsite deadline is null when onsite support is not enabled. Values
+   * are ISO strings (or null) ready for the tickets row.
+   */
+  function applyContract(ticketCreatedAt, contract) {
+    var out = { is_ltsa: true, priority: 'urgent',
+                sla_response_at: null, sla_onsite_at: null, sla_resolve_at: null };
+    var base = ticketCreatedAt ? new Date(ticketCreatedAt).getTime() : NaN;
+    if (isNaN(base) || !contract) return out;
+    function add(h) {
+      h = Number(h);
+      if (isNaN(h) || h < 0) return null;
+      return new Date(base + h * 3600 * 1000).toISOString();
+    }
+    out.sla_response_at = add(contract.response_hours);
+    out.sla_onsite_at = contract.onsite_enabled ? add(contract.onsite_hours) : null;
+    out.sla_resolve_at = add(contract.resolve_hours);
+    return out;
+  }
+
+  /**
+   * dayState(shiftStatus, date) →
+   *   'available' | 'assigned' | 'leave' | 'weekend' | 'remote'.
+   * A stored shift status wins; otherwise the day defaults to 'weekend' on
+   * Sat/Sun and 'remote' on weekdays. Pure (no DOM, no network).
+   */
+  function dayState(shiftStatus, date) {
+    if (shiftStatus === 'available' || shiftStatus === 'assigned' || shiftStatus === 'leave') {
+      return shiftStatus;
+    }
+    var dow = NaN;
+    if (typeof date === 'string') {
+      var m = date.match(/^(\d{4})-(\d{2})-(\d{2})/);
+      if (m) dow = new Date(Date.UTC(+m[1], +m[2] - 1, +m[3])).getUTCDay();
+    }
+    if (isNaN(dow)) {
+      var dt = new Date(date);
+      if (dt && !isNaN(dt)) dow = dt.getDay();
+    }
+    if (dow === 0 || dow === 6) return 'weekend';
+    return 'remote';
   }
 
   /* ------------------------------------------------------------------ */
@@ -337,6 +440,9 @@
     canUploadPhoto: canUploadPhoto,
     canPostInternal: canPostInternal,
     transitionCtx: transitionCtx,
+    isContractActive: isContractActive,
+    applyContract: applyContract,
+    dayState: dayState,
     formatTicketNo: formatTicketNo,
     sanitizeFileName: sanitizeFileName,
     photoPath: photoPath
