@@ -1,0 +1,8 @@
+<!-- Favicon for the internal BESS ticketing system.
+     Simplified brand mark: #E60012 rounded square + white "L".
+     Internal use only — LONGi company asset. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="#E60012"/>
+  <text x="32" y="44" text-anchor="middle" font-family="Arial, Helvetica, sans-serif"
+        font-size="36" font-weight="700" fill="#ffffff">L</text>
+</svg>
