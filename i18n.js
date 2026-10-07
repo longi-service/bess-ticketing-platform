@@ -261,7 +261,7 @@
     'sites.inUse': 'Cannot delete: {n} ticket(s) still reference this site.',
 
     /* v2: Spare parts */
-    'nav.parts': 'Parts',
+    'nav.parts': 'Spare Parts',
     'parts.title': 'Spare parts',
     'parts.catalog': 'Parts catalog',
     'parts.newPart': 'New part',
