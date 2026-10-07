@@ -351,12 +351,36 @@
           '<div class="form-actions"><button class="btn btn-primary" style="width:100%;justify-content:center" ' +
             'type="submit" id="login-btn">' + esc(t('auth.signIn')) + '</button></div>' +
         '</form>' +
+        '<div style="text-align:center;margin-top:10px">' +
+          '<a href="#" id="login-forgot" style="font-size:13px;color:var(--brand-red,#E60012)">' +
+            esc(t('auth.forgot')) + '</a>' +
+        '</div>' +
         '<div style="text-align:center;margin-top:14px">' +
           '<button class="lang-toggle" id="login-lang">' + (lang === 'en' ? '中文' : 'EN') + '</button>' +
         '</div>' +
       '</div></div>';
     document.getElementById('login-lang').onclick = function () {
       setLang(lang === 'en' ? 'zh' : 'en');
+    };
+    document.getElementById('login-forgot').onclick = async function (e) {
+      e.preventDefault();
+      var errEl = document.getElementById('login-error');
+      var email = document.getElementById('login-email').value.trim();
+      if (!email) {
+        errEl.textContent = t('auth.enterEmailFirst');
+        errEl.style.display = 'block';
+        return;
+      }
+      errEl.style.display = 'none';
+      try {
+        var redirectTo = window.location.origin + window.location.pathname;
+        var r = await sb.auth.resetPasswordForEmail(email, { redirectTo: redirectTo });
+        if (r.error) throw r.error;
+        toast(t('auth.resetSent'), 'ok');
+      } catch (err2) {
+        errEl.textContent = t('auth.resetFailed');
+        errEl.style.display = 'block';
+      }
     };
     if (KEY_MISSING || CDN_MISSING) return; // config banner only; no auth possible
     document.getElementById('login-form').onsubmit = async function (e) {
@@ -382,6 +406,51 @@
         afterSignIn(r.data.session.user).catch(function () {});
       }
     });
+  }
+
+  /* --------------------- set new password (recovery link) --------------------- */
+  function viewSetPassword() {
+    document.documentElement.lang = lang === 'zh' ? 'zh-CN' : 'en';
+    app.innerHTML =
+      '<div class="login-wrap"><div class="card login-card">' +
+        '<div class="login-logo"><img src="assets/longi-logo.svg" alt="LONGi"></div>' +
+        '<div class="login-tagline">' + esc(t('auth.tagline')) + '</div>' +
+        '<h1>' + esc(t('auth.recoveryTitle')) + '</h1>' +
+        '<form id="pw-form">' +
+          '<div class="field"><label>' + esc(t('auth.newPassword')) + '</label>' +
+            '<input type="password" id="pw-new" required autocomplete="new-password" minlength="6"></div>' +
+          '<div class="field"><label>' + esc(t('auth.confirmPassword')) + '</label>' +
+            '<input type="password" id="pw-confirm" required autocomplete="new-password" minlength="6"></div>' +
+          '<div class="field-error" id="pw-error" style="display:none"></div>' +
+          '<div class="form-actions"><button class="btn btn-primary" style="width:100%;justify-content:center" ' +
+            'type="submit" id="pw-btn">' + esc(t('auth.setPassword')) + '</button></div>' +
+        '</form>' +
+      '</div></div>';
+    document.getElementById('pw-form').onsubmit = async function (e) {
+      e.preventDefault();
+      var errEl = document.getElementById('pw-error');
+      var btn = document.getElementById('pw-btn');
+      var p1 = document.getElementById('pw-new').value;
+      var p2 = document.getElementById('pw-confirm').value;
+      errEl.style.display = 'none';
+      if (p1.length < 6) { errEl.textContent = t('auth.passwordTooShort'); errEl.style.display = 'block'; return; }
+      if (p1 !== p2) { errEl.textContent = t('auth.passwordMismatch'); errEl.style.display = 'block'; return; }
+      btn.disabled = true;
+      try {
+        var r = await sb.auth.updateUser({ password: p1 });
+        if (r.error) throw r.error;
+        // Drop the recovery token from the URL, then return to sign-in.
+        try { window.history.replaceState(null, '', window.location.pathname + window.location.search); } catch (e2) {}
+        await sb.auth.signOut();
+        state.user = null; state.profile = null; state.nameCache = {};
+        viewLogin();
+        toast(t('auth.passwordUpdated'), 'ok');
+      } catch (err) {
+        errEl.textContent = (err && err.message) ? err.message : t('auth.failed');
+        errEl.style.display = 'block';
+        btn.disabled = false;
+      }
+    };
   }
 
   /** Shared post-sign-in: profile load + is_active gate. */
@@ -1523,6 +1592,8 @@
   async function boot() {
     document.documentElement.lang = lang === 'zh' ? 'zh-CN' : 'en';
     if (KEY_MISSING || CDN_MISSING) { render(); return; }
+    // Password-recovery landing: Supabase redirects here with #type=recovery.
+    var isRecovery = window.location.hash.indexOf('type=recovery') !== -1;
     sb.auth.onAuthStateChange(function (event) {
       if (event === 'SIGNED_OUT' && state.profile) {
         state.user = null; state.profile = null; state.nameCache = {};
@@ -1532,6 +1603,7 @@
     try {
       var s = await sb.auth.getSession();
       if (s.data && s.data.session && s.data.session.user) {
+        if (isRecovery) { viewSetPassword(); return; }
         await afterSignIn(s.data.session.user);
         return; // afterSignIn navigates to dashboard
       }
