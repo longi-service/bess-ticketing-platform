@@ -419,6 +419,116 @@
   }
 
   /* ------------------------------------------------------------------ */
+  /* v4: scheduling — day-state resolution, regions, recommendations      */
+  /* ------------------------------------------------------------------ */
+
+  /**
+   * dowOf(dateStr) → 0-6 (Sunday=0) for 'YYYY-MM-DD', NaN when unparseable.
+   * Uses UTC so a pure date string never shifts across midnight locally.
+   */
+  function dowOf(dateStr) {
+    if (typeof dateStr !== 'string') return NaN;
+    var m = dateStr.match(/^(\d{4})-(\d{2})-(\d{2})/);
+    if (!m) return NaN;
+    return new Date(Date.UTC(+m[1], +m[2] - 1, +m[3])).getUTCDay();
+  }
+
+  /**
+   * resolveDayState(opts) → one of the 8 engineer-status definition keys:
+   *   'campo' | 'ferie' | 'malattia' | 'formazione' | 'trasferta' |
+   *   'festivo' | 'weekend' | 'remoto'.
+   * opts: { shiftStatus, dayPart, hasFieldTicket, holidayName, dateStr }.
+   * Precedence (first hit wins):
+   *   1. field activity — shift.status 'field', legacy 'assigned' booking
+   *      rows, or hasFieldTicket (shift carries site/ticket, or a ticket's
+   *      onsite range covers the day) → 'campo'
+   *   2. absence — vacation→ferie, sick→malattia, training→formazione,
+   *      travel→trasferta, legacy 'leave'→ferie
+   *   3. public holiday in the engineer's OWN country → 'festivo'
+   *   4. Saturday / Sunday → 'weekend'
+   *   5. default → 'remoto' (includes legacy 'available', 'remote', and
+   *      no shift row at all — "remote by default" scheduling assumption)
+   * Pure (no DOM, no network); the caller pre-resolves holidayName and
+   * hasFieldTicket from its own queries.
+   */
+  var ABSENCE_TO_DEF = {
+    vacation: 'ferie', sick: 'malattia', training: 'formazione',
+    travel: 'trasferta', leave: 'ferie'   // legacy 'leave' → ferie
+  };
+  function resolveDayState(opts) {
+    opts = opts || {};
+    var status = opts.shiftStatus;
+    if (status === 'field' || status === 'assigned' || opts.hasFieldTicket) return 'campo';
+    if (ABSENCE_TO_DEF[status]) return ABSENCE_TO_DEF[status];
+    if (opts.holidayName) return 'festivo';
+    var dow = dowOf(opts.dateStr);
+    if (dow === 0 || dow === 6) return 'weekend';
+    return 'remoto';
+  }
+
+  /**
+   * Region model for assignment recommendation (v4).
+   * Region set: DACH, South EU, West EU, North EU, East EU.
+   */
+  var REGION_SET = ['DACH', 'South EU', 'West EU', 'North EU', 'East EU'];
+  var COUNTRY_REGION = (function () {
+    var m = {};
+    function put(region, ccs) {
+      ccs.forEach(function (c) { m[c] = region; });
+    }
+    put('DACH',     ['DE', 'AT', 'CH']);
+    put('South EU', ['IT', 'ES', 'PT', 'GR', 'CY', 'MT']);
+    put('West EU',  ['FR', 'BE', 'NL', 'LU', 'IE', 'GB']);
+    put('North EU', ['SE', 'FI', 'DK', 'NO', 'IS', 'EE', 'LV', 'LT']);
+    put('East EU',  ['PL', 'CZ', 'SK', 'HU', 'RO', 'BG', 'HR', 'SI', 'RS']);
+    return m;
+  })();
+
+  /** regionOfCountry('de') → 'DACH'; unknown/empty → null. */
+  function regionOfCountry(cc) {
+    cc = String(cc || '').trim().toUpperCase();
+    return COUNTRY_REGION[cc] || null;
+  }
+
+  /**
+   * engineerRegions(eng) → array of region codes for an engineer profile.
+   * Uses eng.regions (v4) when non-empty; otherwise falls back to the
+   * region of eng.country_code || eng.country; [] when undeterminable.
+   */
+  function engineerRegions(eng) {
+    if (eng && Array.isArray(eng.regions) && eng.regions.length) {
+      return eng.regions.filter(function (r) { return REGION_SET.indexOf(r) !== -1; });
+    }
+    var c = regionOfCountry(eng && (eng.country_code || eng.country));
+    return c ? [c] : [];
+  }
+
+  /**
+   * rankEngineers(engineers, siteCountry) → [{ eng, regions, regionMatch }]
+   * sorted with region matches first (site region derived from the site's
+   * country), then by display_name. This is a REAL ranking used by the
+   * assignment UIs — not decorative.
+   */
+  function rankEngineers(engineers, siteCountry) {
+    var siteRegion = regionOfCountry(siteCountry);
+    return (engineers || []).map(function (e) {
+      var regs = engineerRegions(e);
+      return {
+        eng: e,
+        regions: regs,
+        regionMatch: !!(siteRegion && regs.indexOf(siteRegion) !== -1)
+      };
+    }).sort(function (a, b) {
+      if (a.regionMatch !== b.regionMatch) return a.regionMatch ? -1 : 1;
+      var an = String(a.eng.display_name || a.eng.email || '').toLowerCase();
+      var bn = String(b.eng.display_name || b.eng.email || '').toLowerCase();
+      if (an < bn) return -1;
+      if (an > bn) return 1;
+      return 0;
+    });
+  }
+
+  /* ------------------------------------------------------------------ */
   /* Display helpers                                                     */
   /* ------------------------------------------------------------------ */
 
@@ -470,6 +580,13 @@
     isContractActive: isContractActive,
     applyContract: applyContract,
     dayState: dayState,
+    resolveDayState: resolveDayState,
+    ABSENCE_TO_DEF: ABSENCE_TO_DEF,
+    REGION_SET: REGION_SET,
+    COUNTRY_REGION: COUNTRY_REGION,
+    regionOfCountry: regionOfCountry,
+    engineerRegions: engineerRegions,
+    rankEngineers: rankEngineers,
     formatTicketNo: formatTicketNo,
     sanitizeFileName: sanitizeFileName,
     photoPath: photoPath

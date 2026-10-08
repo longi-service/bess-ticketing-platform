@@ -68,12 +68,129 @@
     contracts: {},     // v2: site_id -> ltsa_contracts row
     v3: false,         // v3: true once migration_v3 tables are detected
     customers: [],     // v3: customer companies
+    v4: false,         // v4: true once migration_v4 tables are detected
+    statusDefs: [],    // v4: engineer_status_definitions rows (sort_order)
+    statusDefMap: {},  // v4: status key -> definition row
+    dutyDefs: [],      // v4: duty_type_definitions rows (sort_order)
+    dutyDefMap: {},    // v4: duty key -> definition row
     nameCache: {},       // profile id -> display name (best effort)
     listFilters: { status: '', priority: '', source: '', site: '', assignee: '', q: '', tag: '', customer: '',
                  unassignedOnly: false, contractOnly: false }, // v3 U6: quick filters
     listPage: 0,           // v3 D7: pagination cursor (page index), reset on filter change
     siteSearch: ''       // v2: sites tree search text
   };
+
+  /* ================= v4: table-driven status/duty definitions ============= */
+  /* Fallback definitions — exact colors from migration_v4, used when the
+     definition tables are unavailable (!state.v4). Labels come from i18n. */
+  var STATUS_DEFS_FALLBACK = [
+    { key: 'campo',      bg_color: '#fee2e2', text_color: '#b91c1c', sort_order: 1 },
+    { key: 'ferie',      bg_color: '#dbeafe', text_color: '#1d4ed8', sort_order: 2 },
+    { key: 'malattia',   bg_color: '#f1f5f9', text_color: '#475569', sort_order: 3 },
+    { key: 'formazione',  bg_color: '#ede9fe', text_color: '#6d28d9', sort_order: 4 },
+    { key: 'trasferta',   bg_color: '#ffedd5', text_color: '#9a3412', sort_order: 5 },
+    { key: 'festivo',    bg_color: '#fef3c7', text_color: '#92400e', sort_order: 6 },
+    { key: 'weekend',    bg_color: '#f8fafc', text_color: '#94a3b8', sort_order: 7 },
+    { key: 'remoto',     bg_color: '#dcfce7', text_color: '#15803d', sort_order: 8 }
+  ];
+  var DUTY_DEFS_FALLBACK = [
+    { key: 'remote_call',  bg_color: '#dcfce7', text_color: '#15803d', icon: 'message', sort_order: 1 },
+    { key: 'phone_oncall', bg_color: '#dbeafe', text_color: '#1d4ed8', icon: 'phone',   sort_order: 2 },
+    { key: 'field_oncall', bg_color: '#ffedd5', text_color: '#9a3412', icon: 'tool',    sort_order: 3 }
+  ];
+  var STATUS_FALLBACK_MAP = {}, DUTY_FALLBACK_MAP = {};
+  STATUS_DEFS_FALLBACK.forEach(function (d) { STATUS_FALLBACK_MAP[d.key] = d; });
+  DUTY_DEFS_FALLBACK.forEach(function (d) { DUTY_FALLBACK_MAP[d.key] = d; });
+
+  /** statusDef(key) → definition row or gray fallback. dutyDef(key) likewise. */
+  function statusDef(key) {
+    return state.statusDefMap[key] || STATUS_FALLBACK_MAP[key] ||
+      { key: key, bg_color: '#f1f5f9', text_color: '#64748b' };
+  }
+  function dutyDef(key) {
+    return state.dutyDefMap[key] || DUTY_FALLBACK_MAP[key] ||
+      { key: key, bg_color: '#f1f5f9', text_color: '#64748b', icon: 'phone' };
+  }
+  function statusDefs() {
+    return state.statusDefs.length ? state.statusDefs : STATUS_DEFS_FALLBACK;
+  }
+  function dutyDefs() {
+    return state.dutyDefs.length ? state.dutyDefs : DUTY_DEFS_FALLBACK;
+  }
+  /** statusLabel(key): live DB label when v4, else the i18n fallback. */
+  function statusLabel(key) {
+    var d = state.statusDefMap[key];
+    if (d) return lang === 'zh' ? (d.label_zh || d.label_en || key) : (d.label_en || d.label_zh || key);
+    return t('plan.status.' + key);
+  }
+  function dutyLabel(key) {
+    var d = state.dutyDefMap[key];
+    if (d) return lang === 'zh' ? (d.label_zh || d.label_en || key) : (d.label_en || d.label_zh || key);
+    return t('plan.duty.' + key);
+  }
+  /** statusBadge(key, extra) — tinted badge rendered from the definition colors. */
+  function statusBadge(key, extra) {
+    var d = statusDef(key);
+    return '<span class="badge"' + (extra ? ' ' + extra : '') +
+      ' style="background:' + d.bg_color + ';color:' + d.text_color + '">' +
+      esc(statusLabel(key)) + '</span>';
+  }
+  /** dutyBadgeHtml(key) — duty badge with its SVG icon, def-driven colors. */
+  function dutyBadgeHtml(key) {
+    var d = dutyDef(key);
+    return '<span class="duty-badge" style="background:' + d.bg_color + ';color:' + d.text_color + '">' +
+      icon(d.icon || 'phone', 11) + '<span>' + esc(dutyLabel(key)) + '</span></span>';
+  }
+  /** dayPartLabel('am') → i18n label. */
+  function dayPartLabel(dp) {
+    return t('plan.dayPart.' + (dp === 'am' || dp === 'pm' ? dp : 'full'));
+  }
+  /** absenceDefKey('vacation') → 'ferie' (DB shift status → definition key). */
+  function absenceDefKey(s) {
+    return (L.ABSENCE_TO_DEF[s] || 'ferie');
+  }
+  /** regionName('South EU') → i18n label. */
+  var REGION_I18N = { 'DACH': 'region.dach', 'South EU': 'region.south_eu',
+    'West EU': 'region.west_eu', 'North EU': 'region.north_eu', 'East EU': 'region.east_eu' };
+  function regionName(r) {
+    return REGION_I18N[r] ? t(REGION_I18N[r]) : r;
+  }
+  /** dutyKeyValid(key) — app-side validation of duty_type (the DB no longer
+      constrains it; the app validates against the loaded definitions). */
+  function dutyKeyValid(key) {
+    if (!key) return false;
+    if (state.dutyDefMap[key]) return true;
+    return DUTY_FALLBACK_MAP[key] != null;
+  }
+
+  /* ================= v4: inline SVG icon set (no new CDN) ================= */
+  /* Replaces emoji in duty badges, holiday markers and note markers so the
+     scheduling UI renders identically on every platform. */
+  var ICON_PATHS = {
+    message: '<path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/>',
+    phone: '<path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.13.96.36 1.9.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.91.34 1.85.57 2.81.7A2 2 0 0 1 22 16.92z"/>',
+    tool: '<path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>',
+    star: '<path d="M12 2l2.9 6.26 6.6 1.04-4.75 4.87L17.8 21 12 17.77 6.2 21l1.05-6.83L2.5 9.3l6.6-1.04L12 2z"/>',
+    pencil: '<path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/>',
+    check: '<path d="M20 6L9 17l-5-5"/>',
+    alert: '<path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>',
+    laptop: '<rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/>',
+    lock: '<rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
+    camera: '<path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/>',
+    printer: '<path d="M6 9V2h12v7"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/>'
+  };
+  /**
+   * icon(name, size) → inline SVG string. Star is filled; the rest are
+   * stroke-based (currentColor) so they inherit the badge/text color.
+   */
+  function icon(name, size) {
+    var s = size || 12;
+    var p = ICON_PATHS[name] || ICON_PATHS.phone;
+    var fill = name === 'star' ? ' fill="currentColor" stroke="none"'
+                               : ' fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"';
+    return '<svg width="' + s + '" height="' + s + '" viewBox="0 0 24 24"' + fill +
+      ' aria-hidden="true">' + p + '</svg>';
+  }
 
   /* ------------------------------ helpers ------------------------------ */
   function esc(s) {
@@ -198,6 +315,32 @@
         var cu = await sb.from('customers').select('*').order('company_name');
         if (!cu.error) state.customers = cu.data || [];
       } catch (e) {}
+    }
+    // v4: feature probe — engineer_status_definitions exists only after
+    // migration_v4. When present, load both definition tables; the app
+    // renders ALL status/duty colors and labels from them (table-driven,
+    // zero code change to add a new status). Otherwise the hardcoded
+    // fallback defs below are used (same colors, i18n labels).
+    state.v4 = false;
+    state.statusDefs = []; state.statusDefMap = {};
+    state.dutyDefs = []; state.dutyDefMap = {};
+    try {
+      var v4p = await sb.from('engineer_status_definitions').select('id', { count: 'exact', head: true });
+      state.v4 = !v4p.error;
+    } catch (e) { state.v4 = false; }
+    if (state.v4) {
+      try {
+        var sdr = await sb.from('engineer_status_definitions').select('*').order('sort_order');
+        var ddr = await sb.from('duty_type_definitions').select('*').order('sort_order');
+        if (!sdr.error) {
+          state.statusDefs = sdr.data || [];
+          state.statusDefs.forEach(function (d) { state.statusDefMap[d.key] = d; });
+        }
+        if (!ddr.error) {
+          state.dutyDefs = ddr.data || [];
+          state.dutyDefs.forEach(function (d) { state.dutyDefMap[d.key] = d; });
+        }
+      } catch (e) { /* defs stay empty → helpers fall back to hardcoded */ }
     }
   }
 
@@ -753,7 +896,7 @@
       return '<tr><td><b>' + esc(w.eng.display_name || w.eng.email) + '</b></td>' +
         '<td><div style="display:flex;align-items:center;gap:8px"><div class="loadbar"><div style="width:' +
         pct + '%"></div></div><b>' + w.open + '</b></div></td>' +
-        '<td>' + (w.contract ? badge('escalated', String(w.contract)) : '<span class="muted">0</span>') + '</td>' +
+        '<td>' + (w.contract ? badge('contract', String(w.contract)) : '<span class="muted">0</span>') + '</td>' +
         '<td>' + (w.breached ? badge('sla-breached', String(w.breached)) : '<span class="muted">0</span>') + '</td></tr>';
     }).join('');
 
@@ -1336,9 +1479,10 @@
     /* ----- header ----- */
     var html =
       '<button class="btn btn-sm" id="back-btn" style="margin-bottom:12px">← ' + esc(t('detail.backToList')) + '</button>' +
-      /* v3 F9: printable service report — staff only */
+      /* v4: print icon is inline SVG (no emoji). */
       (!isCustomer
-        ? ' <button class="btn btn-sm" id="print-report-btn" style="margin-bottom:12px">🖨 ' +
+        ? ' <button class="btn btn-sm" id="print-report-btn" style="margin-bottom:12px">' +
+          '<span class="note-ic">' + icon('printer', 12) + '</span> ' +
           esc(t('detail.printReport')) + '</button>'
         : '') +
       '<div class="detail-head"><span class="tnum">' + esc(L.formatTicketNo(ticket.ticket_no)) + '</span>' +
@@ -1604,7 +1748,8 @@
     var box = document.getElementById('assign-box');
     var res;
     try {
-      res = await sb.from('profiles').select('id,display_name,email')
+      /* v4: extra columns feed the assignment recommendation. */
+      res = await sb.from('profiles').select('id,display_name,email,country,country_code,regions,skills,remote_capable')
         .eq('role', 'engineer').eq('is_active', true).order('display_name');
     } catch (e) { res = { error: e }; }
     if (res.error) {
@@ -1613,27 +1758,28 @@
     }
     var engs = res.data || [];
     engs.forEach(function (e) { state.nameCache[e.id] = e.display_name || e.email; });
+    /* v4: REAL ranking — region match first, then name (L.rankEngineers). */
+    var site = (state.sites || []).filter(function (x) { return x.id === ticket.site_id; })[0] || {};
+    var siteRegion = L.regionOfCountry(site.country);
+    var ranked = L.rankEngineers(engs, site.country);
     box.innerHTML =
       '<dl class="kv" style="margin-bottom:12px">' +
         '<dt>' + esc(t('detail.assignee')) + '</dt><dd>' + esc(displayName(ticket.assigned_to)) + '</dd>' +
         '<dt>' + esc(t('detail.plannedCheckAt')) + '</dt><dd>' + esc(fmtDate(ticket.planned_check_at)) + '</dd>' +
       '</dl>' +
-      '<div class="assign-row"><div class="field"><label>' + esc(t('detail.assignee')) + '</label>' +
-        '<select id="assign-eng"><option value="">' + esc(t('common.select')) + '</option>' +
-        engs.map(function (e) {
-          return '<option value="' + e.id + '"' + (ticket.assigned_to === e.id ? ' selected' : '') + '>' +
-            esc(e.display_name || e.email) + '</option>';
-        }).join('') + '</select></div>' +
+      '<div class="field"><label>' + esc(t('assign.ranked')) +
+        (siteRegion ? ' <span class="muted">· ' + esc(t('assign.siteRegion')) + ': ' +
+          esc(regionName(siteRegion)) + '</span>' : '') + '</label>' +
+        candidateListHtml(ranked, ticket.assigned_to, 'assign-eng') + '</div>' +
       '<div class="field"><label>' + esc(t('detail.plannedCheckAt')) + '</label>' +
         '<input type="datetime-local" id="assign-planned" value="' + fmtInputDateTime(ticket.planned_check_at) + '"></div>' +
-      '</div>' +
       '<div class="form-actions">' +
         '<button class="btn btn-primary btn-sm" id="assign-btn">' +
           esc(ticket.assigned_to ? t('detail.reassign') : t('detail.assign')) + '</button>' +
         (ticket.assigned_to ? '<button class="btn btn-sm" id="unassign-btn">' + esc(t('detail.unassign')) + '</button>' : '') +
       '</div>';
     document.getElementById('assign-btn').onclick = async function () {
-      var engId = document.getElementById('assign-eng').value;
+      var engId = candidateValue('assign-eng');
       if (!engId) { toast(t('users.pickEngineer'), 'error'); return; }
       var planned = document.getElementById('assign-planned').value;
       var btn = this; btn.disabled = true;
@@ -1724,9 +1870,15 @@
   /* v3 U7: icon timeline — each event kind gets its own icon dot + color,
      so status changes, assignments, part issues and notes are instantly
      distinguishable (matters for LTSA penalty disputes). */
+  /* v3 U7: icon timeline — each event kind gets its own icon dot + color,
+     so status changes, assignments, part issues and notes are instantly
+     distinguishable (matters for LTSA penalty disputes).
+     v4: the emoji entries are inline SVG (same icon set as the duty badges);
+     the plain glyphs stay as text. */
   var TL_ICONS = {
     created: '＋', responded: '↗', visited: '⚒', escalated: '⚠',
-    resolved: '✓', closed: '■', comment: '💬', internal: '🔒', photo: '📷'
+    resolved: '✓', closed: '■',
+    comment: icon('message', 12), internal: icon('lock', 12), photo: icon('camera', 12)
   };
   function renderTimeline(ticket, comments, photos) {
     var el = document.getElementById('timeline');
@@ -1954,6 +2106,33 @@
     return close;
   }
 
+  /* v4: ranked engineer candidate list — the assignment recommendation,
+     made REAL: region matches first (site region from site.country), then
+     name. Each candidate shows a region-match badge, skills text and a
+     remote-capable icon. Used by the ticket assign box and the booking flow. */
+  function candidateListHtml(ranked, selectedId, inputName) {
+    return '<div class="cand-list" role="radiogroup" aria-label="' + esc(t('assign.ranked')) + '">' +
+      ranked.map(function (r, i) {
+        var e = r.eng;
+        var checked = (selectedId && e.id === selectedId) || (!selectedId && i === 0);
+        var rc = e.remote_capable !== false;
+        var regs = r.regions.length ? r.regions.map(regionName).join(', ') : '—';
+        return '<label class="cand"><input type="radio" name="' + inputName + '" value="' + e.id + '"' +
+          (checked ? ' checked' : '') + '>' +
+          '<span class="cand-name">' + esc(e.display_name || e.email) + '</span>' +
+          '<span class="region-badge ' + (r.regionMatch ? 'match' : 'nomatch') + '" title="' +
+            esc(t('assign.region') + ': ' + regs) + '">' +
+            (r.regionMatch ? '✓ ' + esc(t('assign.regionMatch')) : esc(regs)) + '</span>' +
+          (e.skills ? '<span class="cand-skills">' + esc(e.skills) + '</span>' : '') +
+          '<span class="cand-remote' + (rc ? '' : ' off') + '" title="' +
+            esc(rc ? t('assign.remoteCapable') : t('assign.noRemoteCapable')) + '">' +
+            icon('laptop', 14) + '</span></label>';
+      }).join('') + '</div>';
+  }
+  function candidateValue(inputName) {
+    var el = document.querySelector('input[name="' + inputName + '"]:checked');
+    return el ? el.value : null;
+  }
   /* ------------------------- modals: edit ticket ------------------------ */
 
   /* v3 I2: field-activity dates + "book resource" with conflict warnings.
@@ -1994,17 +2173,24 @@
       toast(t('detail.bookNeedsDates'), 'error');
       return;
     }
-    var er = await sb.from('profiles').select('id,display_name,email,country')
+    /* v4: booking requires an assigned engineer first. */
+    if (!ticket.assigned_to) {
+      toast(t('detail.bookNeedsAssignee'), 'error');
+      return;
+    }
+    var er = await sb.from('profiles').select('id,display_name,email,country,country_code,regions,skills,remote_capable')
       .eq('role', 'engineer').eq('is_active', true).order('display_name');
     if (er.error) { apiError(er.error); return; }
     var engineers = er.data || [];
+    /* v4: rank engineers by region match (REAL ranking, not decorative). */
+    var bSite = (state.sites || []).filter(function (x) { return x.id === ticket.site_id; })[0] || {};
+    var bSiteRegion = L.regionOfCountry(bSite.country);
+    var bRanked = L.rankEngineers(engineers, bSite.country);
     var body =
-      '<div class="field"><label>' + esc(t('detail.bookEngineer')) + '</label>' +
-        '<select id="bk-eng">' + engineers.map(function (e) {
-          return '<option value="' + e.id + '"' +
-            (ticket.assigned_to === e.id ? ' selected' : '') + '>' +
-            esc(e.display_name || e.email) + '</option>';
-        }).join('') + '</select></div>' +
+      '<div class="field"><label>' + esc(t('assign.ranked')) +
+        (bSiteRegion ? ' <span class="muted">· ' + esc(t('assign.siteRegion')) + ': ' +
+          esc(regionName(bSiteRegion)) + '</span>' : '') + '</label>' +
+        candidateListHtml(bRanked, ticket.assigned_to, 'bk-eng') + '</div>' +
       '<div class="muted">' + esc(t('detail.bookRange')
         .replace('{from}', fmtDate(ticket.onsite_from)).replace('{to}', fmtDate(ticket.onsite_to))) + '</div>' +
       '<div id="bk-warnings" style="margin-top:10px"></div>';
@@ -2015,23 +2201,27 @@
     document.getElementById('m-cancel').onclick = close;
     var lastCheck = null;
     async function check() {
-      var engId = document.getElementById('bk-eng').value;
+      var engId = candidateValue('bk-eng');
       var box = document.getElementById('bk-warnings');
       box.innerHTML = '<div class="empty">' + esc(t('common.loading')) + '</div>';
       var warnings = [];
       try {
         var days = eachDay(ticket.onsite_from, ticket.onsite_to);
-        // 1) existing shifts (leave / other assignments)
-        var sr = await sb.from('shifts').select('day,status').eq('engineer_id', engId)
+        /* v4: conflicts cover the new absence types (vacation/sick/training/
+           travel) plus legacy leave, other assignments, holidays and weekends. */
+        var sr = await sb.from('shifts').select('day,status,day_part').eq('engineer_id', engId)
           .gte('day', ticket.onsite_from).lte('day', ticket.onsite_to);
         (sr.error ? [] : (sr.data || [])).forEach(function (s) {
-          if (s.status === 'leave') warnings.push({ day: s.day, kind: 'leave' });
-          else if (s.status === 'assigned') warnings.push({ day: s.day, kind: 'busy' });
+          if (L.ABSENCE_TO_DEF[s.status]) {
+            warnings.push({ day: s.day, kind: 'absence', status: s.status, dayPart: s.day_part });
+          } else if (s.status === 'assigned' || s.status === 'field') {
+            warnings.push({ day: s.day, kind: 'busy' });
+          }
         });
         // 2) holidays in the engineer's country
         var eng = engineers.filter(function (e) { return e.id === engId; })[0] || {};
-        var cc = (eng.country || '').toUpperCase();
-        if (cc) {
+        var cc = ((eng.country_code || eng.country) || '').toUpperCase();
+        if (cc && state.v3) {
           var hr = await sb.from('holidays').select('day,name').eq('country_code', cc)
             .gte('day', ticket.onsite_from).lte('day', ticket.onsite_to);
           (hr.error ? [] : (hr.data || [])).forEach(function (h) {
@@ -2044,14 +2234,21 @@
           if (dw === 0 || dw === 6) warnings.push({ day: d, kind: 'weekend' });
         });
         lastCheck = { engId: engId, days: days, warnings: warnings };
+        /* v4: amber info-box naming the engineer + dates — warn, don't block. */
         box.innerHTML = warnings.length
-          ? '<div class="inline-err">' + warnings.map(function (w) {
-              var lbl = w.kind === 'leave' ? t('detail.warn.leave')
-                      : w.kind === 'busy' ? t('detail.warn.busy')
-                      : w.kind === 'holiday' ? t('detail.warn.holiday').replace('{name}', w.name || '')
-                      : t('detail.warn.weekend');
-              return esc(w.day + ' — ' + lbl);
-            }).join('<br>') + '</div>'
+          ? '<div class="inline-warn"><div class="warn-head">' + icon('alert', 14) +
+            esc(t('detail.warn.conflictTitle')
+              .replace('{name}', eng.display_name || eng.email || '')) + '</div>' +
+            warnings.map(function (w) {
+              var lbl = w.kind === 'absence'
+                ? statusLabel(absenceDefKey(w.status)) +
+                  (w.dayPart && w.dayPart !== 'full' ? ' · ' + dayPartLabel(w.dayPart) : '')
+                : w.kind === 'busy' ? t('detail.warn.busy')
+                : w.kind === 'holiday' ? t('detail.warn.holiday').replace('{name}', w.name || '')
+                : t('detail.warn.weekend');
+              return '<div>' + esc(w.day) + ' — ' + esc(lbl) + '</div>';
+            }).join('') +
+            '<div class="warn-note">' + esc(t('detail.warn.conflictNote')) + '</div></div>'
           : '<div class="ok-line">' + esc(t('detail.warn.none')) + '</div>';
       } catch (e) {
         box.innerHTML = '<div class="inline-err">' + esc(e.message || t('common.error')) + '</div>';
@@ -2059,7 +2256,7 @@
     }
     document.getElementById('bk-check').onclick = check;
     document.getElementById('m-save').onclick = async function () {
-      if (!lastCheck || lastCheck.engId !== document.getElementById('bk-eng').value) {
+      if (!lastCheck || lastCheck.engId !== candidateValue('bk-eng')) {
         toast(t('detail.bookCheckFirst'), 'error');
         return;
       }
@@ -2175,6 +2372,13 @@
     var sources = role === 'customer' ? ['customer_feedback'] : L.SOURCES;
     view.innerHTML =
       '<div class="page-head"><h1>' + esc(t('new.title')) + '</h1></div>' +
+      /* v4: banner when launched from the planning cell workbench. */
+      (newTicketPrefill
+        ? '<div class="inline-warn" style="margin-bottom:16px">' +
+          esc(t('new.prefillField')
+            .replace('{name}', newTicketPrefill.engineerName || '')
+            .replace('{day}', newTicketPrefill.day || '')) + '</div>'
+        : '') +
       '<div class="card"><h2>' + esc(t('new.formTitle')) + '</h2>' +
       '<form id="new-form" class="nt-grid">' +
         '<div class="field span2"><label>' + esc(t('new.field.title')) + '<span class="req">*</span></label>' +
@@ -2219,6 +2423,10 @@
     /* v2 R3: a site with an active LTSA contract forces is_ltsa + urgent + contract SLA. */
     var siteSel = document.getElementById('nt-site');
     var priSel = document.getElementById('nt-priority');
+    /* v4: apply the planning workbench prefill (site). */
+    if (newTicketPrefill && newTicketPrefill.siteId) {
+      siteSel.value = newTicketPrefill.siteId;
+    }
     function refreshContractState() {
       var c = state.contracts[siteSel.value];
       var active = c && L.isContractActive(c);
@@ -2279,6 +2487,18 @@
         }
         var ins = await sb.from('tickets').insert(insData).select('id,ticket_no').single();
         if (ins.error) throw ins.error;
+        /* v4: planning workbench prefill — set the assignee and the field
+           date right after creation, then consume the prefill. */
+        var pf = newTicketPrefill; newTicketPrefill = null;
+        if (pf && pf.engineerId) {
+          try {
+            await sb.from('tickets').update({
+              assigned_to: pf.engineerId,
+              onsite_from: pf.day || null,
+              onsite_to: pf.day || null
+            }).eq('id', ins.data.id);
+          } catch (e) { /* assignee/date stay unset — non-fatal */ }
+        }
         toast(t('new.created', { no: L.formatTicketNo(ins.data.ticket_no) }), 'ok');
         nav('#/ticket/' + ins.data.id);
       } catch (err) { apiError(err); btn.disabled = false; }
@@ -2294,10 +2514,12 @@
     }
     var users = res.data || [];
     users.forEach(function (u) { state.nameCache[u.id] = u.display_name || u.email; });
+    /* v4: EU country options for the engineer country_code picker. */
+    var EU_COUNTRIES = ['DE', 'IT', 'ES', 'FR', 'NL', 'PL', 'GR', 'RO', 'AT', 'CH', 'BE', 'PT', 'CZ', 'HU', 'SE'];
     var rows = users.map(function (u) {
       var scope = (u.project_scope && u.project_scope.length)
         ? u.project_scope.map(siteShort).join(', ') : t('users.projectScopeAll');
-      return '<tr>' +
+      var main = '<tr>' +
         '<td><b>' + esc(u.display_name || '—') + '</b><br><span class="muted">' + esc(u.email || '') + '</span></td>' +
         '<td>' + esc(t('role.' + u.role)) + '</td>' +
         '<td>' + certBadge(u.cert_level) + '</td>' +
@@ -2311,6 +2533,38 @@
           ? '<button class="btn btn-sm btn-danger" data-deact="' + u.id + '">' + esc(t('users.deactivate')) + '</button>'
           : '<button class="btn btn-sm" data-react="' + u.id + '">' + esc(t('users.active')) + '</button>') +
         '</td></tr>';
+      /* v4: inline-editable scheduling master data for engineers —
+         country_code, remote_capable, skills, regions. Hidden when !v4
+         (columns don't exist on older backends). */
+      var extra = '';
+      if (state.v4 && u.role === 'engineer') {
+        var ccVal = ((u.country_code || u.country) || '').toUpperCase();
+        extra = '<tr class="eng-extra" data-engrow="' + u.id + '"><td colspan="7">' +
+          '<div class="micro-label" style="margin-bottom:8px">' + esc(t('users.scheduling')) + '</div>' +
+          '<div class="ee-grid">' +
+            '<div class="field"><label>' + esc(t('users.countryCode')) + '</label>' +
+              '<select data-f="country_code"><option value="">' + esc(t('common.none')) + '</option>' +
+              EU_COUNTRIES.map(function (c) {
+                return '<option value="' + c + '"' + (ccVal === c ? ' selected' : '') + '>' + c + '</option>';
+              }).join('') + '</select></div>' +
+            '<div class="field"><label>' + esc(t('users.remoteCapable')) + '</label>' +
+              '<input type="checkbox" data-f="remote_capable" style="width:auto"' +
+              (u.remote_capable !== false ? ' checked' : '') + '></div>' +
+            '<div class="field wide"><label>' + esc(t('users.skills')) + '</label>' +
+              '<input type="text" data-f="skills" value="' + esc(u.skills || '') +
+              '" placeholder="' + esc(t('users.skillsPh')) + '"></div>' +
+            '<div class="field"><label>' + esc(t('users.regions')) + '</label>' +
+              '<div class="regions-cbs">' + L.REGION_SET.map(function (r) {
+                return '<label><input type="checkbox" data-region="' + esc(r) + '"' +
+                  ((u.regions || []).indexOf(r) !== -1 ? ' checked' : '') + '> ' +
+                  esc(regionName(r)) + '</label>';
+              }).join('') + '</div></div>' +
+            '<div class="field"><label>&nbsp;</label>' +
+              '<button class="btn btn-sm btn-primary" data-schedsave="' + u.id + '">' +
+              esc(t('common.save')) + '</button></div>' +
+          '</div></td></tr>';
+      }
+      return main + extra;
     }).join('');
     view.innerHTML =
       '<div class="page-head"><h1>' + esc(t('users.title')) + '</h1>' +
@@ -2323,6 +2577,33 @@
       '<th>' + esc(t('common.status')) + '</th><th>' + esc(t('common.actions')) + '</th>' +
       '</tr></thead><tbody>' + rows + '</tbody></table></div></div>';
     document.getElementById('user-new').onclick = function () { openUserModal(null, users, function () { render(); }); };
+    /* v4: save inline scheduling master data (engineer rows). */
+    view.querySelectorAll('[data-schedsave]').forEach(function (b) {
+      b.onclick = async function () {
+        var id = b.getAttribute('data-schedsave');
+        var row = view.querySelector('tr[data-engrow="' + id + '"]');
+        if (!row) return;
+        function fval(f) {
+          var el = row.querySelector('[data-f="' + f + '"]');
+          return el ? el.value : '';
+        }
+        var payload = {
+          country_code: (fval('country_code') || '').toUpperCase() || null,
+          remote_capable: !!row.querySelector('[data-f="remote_capable"]').checked,
+          skills: fval('skills').trim() || null,
+          regions: Array.prototype.map.call(
+            row.querySelectorAll('[data-region]:checked'),
+            function (c) { return c.getAttribute('data-region'); })
+        };
+        b.disabled = true;
+        try {
+          var r = await sb.from('profiles').update(payload).eq('id', id);
+          if (r.error) throw r.error;
+          toast(t('users.schedSaved'), 'ok');
+        } catch (e) { apiError(e); }
+        b.disabled = false;
+      };
+    });
     view.querySelectorAll('[data-edit]').forEach(function (b) {
       b.onclick = function () {
         var u = users.find(function (x) { return x.id === b.getAttribute('data-edit'); });
@@ -3851,6 +4132,9 @@
   /* ====================== v2: planning & calendar ====================== */
   var planUi = { weeks: 2, offset: 0, q: '', cert: '' };
   var calUi = { y: null, m: null };
+  /* v4: prefill stashed by the planning workbench ("create field ticket");
+     consumed once by viewNewTicket on creation. */
+  var newTicketPrefill = null;
 
   function ymd(d) {
     function p(n) { return String(n).padStart(2, '0'); }
@@ -3860,6 +4144,95 @@
     var x = new Date(d.getFullYear(), d.getMonth(), d.getDate());
     x.setDate(x.getDate() - ((x.getDay() + 6) % 7));
     return x;
+  }
+
+  /* v4: "today band" — 4 KPI cards above the planning grid, aligned to the
+     demo's Today band: remote-available (& remote_capable) / in-field /
+     absent-or-holiday / on-duty, each listing names. */
+  async function planTodayBand(engineers, todayKey) {
+    var tShifts = {};
+    try {
+      var tr = await sb.from('shifts').select('*').eq('day', todayKey);
+      (tr.error ? [] : (tr.data || [])).forEach(function (s) { tShifts[s.engineer_id] = s; });
+    } catch (e) {}
+    var holMap = {};
+    if (state.v3) {
+      try {
+        var hr = await sb.from('holidays').select('country_code,name').eq('day', todayKey);
+        (hr.error ? [] : (hr.data || [])).forEach(function (h) {
+          holMap[(h.country_code || '').toUpperCase()] = h.name;
+        });
+      } catch (e) {}
+    }
+    var tNos = {};
+    var tTids = [];
+    Object.keys(tShifts).forEach(function (k) {
+      var tid = tShifts[k].ticket_id;
+      if (tid && tTids.indexOf(tid) === -1) tTids.push(tid);
+    });
+    if (tTids.length) {
+      try {
+        var nr = await sb.from('tickets').select('id,ticket_no').in('id', tTids);
+        (nr.error ? [] : (nr.data || [])).forEach(function (x) { tNos[x.id] = x.ticket_no; });
+      } catch (e) {}
+    }
+    var groups = { remote: [], field: [], absent: [], duty: [] };
+    var ABSENT_KEYS = ['ferie', 'malattia', 'formazione', 'trasferta', 'festivo'];
+    engineers.forEach(function (e) {
+      var sh = tShifts[e.id];
+      var stKey = L.resolveDayState({
+        shiftStatus: sh && sh.status,
+        dayPart: sh && sh.day_part,
+        hasFieldTicket: !!(sh && (sh.status === 'field' || sh.ticket_id || sh.site_id)),
+        holidayName: state.v3 ? (holMap[((e.country_code || e.country) || '').toUpperCase()] || null) : null,
+        dateStr: todayKey
+      });
+      var nm = e.display_name || e.email;
+      if (stKey === 'remoto' && e.remote_capable !== false) groups.remote.push(nm);
+      else if (stKey === 'campo') {
+        groups.field.push({ name: nm, id: sh && sh.ticket_id,
+                            no: sh && sh.ticket_id ? tNos[sh.ticket_id] : null });
+      } else if (ABSENT_KEYS.indexOf(stKey) !== -1) {
+        groups.absent.push(nm + ' (' + statusLabel(stKey) + ')');
+      }
+      if (state.v3 && sh && sh.duty_type && dutyKeyValid(sh.duty_type)) {
+        groups.duty.push({ name: nm, duty: sh.duty_type });
+      }
+    });
+    function card(label, color, items, itemHtml) {
+      return '<div class="card today-card"><div class="micro-label">' + esc(label) + '</div>' +
+        '<div class="tc-num" style="color:' + color + '">' + items.length + '</div>' +
+        '<div class="tc-names">' +
+          (items.length ? items.map(itemHtml).join('<br>') : esc(t('plan.today.none'))) +
+        '</div></div>';
+    }
+    return '<div class="today-band">' +
+      card(t('plan.today.remote'), '#15803d', groups.remote, function (n) { return esc(n); }) +
+      card(t('plan.today.field'), '#b91c1c', groups.field, function (f) {
+        return esc(f.name) + (f.no
+          ? ' → <a class="tnum" href="#/ticket/' + f.id + '">' + esc(L.formatTicketNo(f.no)) + '</a>' : '');
+      }) +
+      card(t('plan.today.absent'), '#92400e', groups.absent, function (n) { return esc(n); }) +
+      card(t('plan.today.duty'), '#1d4ed8', groups.duty, function (x) {
+        var d = dutyDef(x.duty);
+        return '<span class="duty-ic" style="color:' + d.text_color + '">' +
+          icon(d.icon || 'phone', 11) + '</span>' + esc(x.name);
+      }) +
+    '</div>';
+  }
+
+  /* v4: planning legend — auto-rendered from the loaded definitions, so a
+     newly added status/duty shows up with zero code change. */
+  function planningLegend() {
+    return '<div class="plan-legend"><span class="micro-label">' + esc(t('plan.wb.legend')) + '</span>' +
+      statusDefs().map(function (d) {
+        return '<span class="legend-item"><span class="legend-sw" style="background:' +
+          d.bg_color + '"></span>' + esc(statusLabel(d.key)) + '</span>';
+      }).join('') + '<span class="legend-sep">|</span>' +
+      dutyDefs().map(function (d) {
+        return '<span class="legend-item"><span class="legend-sw" style="background:' +
+          d.bg_color + '"></span>' + esc(dutyLabel(d.key)) + '</span>';
+      }).join('') + '</div>';
   }
 
   async function viewPlanning(view) {
@@ -3911,6 +4284,25 @@
         } catch (e) {}
       }
     }
+    /* v4: ticket onsite ranges also mark field days (demo precedence #1).
+       Booking always writes shift rows too; this covers ranges set directly
+       on the ticket (e.g. before the booking flow existed). */
+    var fieldTicketMap = {}, fieldTicketId = {};
+    try {
+      var oqr = await baseTicketQuery('id,ticket_no,assigned_to,onsite_from,onsite_to')
+        .not('onsite_from', 'is', null).not('onsite_to', 'is', null)
+        .lte('onsite_from', to).gte('onsite_to', from)
+        .not('status', 'in', '(resolved,closed,pending_customer)').limit(500);
+      (oqr.error ? [] : (oqr.data || [])).forEach(function (x) {
+        if (!x.assigned_to) return;
+        eachDay(x.onsite_from, x.onsite_to).forEach(function (dd) {
+          if (dd >= from && dd <= to) {
+            fieldTicketMap[x.assigned_to + '|' + dd] = x.ticket_no;
+            fieldTicketId[x.assigned_to + '|' + dd] = x.id;
+          }
+        });
+      });
+    } catch (e) {}
 
     var q = planUi.q.trim().toLowerCase();
     var list = engineers.filter(function (e) {
@@ -3924,45 +4316,91 @@
     var loc = lang === 'zh' ? 'zh-CN' : 'en-GB';
     var todayKey = ymd(new Date());
     var headCells = days.map(function (d) {
-      /* v3 U9: highlight today's column header */
+      /* v4: today's column header — blue tint (was red). */
       var isToday = ymd(d) === todayKey;
       return '<div class="plan-cell plan-head' + (isToday ? ' plan-today' : '') + '">' +
         esc(d.toLocaleDateString(loc, { weekday: 'short', day: 'numeric', month: 'numeric' })) + '</div>';
     }).join('');
     var rowsHtml = list.map(function (e) {
-      var cells = days.map(function (d) {
+      var cc = ((e.country_code || e.country) || '').toUpperCase();
+      var cellStrs = days.map(function (d) {
         var key = ymd(d);
         var sh = shiftMap[e.id + '|' + key];
-        var st = L.dayState(sh && sh.status, key);
-        // v3 F5: public holiday in the engineer's country.
-        var holName = state.v3 ? holidayMap[((e.country || '').toUpperCase()) + '|' + key] : null;
-        var inner = '<div><b>' + esc(t('plan.' + st)) + '</b></div>';
-        if (holName) inner += '<div class="muted" title="' + esc(holName) + '">🎉</div>';
-        if (sh && sh.status === 'assigned' && sh.site_id) {
+        var holName = state.v3 ? (holidayMap[cc + '|' + key] || null) : null;
+        var ftKey = e.id + '|' + key;
+        var ftNo = fieldTicketMap[ftKey] || null;
+        /* v4: day-state resolution (pure logic, table-driven display). */
+        var stKey = L.resolveDayState({
+          shiftStatus: sh && sh.status,
+          dayPart: sh && sh.day_part,
+          hasFieldTicket: !!(sh && (sh.status === 'field' || sh.ticket_id || sh.site_id)) || !!ftNo,
+          holidayName: holName,
+          dateStr: key
+        });
+        var def = statusDef(stKey);
+        var dp = sh && sh.day_part;
+        var inner = '<div><b>' + esc(statusLabel(stKey)) + '</b></div>';
+        if (dp && dp !== 'full' && stKey !== 'campo' && stKey !== 'remoto') {
+          inner += '<div class="muted" style="font-size:10px">' + esc(dayPartLabel(dp)) + '</div>';
+        }
+        if (holName) {
+          inner += '<div class="cal-hol" title="' + esc(holName) + '">' + icon('star', 11) +
+            '<span>' + esc(holName.length > 16 ? holName.slice(0, 15) + '…' : holName) + '</span></div>';
+        }
+        if (stKey === 'campo' && sh && sh.site_id) {
           inner += '<div class="muted">' + esc(siteShort(sh.site_id)) + '</div>';
         } else if (sh && sh.note) {
-          inner += '<div class="muted" title="' + esc(sh.note) + '">✎</div>';
+          inner += '<div class="muted note-ic" title="' + esc(sh.note) + '">' + icon('pencil', 11) + '</div>';
         }
-        // v3 I2: ticket number on the planning cell.
-        if (state.v3 && sh && sh.ticket_id && shiftTicketNos[sh.ticket_id]) {
-          inner += '<div><a href="#/ticket/' + sh.ticket_id + '" class="tnum" style="font-size:11px">' +
-            esc(L.formatTicketNo(shiftTicketNos[sh.ticket_id])) + '</a></div>';
+        // v3 I2: ticket number — shift-linked ticket first, then onsite-range ticket.
+        var tNo = (state.v3 && sh && sh.ticket_id && shiftTicketNos[sh.ticket_id]) || ftNo || null;
+        var tId = (state.v3 && sh && sh.ticket_id) || fieldTicketId[ftKey] || null;
+        if (tNo) {
+          inner += '<div>' + (tId
+            ? '<a href="#/ticket/' + tId + '" class="tnum" style="font-size:11px">' +
+              esc(L.formatTicketNo(tNo)) + '</a>'
+            : '<span class="tnum" style="font-size:11px">' + esc(L.formatTicketNo(tNo)) + '</span>') + '</div>';
         }
-        // v3 F4: duty-type badge.
-        if (state.v3 && sh && sh.duty_type) {
-          inner += '<div><span class="duty-badge">' + esc(t('plan.duty.' + sh.duty_type)) + '</span></div>';
+        // v3 F4: duty-type badge, colors from the duty definitions.
+        if (state.v3 && sh && sh.duty_type && dutyKeyValid(sh.duty_type)) {
+          inner += '<div>' + dutyBadgeHtml(sh.duty_type) + '</div>';
         }
-        var cellCls = 'plan-cell cell-' + st + (canWrite ? ' clickable' : '') + (holName ? ' cell-holiday' : '');
-        return '<div class="' + cellCls + '"' +
-          ' data-eng="' + e.id + '" data-day="' + key + '">' + inner + '</div>';
-      }).join('');
+        var isToday = key === todayKey;
+        var cellCls = 'plan-cell cell-' + stKey + (canWrite ? ' clickable' : '') +
+          (isToday ? ' plan-today' : '');
+        /* Merge key for the visual run-merge: same resolved state + day-part,
+           and no extra markers (holiday/ticket/note/duty) that would make
+           the cells visually different. */
+        var hasExtras = !!(holName || tNo || (sh && sh.note) || (sh && sh.duty_type));
+        var mergeKey = stKey + '|' + (dp || 'full') + '|' + (hasExtras ? 'x' : '');
+        return {
+          html: '<div class="' + cellCls + '" data-eng="' + e.id + '" data-day="' + key + '"' +
+            ' style="background:' + def.bg_color + ';color:' + def.text_color + '">' + inner + '</div>',
+          mergeKey: mergeKey
+        };
+      });
+      /* v4: render consecutive same-state days as a merged visual span.
+         NOTE — data stays one row per engineer+day (UNIQUE engineer_id+day);
+         only the grid hides the dividers. Safer than merging DB rows. */
+      for (var ci = 1; ci < cellStrs.length; ci++) {
+        if (cellStrs[ci].mergeKey === cellStrs[ci - 1].mergeKey) {
+          cellStrs[ci - 1].html = cellStrs[ci - 1].html
+            .replace('class="plan-cell ', 'class="plan-cell run-prev ');
+        }
+      }
+      var cells = cellStrs.map(function (c) { return c.html; }).join('');
+      var noRemote = state.v4 && e.remote_capable === false
+        ? ' <span class="muted" style="font-size:10px">· ' + esc(t('assign.noRemoteCapable')) + '</span>' : '';
       return '<div class="plan-row" style="grid-template-columns:' + cols + '">' +
-        '<div class="plan-cell plan-eng"><span>' + esc(e.display_name || e.email) + '</span>' +
+        '<div class="plan-cell plan-eng"><span>' + esc(e.display_name || e.email) + noRemote + '</span>' +
         '<span>' + certBadge(e.cert_level) + '</span></div>' + cells + '</div>';
     }).join('');
 
+    var bandHtml = await planTodayBand(engineers, todayKey);
+
     view.innerHTML =
       '<div class="page-head"><h1>' + esc(t('plan.title')) + '</h1></div>' +
+      bandHtml +
       '<div class="card"><div class="filters">' +
         '<div class="f search"><label>' + esc(t('common.search')) + '</label>' +
           '<input type="text" id="plan-q" placeholder="' + esc(t('plan.searchPh')) +
@@ -3982,12 +4420,13 @@
           '<button class="btn btn-sm" id="plan-next">›</button>' +
         '</div></div>' +
       '</div>' +
+      '<div class="hint" style="margin-bottom:12px">' + esc(t('plan.wb.tip')) + '</div>' +
       '<div class="plan-grid">' +
         '<div class="plan-row" style="grid-template-columns:' + cols + '">' +
           '<div class="plan-cell plan-head">' + esc(t('plan.engineer')) + '</div>' + headCells +
         '</div>' +
         (rowsHtml || '<div class="empty">' + esc(t('list.noResults')) + '</div>') +
-      '</div></div>';
+      '</div>' + planningLegend() + '</div>';
 
     view.querySelectorAll('[data-weeks]').forEach(function (b) {
       b.onclick = function () { planUi.weeks = Number(b.getAttribute('data-weeks')); render(); };
@@ -4012,7 +4451,279 @@
     }
   }
 
+  /* v4: cell workbench dispatcher — full workbench on a v4 backend,
+     legacy status modal on older backends (their DB CHECK rejects the
+     new status values). */
   function openShiftModal(engineer, day, existing, done) {
+    if (!state.v4) { openShiftModalLegacy(engineer, day, existing, done); return; }
+    openShiftWorkbench(engineer, day, existing || {}, done);
+  }
+
+  /* v4: day workbench — restore-remote / field / absence entry with
+     day-parts / duty toggle / covered sites / open-ticket picker. */
+  function openShiftWorkbench(engineer, day, existing, done) {
+    var ABSENCE_STATUSES = ['vacation', 'sick', 'training', 'travel'];
+    var initAbsence = ABSENCE_STATUSES.indexOf(existing.status) !== -1 ? existing.status
+      : (existing.status === 'leave' ? 'vacation' : 'vacation');
+    var initMode = (existing.status === 'field' || existing.status === 'assigned') ? 'field'
+      : ((ABSENCE_STATUSES.indexOf(existing.status) !== -1 || existing.status === 'leave')
+          ? 'absence' : 'remote');
+    var sel = {
+      mode: initMode,                 // 'remote' | 'field' | 'absence'
+      absence: initAbsence,            // DB status value for absence mode
+      dayPart: existing.day_part || 'full',
+      duty: existing.duty_type || null,
+      siteId: existing.site_id || null,     // preserved across panel re-renders
+      ticketId: existing.ticket_id || null  // preserved across panel re-renders
+    };
+    var covSites = existing.covered_site_ids || [];
+    var loc = lang === 'zh' ? 'zh-CN' : 'en-GB';
+    var dayLabel = new Date(day + 'T12:00:00')
+      .toLocaleDateString(loc, { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+    var curKey = L.resolveDayState({
+      shiftStatus: existing.status,
+      hasFieldTicket: !!(existing.status === 'field' || existing.ticket_id || existing.site_id),
+      dateStr: day
+    });
+
+    function stateBtn(mode, absence, label, swBg, swFg) {
+      var active = sel.mode === mode && (mode !== 'absence' || sel.absence === absence);
+      return '<button type="button" class="wb-btn' + (active ? ' active' : '') + '"' +
+        ' data-mode="' + mode + '"' + (absence ? ' data-absence="' + absence + '"' : '') +
+        (active ? ' style="color:' + swFg + ';border-color:' + swFg + '"' : '') + '>' +
+        '<span class="wb-sw" style="background:' + swBg + '"></span>' + esc(label) + '</button>';
+    }
+    function stateButtons() {
+      var rem = statusDef('remoto'), fld = statusDef('campo');
+      var h = stateBtn('remote', null, t('plan.wb.remote'), rem.bg_color, rem.text_color) +
+              stateBtn('field', null, t('plan.wb.field'), fld.bg_color, fld.text_color);
+      h += ABSENCE_STATUSES.map(function (s) {
+        var d = statusDef(absenceDefKey(s));
+        return stateBtn('absence', s, t('plan.wb.absence.' + s), d.bg_color, d.text_color);
+      }).join('');
+      return h;
+    }
+    function dutyButtons() {
+      return dutyDefs().map(function (d) {
+        var active = sel.duty === d.key;
+        return '<button type="button" class="wb-btn' + (active ? ' active' : '') + '" data-duty="' + d.key + '"' +
+          (active ? ' style="color:' + d.text_color + ';border-color:' + d.text_color +
+            ';background:' + d.bg_color + '"' : '') + '>' +
+          icon(d.icon || 'phone', 13) + esc(dutyLabel(d.key)) + '</button>';
+      }).join('');
+    }
+    function panelHtml() {
+      if (sel.mode === 'remote') {
+        return '<div class="hint">' + esc(t('plan.wb.restoreHint')) + '</div>' +
+          '<div style="margin-top:10px"><button type="button" class="btn btn-danger" id="wb-restore">' +
+          esc(t('plan.wb.restore')) + '</button></div>';
+      }
+      if (sel.mode === 'field') {
+        return '<div class="hint" style="margin-bottom:10px">' + esc(t('plan.wb.fieldHint')) + '</div>' +
+          '<div class="field"><label>' + esc(t('plan.site')) + '</label>' +
+          '<select id="wb-site"><option value="">' + esc(t('common.none')) + '</option>' +
+          state.sites.map(function (s) {
+            return '<option value="' + s.id + '"' + (sel.siteId === s.id ? ' selected' : '') + '>' +
+              esc(s.code + ' — ' + s.name) + '</option>';
+          }).join('') + '</select></div>' +
+          (state.v3
+            ? '<div class="field"><label>' + esc(t('plan.assignTicket')) + '</label>' +
+              '<select id="wb-ticket"><option value="">' + esc(t('common.none')) + '</option></select>' +
+              '<div class="hint">' + esc(t('plan.assignTicketHint')) + '</div></div>'
+            : '') +
+          '<div><button type="button" class="btn btn-sm" id="wb-newticket">' +
+          esc(t('plan.wb.createFieldTicket')) + '</button> ' +
+          '<span class="hint">' + esc(t('plan.wb.createFieldTicketHint')) + '</span></div>';
+      }
+      /* absence mode: type comes from the buttons above; day-part selector
+         is shown for absence statuses only. */
+      var d = statusDef(absenceDefKey(sel.absence));
+      return '<div class="field"><label>' + esc(t('plan.dayPartLabel')) + '</label>' +
+        '<div class="daypart-radios">' +
+        ['full', 'am', 'pm'].map(function (p) {
+          return '<label><input type="radio" name="wb-dp" value="' + p + '"' +
+            (sel.dayPart === p ? ' checked' : '') + '> ' + esc(dayPartLabel(p)) + '</label>';
+        }).join('') + '</div></div>' +
+        '<div class="hint">' + esc(statusLabel(absenceDefKey(sel.absence))) + '</div>';
+    }
+
+    var body =
+      '<div class="wb-sec"><div class="wb-cur"><b>' + esc(engineer.display_name || engineer.email) + '</b> ' +
+        certBadge(engineer.cert_level) + '<span class="muted">' + esc(dayLabel) + '</span> ' +
+        statusBadge(curKey) + '</div></div>' +
+      '<div class="wb-sec"><div class="micro-label" style="margin-bottom:8px">' +
+        esc(t('plan.wb.dayState')) + '</div><div class="wb-btns" id="wb-states">' + stateButtons() + '</div></div>' +
+      '<div class="wb-sec" id="wb-panel">' + panelHtml() + '</div>' +
+      '<div class="wb-sec"><div class="micro-label" style="margin-bottom:8px">' +
+        esc(t('plan.wb.dutyToday')) + '</div><div class="wb-btns" id="wb-duties">' + dutyButtons() + '</div>' +
+        '<div class="hint" style="margin-top:6px">' + esc(t('plan.wb.dutyOff')) + '</div></div>' +
+      (state.v3
+        ? '<div class="wb-sec"><div class="micro-label" style="margin-bottom:8px">' +
+          esc(t('plan.coveredSites')) + '</div>' +
+          '<div class="check-list">' + state.sites.map(function (s) {
+            return '<label><input type="checkbox" data-cov="' + s.id + '"' +
+              (covSites.indexOf(s.id) !== -1 ? ' checked' : '') + ' style="width:auto"> ' +
+              esc(s.code) + '</label>';
+          }).join('') + '</div></div>'
+        : '') +
+      '<div class="wb-sec"><div class="field" style="margin-bottom:0"><label>' + esc(t('plan.note')) + '</label>' +
+        '<input type="text" id="wb-note" value="' + esc(existing.note || '') + '"></div></div>';
+
+    var close = openModal(t('plan.wb.title'), body,
+      '<button class="btn" id="m-cancel">' + esc(t('common.cancel')) + '</button>' +
+      '<button class="btn btn-primary" id="m-save">' + esc(t('common.save')) + '</button>', true);
+    document.getElementById('m-cancel').onclick = close;
+
+    /* Selection state that must survive panel re-renders (initialized above). */
+    function updateSaveBtn() {
+      document.getElementById('m-save').style.display = sel.mode === 'remote' ? 'none' : '';
+    }
+    /* Capture the field panel's live picks before it is re-rendered. */
+    function capturePanel() {
+      var s = document.getElementById('wb-site');
+      if (s) sel.siteId = s.value || null;
+      var tk = document.getElementById('wb-ticket');
+      if (tk) sel.ticketId = tk.value || null;
+    }
+    function renderStates() {
+      document.getElementById('wb-states').innerHTML = stateButtons();
+      document.querySelectorAll('#wb-states .wb-btn').forEach(function (b) {
+        b.onclick = function () {
+          capturePanel();
+          sel.mode = b.getAttribute('data-mode');
+          if (b.getAttribute('data-absence')) sel.absence = b.getAttribute('data-absence');
+          renderStates(); renderPanel(); updateSaveBtn();
+        };
+      });
+    }
+    function renderDuties() {
+      /* Duty toggle re-renders ONLY the duty buttons — the field panel
+         (site/ticket picks) is left untouched. */
+      document.getElementById('wb-duties').innerHTML = dutyButtons();
+      document.querySelectorAll('#wb-duties .wb-btn').forEach(function (b) {
+        b.onclick = function () {
+          var k = b.getAttribute('data-duty');
+          sel.duty = (sel.duty === k) ? null : k;   // toggle on/off for the day
+          renderDuties();
+        };
+      });
+    }
+    function renderPanel() {
+      document.getElementById('wb-panel').innerHTML = panelHtml();
+      var dpRadios = document.querySelectorAll('input[name="wb-dp"]');
+      Array.prototype.forEach.call(dpRadios, function (r) {
+        r.onchange = function () { sel.dayPart = r.value; };
+      });
+      var siteSel = document.getElementById('wb-site');
+      if (siteSel) {
+        siteSel.value = sel.siteId || '';
+        siteSel.onchange = function () { sel.siteId = siteSel.value || null; };
+      }
+      var rb = document.getElementById('wb-restore');
+      if (rb) rb.onclick = async function () {
+        if (!existing.id) { close(); done(); return; }
+        try {
+          var r = await sb.from('shifts').delete().eq('id', existing.id);
+          if (r.error) throw r.error;
+          close(); toast(t('plan.cleared'), 'ok'); done();
+        } catch (e) { apiError(e); }
+      };
+      var nt = document.getElementById('wb-newticket');
+      if (nt) nt.onclick = function () {
+        capturePanel();
+        newTicketPrefill = {
+          engineerId: engineer.id,
+          engineerName: engineer.display_name || engineer.email,
+          day: day,
+          siteId: sel.siteId
+        };
+        close(); nav('#/new');
+      };
+      loadOpenTickets();
+    }
+    /* v3 I1: open-ticket picker (unassigned, not terminal). The shift's
+       current ticket is included even though it's now assigned. */
+    function loadOpenTickets() {
+      var selEl = document.getElementById('wb-ticket');
+      if (!selEl) return;
+      var curTid = sel.ticketId || null;
+      baseTicketQuery('id,ticket_no,title,site_id,assigned_to')
+        .is('assigned_to', null)
+        .not('status', 'in', '(resolved,closed,pending_customer)')
+        .order('created_at', { ascending: true }).limit(100)
+        .then(function (r) {
+          if (r.error || !document.getElementById('wb-ticket')) return;
+          var list = r.data || [];
+          function renderOpts(extra) {
+            var s = document.getElementById('wb-ticket');
+            if (!s) return;
+            var all = (extra ? [extra] : []).concat(list.filter(function (x) {
+              return !extra || x.id !== extra.id;
+            }));
+            s.innerHTML = '<option value="">' + esc(t('common.none')) + '</option>' +
+              all.map(function (x) {
+                return '<option value="' + x.id + '"' +
+                  (curTid === x.id ? ' selected' : '') +
+                  ' data-site="' + (x.site_id || '') + '">' +
+                  esc(L.formatTicketNo(x.ticket_no) + ' — ' + x.title) + '</option>';
+              }).join('');
+            s.onchange = function () {
+              sel.ticketId = s.value || null;
+              var o = s.options[s.selectedIndex];
+              var siteId = o && o.getAttribute('data-site');
+              var siteSel = document.getElementById('wb-site');
+              if (siteId && siteSel) { siteSel.value = siteId; sel.siteId = siteId; }
+            };
+          }
+          if (curTid) {
+            sb.from('tickets').select('id,ticket_no,title,site_id').eq('id', curTid).single()
+              .then(function (cr) { renderOpts(cr.error ? null : cr.data); });
+          } else renderOpts(null);
+        });
+    }
+    renderStates(); renderDuties(); renderPanel(); updateSaveBtn();
+
+    document.getElementById('m-save').onclick = async function () {
+      var btn = this; btn.disabled = true;
+      capturePanel();
+      try {
+        var ticketId = sel.mode === 'field' ? sel.ticketId : null;
+        var row = {
+          engineer_id: engineer.id,
+          day: day,
+          status: sel.mode === 'absence' ? sel.absence : (ticketId ? 'assigned' : 'field'),
+          day_part: sel.mode === 'absence' ? sel.dayPart : 'full',
+          site_id: sel.mode === 'field' ? sel.siteId : null,
+          note: document.getElementById('wb-note').value.trim() || null,
+          /* App-side validation: duty_type is free text in the DB now;
+             only values from the loaded definitions are written. */
+          duty_type: dutyKeyValid(sel.duty) ? sel.duty : null,
+          covered_site_ids: state.v3 ? Array.prototype.map.call(
+            document.querySelectorAll('[data-cov]:checked'), function (c) {
+              return c.getAttribute('data-cov');
+            }) : [],
+          ticket_id: ticketId
+        };
+        var r = await sb.from('shifts').upsert(row, { onConflict: 'engineer_id,day' });
+        if (r.error) throw r.error;
+        // v3 I1: assigning a ticket from planning sets the ticket's owner
+        // and stamps that day as the field-visit date.
+        if (ticketId) {
+          var tr = await sb.from('tickets').update({
+            assigned_to: engineer.id,
+            onsite_from: day,
+            onsite_to: day
+          }).eq('id', ticketId);
+          if (tr.error) throw tr.error;
+        }
+        close(); toast(t('plan.saved'), 'ok'); done();
+      } catch (e) { apiError(e); btn.disabled = false; }
+    };
+  }
+
+  /* v3 legacy cell modal (statuses available/assigned/leave only) — used on
+     backends without migration_v4, whose DB CHECK rejects the new values. */
+  function openShiftModalLegacy(engineer, day, existing, done) {
     existing = existing || {};
     var dutyTypes = ['remote_call', 'phone_oncall', 'field_oncall'];
     var covSites = existing.covered_site_ids || [];
@@ -4169,6 +4880,27 @@
     var engIds = [];
     shifts.forEach(function (s) { if (engIds.indexOf(s.engineer_id) === -1) engIds.push(s.engineer_id); });
     await resolveNames(engIds);
+    /* v4: engineer countries for per-engineer holiday resolution in the
+       calendar chips (same resolveDayState + colors as planning). */
+    var engCountry = {};
+    if (state.v3 && engIds.length) {
+      try {
+        var pr = await sb.from('profiles').select('id,country_code,country').in('id', engIds);
+        (pr.error ? [] : (pr.data || [])).forEach(function (p) {
+          engCountry[p.id] = ((p.country_code || p.country) || '').toUpperCase();
+        });
+      } catch (e) {}
+    }
+    var calHolMap = {};
+    if (state.v3) {
+      try {
+        var chr = await sb.from('holidays').select('country_code,day,name')
+          .gte('day', from).lt('day', ymd(endPlus));
+        (chr.error ? [] : (chr.data || [])).forEach(function (h) {
+          calHolMap[(h.country_code || '').toUpperCase() + '|' + h.day] = h.name;
+        });
+      } catch (e) {}
+    }
     var t0 = new Date(from + 'T00:00:00');
     var tr = await baseTicketQuery('id,ticket_no,title,planned_check_at,is_ltsa')
       .not('planned_check_at', 'is', null)
@@ -4198,10 +4930,23 @@
     var cells = days.map(function (d) {
       var k = ymd(d);
       var b = byDay[k] || { shifts: [], tickets: [] };
+      /* v4: calendar chips use the same resolveDayState + definition colors
+         as the planning grid (per-engineer holiday by their own country). */
       var chips = b.shifts.map(function (s) {
-        return '<span class="cal-chip shift-' + s.status + '" title="' +
-          esc(displayName(s.engineer_id)) + ' — ' + esc(t('plan.' + s.status)) + '">' +
-          esc(displayName(s.engineer_id)) + ' · ' + esc(t('plan.' + s.status)) + '</span>';
+        var hol = state.v3 ? (calHolMap[(engCountry[s.engineer_id] || '') + '|' + k] || null) : null;
+        var stKey = L.resolveDayState({
+          shiftStatus: s.status,
+          dayPart: s.day_part,
+          hasFieldTicket: !!(s.status === 'field' || s.ticket_id || s.site_id),
+          holidayName: hol,
+          dateStr: k
+        });
+        var cd = statusDef(stKey);
+        return '<span class="cal-chip shift-' + stKey + '"' +
+          ' style="background:' + cd.bg_color + ';color:' + cd.text_color + '" title="' +
+          esc(displayName(s.engineer_id)) + ' — ' + esc(statusLabel(stKey)) +
+          (hol ? ' · ' + esc(hol) : '') + '">' +
+          esc(displayName(s.engineer_id)) + ' · ' + esc(statusLabel(stKey)) + '</span>';
       }).join('');
       var tchips = b.tickets.map(function (x) {
         return '<span class="cal-chip ticket' + (x.is_ltsa ? ' is-ltsa' : '') + '" data-id="' + x.id +

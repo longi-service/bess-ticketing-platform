@@ -1,8 +1,9 @@
 /* ============================================================================
  * styles.css — BESS Service Desk (v1)
  * Neutral enterprise palette (white / light gray / dark gray). LONGi brand
- * red is used ONLY as an accent (--brand-red): primary buttons, key
- * highlights, top-bar accent, link hovers. Never large red surfaces.
+ * red is used ONLY as a high-signal accent (--brand-red): primary buttons,
+ * nav active state, urgent priority, SLA breached/escalated, and genuine
+ * error states. Everything else uses semantic colors. Never large red surfaces.
  * ========================================================================== */
 :root {
   /* LONGi brand red — final value #E60012 (from the official logo asset).
@@ -24,9 +25,31 @@
   --warn: #b45309;
   --warn-tint: #fdf3e3;
   --info: #374151;
+  --blue: #4f8ef7;
+  --blue-dark: #2b4acb;
+  --blue-tint: #eff6ff;
+  --indigo: #6366f1;
+  --indigo-tint: #eef2ff;
+  --indigo-dark: #3730a3;
+
+  /* v4: engineer day-state semantic colors (mirror engineer_status_definitions;
+     JS renders them inline from the loaded definitions — these vars are the
+     CSS fallback when a definition is missing). */
+  --st-campo-bg: #fee2e2;      --st-campo-fg: #b91c1c;
+  --st-ferie-bg: #dbeafe;      --st-ferie-fg: #1d4ed8;
+  --st-malattia-bg: #f1f5f9;   --st-malattia-fg: #475569;
+  --st-formazione-bg: #ede9fe; --st-formazione-fg: #6d28d9;
+  --st-trasferta-bg: #ffedd5;  --st-trasferta-fg: #9a3412;
+  --st-festivo-bg: #fef3c7;    --st-festivo-fg: #92400e;
+  --st-weekend-bg: #f8fafc;    --st-weekend-fg: #94a3b8;
+  --st-remoto-bg: #dcfce7;     --st-remoto-fg: #15803d;
+  /* v4: duty-type semantic colors (mirror duty_type_definitions). */
+  --dt-remote_call-bg: #dcfce7;  --dt-remote_call-fg: #15803d;
+  --dt-phone_oncall-bg: #dbeafe; --dt-phone_oncall-fg: #1d4ed8;
+  --dt-field_oncall-bg: #ffedd5; --dt-field_oncall-fg: #9a3412;
 
   --radius: 10px;
-  --shadow: 0 1px 2px rgba(16, 24, 40, 0.05), 0 4px 14px rgba(16, 24, 40, 0.08);
+  --shadow: 0 1px 3px rgba(16, 24, 40, 0.08), 0 6px 18px rgba(16, 24, 40, 0.10);
   --shadow-lg: 0 2px 4px rgba(16, 24, 40, 0.06), 0 10px 28px rgba(16, 24, 40, 0.14);
   --font: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue",
            "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", Arial, sans-serif;
@@ -43,7 +66,7 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 a { color: var(--text); text-decoration: none; }
-a:hover { color: var(--brand-red); }
+a:hover { color: var(--blue-dark); }
 
 /* ---------------- Sidebar shell (v3 light sidebar) ---------------- */
 .app-shell { display: flex; min-height: 100vh; }
@@ -60,10 +83,15 @@ a:hover { color: var(--brand-red); }
 .side-brand img { height: 28px; width: auto; display: block; flex-shrink: 0; }
 .side-brand .tagline { font-size: 11px; color: var(--text-muted); font-weight: 500; line-height: 1.35; }
 .side-nav { flex: 1; overflow-y: auto; padding: 6px 10px 12px; }
-.nav-group-title {
+.nav-group-title { padding: 14px 10px 6px; }
+/* v4: one unified micro-label pattern for every section/group header —
+   11px, uppercase, letterspaced. Section-title, nav-group-title and the
+   ticket-detail card headers all share it. */
+.micro-label, .section-title, .nav-group-title, .t-detail .card > h2, .card h2.micro {
   font-size: 11px; text-transform: uppercase; letter-spacing: .08em;
-  color: var(--text-muted); font-weight: 700; padding: 14px 10px 6px;
+  color: var(--text-muted); font-weight: 700;
 }
+.section-title, .t-detail .card > h2 { margin: 0 0 10px; }
 .side-nav a {
   display: block; padding: 9px 12px; border-radius: 8px;
   color: var(--text); font-size: 14px; font-weight: 500; position: relative;
@@ -157,12 +185,12 @@ a:hover { color: var(--brand-red); }
 .btn-danger:hover { background: var(--brand-red-tint); border-color: var(--brand-red); }
 .btn-sm { padding: 5px 10px; font-size: 12px; }
 .btn-link { background: none; border: none; color: var(--text-muted); cursor: pointer; padding: 4px 6px; font-size: 13px; }
-.btn-link:hover { color: var(--brand-red); }
+.btn-link:hover { color: var(--blue-dark); }
 
 /* ---------------- Forms ---------------- */
 .field { margin-bottom: 14px; }
 .field label { display: block; font-weight: 600; font-size: 13px; margin-bottom: 6px; }
-.field label .req { color: var(--brand-red); margin-left: 2px; }
+.field label .req { color: var(--blue-dark); margin-left: 2px; }
 .field .hint { font-size: 12px; color: var(--text-muted); margin-top: 4px; }
 input[type="text"], input[type="email"], input[type="password"], input[type="tel"],
 input[type="number"], input[type="date"], input[type="datetime-local"], select, textarea {
@@ -170,10 +198,10 @@ input[type="number"], input[type="date"], input[type="datetime-local"], select, 
   padding: 9px 11px; font-size: 14px; font-family: var(--font); background: #fff; color: var(--text);
 }
 input:focus, select:focus, textarea:focus {
-  outline: none; border-color: var(--brand-red); box-shadow: 0 0 0 3px var(--brand-red-tint);
+  outline: none; border-color: var(--blue-dark); box-shadow: 0 0 0 3px var(--blue-tint);
 }
 textarea { min-height: 90px; resize: vertical; }
-input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--brand-red); }
+input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--blue-dark); }
 .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 @media (max-width: 700px) { .form-row { grid-template-columns: 1fr; } }
 .form-actions { display: flex; gap: 10px; margin-top: 18px; }
@@ -212,6 +240,7 @@ table.tbl { width: 100%; border-collapse: collapse; background: var(--surface); 
 .badge.sla-breached { background: var(--brand-red-tint); color: var(--brand-red-dark); }
 .badge.sla-stopped  { background: #eef1f4; color: var(--text-muted); }
 .badge.escalated { background: var(--brand-red); color: #fff; }
+.badge.contract { background: var(--indigo-tint); color: var(--indigo-dark); }
 
 /* ---------------- Dashboard counters ---------------- */
 .counter .num { font-size: 30px; font-weight: 800; letter-spacing: -0.02em; }
@@ -289,14 +318,7 @@ table.tbl { width: 100%; border-collapse: collapse; background: var(--surface); 
 /* ---------------- v3: ticket detail two-column (U1) ---------------- */
 .t-detail { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 16px; align-items: start; }
 @media (max-width: 900px) { .t-detail { grid-template-columns: 1fr; } }
-.t-detail .card > h2 {
-  font-size: 11px; text-transform: uppercase; letter-spacing: .08em;
-  color: var(--text-muted); font-weight: 700; margin: 0 0 10px;
-}
-.section-title {
-  font-size: 11px; text-transform: uppercase; letter-spacing: .08em;
-  color: var(--text-muted); font-weight: 700; margin: 0 0 10px;
-}
+/* (micro-label typography unified above) */
 .sf-row {
   display: flex; justify-content: space-between; align-items: baseline; gap: 12px;
   padding: 7px 0; border-bottom: 1px solid var(--border); font-size: 13px;
@@ -373,10 +395,10 @@ tr.unassigned-open:hover td { background: #ffedd5; }
 .empty { color: var(--text-muted); text-align: center; padding: 30px 10px; font-size: 13px; }
 
 /* ---------------- v2: contract rail / badges / tree / planning / calendar ---------------- */
-.tbl tr.is-ltsa td:first-child { box-shadow: inset 3px 0 var(--brand-red); }
+.tbl tr.is-ltsa td:first-child { box-shadow: inset 3px 0 var(--indigo); }
 .badge.status-pending_customer { background: #f3e8ff; color: #7e22ce; }
 .badge.cert-associate { background: #e8eefb; color: #2b4acb; }
-.badge.cert-professional { background: var(--brand-red-tint); color: var(--brand-red-dark); }
+.badge.cert-professional { background: #ede9fe; color: #6d28d9; }
 .badge.contract-active { background: var(--ok-tint); color: var(--ok); }
 .badge.contract-expiring { background: var(--warn-tint); color: var(--warn); }
 .badge.contract-none { background: #eef1f4; color: var(--text-muted); }
@@ -392,7 +414,7 @@ tr.unassigned-open:hover td { background: #ffedd5; }
 .tree-node .grow { flex: 1; }
 
 tr.low-stock-amber td { background: #fffbeb; }
-tr.low-stock-red td { background: var(--brand-red-tint); }
+tr.low-stock-red td { background: #fef3c7; }
 
 .donut-wrap { display: flex; gap: 18px; align-items: center; flex-wrap: wrap; }
 .donut-legend { font-size: 13px; min-width: 180px; }
@@ -400,34 +422,59 @@ tr.low-stock-red td { background: var(--brand-red-tint); }
 .donut-legend .sw { width: 12px; height: 12px; border-radius: 3px; display: inline-block; flex-shrink: 0; }
 .donut-legend .n { margin-left: auto; font-weight: 700; padding-left: 12px; }
 
-.kpi-rail { border-left: 3px solid var(--brand-red); padding-left: 14px; }
+.kpi-rail { border-left: 3px solid var(--blue); padding-left: 14px; }
 
 .loadbar { height: 8px; background: #eef1f4; border-radius: 4px; overflow: hidden; min-width: 100px; }
-.loadbar > div { height: 100%; background: var(--brand-red); border-radius: 4px; }
+.loadbar > div { height: 100%; background: var(--blue); border-radius: 4px; }
 
 .plan-grid { border: 1px solid var(--border); border-radius: var(--radius); overflow: auto; }
 .plan-row { display: grid; }
 .plan-cell {
   border-right: 1px solid var(--border); border-bottom: 1px solid var(--border);
-  padding: 6px; min-height: 46px; font-size: 12px;
+  padding: 6px; min-height: 46px; font-size: 12px; position: relative;
+  transition: transform .12s ease, box-shadow .12s ease;
 }
 .plan-head { background: #fafbfc; font-weight: 700; }
 .plan-eng { font-weight: 600; display: flex; flex-direction: column; gap: 4px; justify-content: center; }
-.cell-available { background: var(--ok-tint); }
-.cell-assigned { background: #e8eefb; }
-.cell-leave { background: var(--brand-red-tint); }
-.cell-weekend { background: #f4f5f7; color: var(--text-muted); }
+/* v4: day-state cells. Colors are rendered inline from the loaded
+   engineer_status_definitions — the var() values below are the fallback. */
+.cell-campo     { background: var(--st-campo-bg);     color: var(--st-campo-fg); }
+.cell-ferie     { background: var(--st-ferie-bg);     color: var(--st-ferie-fg); }
+.cell-malattia  { background: var(--st-malattia-bg);  color: var(--st-malattia-fg); }
+.cell-formazione{ background: var(--st-formazione-bg);color: var(--st-formazione-fg); }
+.cell-trasferta { background: var(--st-trasferta-bg); color: var(--st-trasferta-fg); }
+.cell-festivo   { background: var(--st-festivo-bg);   color: var(--st-festivo-fg); }
+.cell-weekend   { background: var(--st-weekend-bg);   color: var(--st-weekend-fg); }
+.cell-remoto    { background: var(--st-remoto-bg);    color: var(--st-remoto-fg); }
+/* v4: visual run-merge — hide the divider between consecutive same-state days
+   so multi-day absences read as one span (data stays one row per day). */
+.plan-cell.run-prev { border-right-color: transparent; }
 .plan-cell.clickable { cursor: pointer; }
-.plan-cell.clickable:hover { outline: 2px solid var(--brand-red); outline-offset: -2px; }
-.plan-cell .tnum { color: var(--brand-red); }
-/* v3 F5: holiday cells */
-.cell-holiday { background: #fef9e7 !important; border-color: #fde68a !important; }
-/* v3 F4: duty-type badge */
-.duty-badge {
-  display: inline-block; font-size: 10px; font-weight: 700; color: #1d4ed8;
-  background: #dbeafe; border-radius: 999px; padding: 1px 7px; margin-top: 2px;
-  white-space: nowrap;
+/* v4: cell hover lift (replaces the old red outline). */
+.plan-cell.clickable:hover {
+  transform: translateY(-1px); box-shadow: 0 4px 10px rgba(16,24,40,.14); z-index: 1;
 }
+.plan-cell .tnum { color: var(--blue-dark); font-weight: 700; }
+/* v4: today column — header tinted blue; day cells get a translucent blue
+   overlay so the day-state colors stay visible through the full-height band. */
+.plan-head.plan-today { background: var(--blue-tint); color: var(--blue-dark); }
+.plan-cell.plan-today::after {
+  content: ""; position: absolute; inset: 0; background: rgba(79,142,247,.08);
+  pointer-events: none;
+}
+/* v4: duty-type badge — colors come inline from duty_type_definitions. */
+.duty-badge {
+  display: inline-flex; align-items: center; gap: 3px;
+  font-size: 10px; font-weight: 700; border-radius: 999px; padding: 1px 7px; margin-top: 2px;
+  white-space: nowrap;
+  background: var(--dt-phone_oncall-bg); color: var(--dt-phone_oncall-fg);
+}
+.duty-badge svg { width: 11px; height: 11px; flex-shrink: 0; }
+/* v4: holiday marker (star svg + short name). */
+.cal-hol { display: flex; align-items: center; gap: 3px; font-size: 10px; font-weight: 600; }
+.cal-hol svg { width: 11px; height: 11px; flex-shrink: 0; }
+.note-ic { display: inline-flex; vertical-align: -2px; }
+.note-ic svg { width: 11px; height: 11px; }
 /* v3 F4: covered-sites checkbox list */
 .check-list {
   display: flex; flex-wrap: wrap; gap: 4px 12px; max-height: 110px; overflow-y: auto;
@@ -442,18 +489,25 @@ tr.low-stock-red td { background: var(--brand-red-tint); }
 .cal-dow { background: #fafbfc; font-weight: 700; font-size: 12px; padding: 8px; text-align: center; border-bottom: 1px solid var(--border); }
 .cal-day { min-height: 100px; border-bottom: 1px solid var(--border); border-right: 1px solid var(--border); padding: 6px; font-size: 12px; }
 .cal-day.other { background: #fafbfc; color: var(--text-muted); }
-.cal-day.today { outline: 2px solid var(--brand-red); outline-offset: -2px; }
+.cal-day.today { outline: 2px solid var(--blue-dark); outline-offset: -2px; }
 .cal-num { font-weight: 700; margin-bottom: 4px; }
 .cal-chip {
   display: block; border-radius: 4px; padding: 2px 6px; margin-bottom: 3px; font-size: 11px;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.cal-chip.shift-available { background: var(--ok-tint); color: var(--ok); }
-.cal-chip.shift-assigned { background: #e8eefb; color: #2b4acb; }
-.cal-chip.shift-leave { background: var(--brand-red-tint); color: var(--brand-red-dark); }
+/* v4: calendar chips share the definition colors with planning (JS renders
+   them inline; the var() values are the fallback). */
+.cal-chip.shift-campo      { background: var(--st-campo-bg);      color: var(--st-campo-fg); }
+.cal-chip.shift-ferie      { background: var(--st-ferie-bg);      color: var(--st-ferie-fg); }
+.cal-chip.shift-malattia   { background: var(--st-malattia-bg);   color: var(--st-malattia-fg); }
+.cal-chip.shift-formazione { background: var(--st-formazione-bg); color: var(--st-formazione-fg); }
+.cal-chip.shift-trasferta  { background: var(--st-trasferta-bg);  color: var(--st-trasferta-fg); }
+.cal-chip.shift-festivo    { background: var(--st-festivo-bg);    color: var(--st-festivo-fg); }
+.cal-chip.shift-weekend    { background: var(--st-weekend-bg);    color: var(--st-weekend-fg); }
+.cal-chip.shift-remoto     { background: var(--st-remoto-bg);     color: var(--st-remoto-fg); }
 .cal-chip.ticket { background: #eef1f4; color: var(--text); cursor: pointer; }
-.cal-chip.ticket:hover { color: var(--brand-red); }
-.cal-chip.ticket.is-ltsa { border-left: 3px solid var(--brand-red); }
+.cal-chip.ticket:hover { color: var(--blue-dark); }
+.cal-chip.ticket.is-ltsa { border-left: 3px solid var(--indigo); }
 .inline-err {
   background: var(--brand-red-tint); border: 1px solid #f0c4c6; color: var(--brand-red-dark);
   border-radius: var(--radius); padding: 10px 14px; margin-bottom: 14px; font-size: 13px;
@@ -475,16 +529,17 @@ tr.low-stock-red td { background: var(--brand-red-tint); }
  * accent. All motion is subtle and disabled under prefers-reduced-motion.
  * ========================================================================== */
 
-/* ---------- Section headers: red accent bar ---------- */
+/* ---------- Section headers: blue accent bar (v4: red reserved for
+   primary buttons / nav active / urgent / SLA-breached) ---------- */
 .card h2 { position: relative; padding-left: 12px; letter-spacing: 0.01em; }
 .card h2::before {
   content: ""; position: absolute; left: 0; top: 3px; bottom: 3px; width: 3px;
-  border-radius: 2px; background: linear-gradient(180deg, var(--brand-red), var(--brand-red-dark));
+  border-radius: 2px; background: linear-gradient(180deg, var(--blue), var(--blue-dark));
 }
 .page-head h1 { position: relative; padding-left: 14px; letter-spacing: -0.01em; }
 .page-head h1::before {
   content: ""; position: absolute; left: 0; top: 5px; bottom: 5px; width: 4px;
-  border-radius: 2px; background: linear-gradient(180deg, var(--brand-red), var(--brand-red-dark));
+  border-radius: 2px; background: linear-gradient(180deg, var(--blue), var(--blue-dark));
 }
 .page-sub { letter-spacing: 0.01em; }
 
@@ -557,13 +612,10 @@ tr.low-stock-red td { background: var(--brand-red-tint); }
 }
 
 /* ---------- Planning / calendar cell polish ---------- */
-.plan-cell { transition: background 0.12s ease, outline-color 0.12s ease; }
-.cell-available { background: linear-gradient(180deg, #ecf8f0, #e2f3e8); }
-.cell-assigned { background: linear-gradient(180deg, #e9eefa, #dfe7fa); }
-.cell-leave { background: linear-gradient(180deg, #fdeeee, #fbdede); }
+/* (v4: day-state cell gradients replaced by the definition color system above) */
 .cal-day { transition: background 0.12s ease; }
 .cal-day:hover { background: #f3f7fd; }
-.cal-day.today { outline: 2px solid var(--brand-red); outline-offset: -2px; box-shadow: 0 0 0 4px rgba(230, 0, 18, 0.12); }
+.cal-day.today { outline: 2px solid var(--blue-dark); outline-offset: -2px; box-shadow: 0 0 0 4px rgba(79,142,247,.14); }
 .cal-chip { transition: transform 0.12s ease; }
 .cal-chip.ticket:hover { transform: translateX(2px); }
 
@@ -600,12 +652,11 @@ input:focus, select:focus, textarea:focus {
   cursor: pointer; font-family: var(--font);
 }
 .chip.active {
-  border-color: var(--brand-red); color: var(--brand-red);
-  background: var(--brand-red-tint); box-shadow: 0 0 0 1px var(--brand-red) inset;
+  border-color: var(--blue-dark); color: var(--blue-dark);
+  background: var(--blue-tint); box-shadow: 0 0 0 1px var(--blue-dark) inset;
 }
 
-/* U9: today's column header in the planning grid */
-.plan-today { color: var(--brand-red); font-weight: 800; background: #fff1f1; }
+/* (v4: today's column styles live with the planning grid rules above) */
 
 /* F9: printable service report — screen keeps the app; print shows only #print-report */
 #print-report { display: none; }
@@ -622,3 +673,85 @@ input:focus, select:focus, textarea:focus {
   #print-report th, #print-report td { border: 1px solid #999; padding: 5px 8px; text-align: left; }
   #print-report .pr-meta { color: #444; font-size: 12px; margin-bottom: 12px; }
 }
+
+/* ============================================================================
+ * v4: scheduling workbench, today band, ranked candidates, legend
+ * ============================================================================ */
+
+/* ---------- Planning legend (auto-rendered from the status/duty defs) ---------- */
+.plan-legend {
+  display: flex; flex-wrap: wrap; gap: 6px 16px; margin-top: 12px; font-size: 12px;
+  color: var(--text-muted); align-items: center;
+}
+.plan-legend .legend-item { display: inline-flex; align-items: center; gap: 5px; }
+.plan-legend .legend-sw {
+  display: inline-block; width: 12px; height: 12px; border-radius: 3px; flex-shrink: 0;
+}
+.plan-legend .legend-sep { color: var(--border-strong); }
+
+/* ---------- Today band: 4 KPI cards above the planning grid ---------- */
+.today-band {
+  display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px;
+  margin-bottom: 16px;
+}
+@media (max-width: 900px) { .today-band { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.today-card { padding: 12px 14px; }
+.today-card .tc-num { font-size: 24px; font-weight: 800; line-height: 1.2; }
+.today-card .tc-names { font-size: 11px; color: var(--text-muted); margin-top: 4px; line-height: 1.6; }
+.today-card .tc-names .duty-ic { display: inline-flex; vertical-align: -2px; margin-right: 2px; }
+.today-card .tc-names .duty-ic svg { width: 11px; height: 11px; }
+
+/* ---------- Amber warning box (scheduling conflicts: warn, don't block) ---------- */
+.inline-warn {
+  background: #fffbeb; border: 1px solid #fde68a; color: #92400e;
+  border-radius: var(--radius); padding: 10px 14px; margin-bottom: 14px; font-size: 13px;
+}
+.inline-warn .warn-head { display: flex; align-items: center; gap: 6px; font-weight: 700; margin-bottom: 4px; }
+.inline-warn .warn-head svg { width: 14px; height: 14px; flex-shrink: 0; }
+.inline-warn .warn-note { font-size: 11px; opacity: .85; margin-top: 6px; }
+
+/* ---------- Ranked engineer candidates (assignment recommendation) ---------- */
+.cand-list { display: flex; flex-direction: column; gap: 6px; max-height: 240px; overflow-y: auto; }
+.cand {
+  display: flex; align-items: center; gap: 8px; border: 1px solid var(--border);
+  border-radius: 8px; padding: 8px 10px; cursor: pointer; font-size: 13px;
+}
+.cand:hover { border-color: var(--blue); }
+.cand input[type="radio"] { width: auto; flex-shrink: 0; }
+.cand-name { font-weight: 600; }
+.cand-skills { color: var(--text-muted); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cand-remote { color: #15803d; display: inline-flex; }
+.cand-remote.off { color: #cbd5e1; }
+.cand-remote svg { width: 14px; height: 14px; }
+.region-badge {
+  font-size: 10px; font-weight: 700; border-radius: 999px; padding: 1px 8px; white-space: nowrap;
+}
+.region-badge.match { background: #dcfce7; color: #15803d; }
+.region-badge.nomatch { background: #f1f5f9; color: #64748b; }
+
+/* ---------- Cell workbench (day menu) ---------- */
+.wb-sec { margin-bottom: 16px; }
+.wb-sec:last-child { margin-bottom: 0; }
+.wb-btns { display: flex; flex-wrap: wrap; gap: 8px; }
+.wb-btn {
+  border: 1.5px solid var(--border-strong); border-radius: 8px; padding: 8px 12px;
+  font-weight: 600; font-size: 13px; background: #fff; cursor: pointer;
+  display: inline-flex; align-items: center; gap: 6px; color: var(--text);
+}
+.wb-btn:hover { border-color: var(--blue); }
+.wb-btn.active { border-color: currentColor; box-shadow: 0 0 0 1px currentColor inset; }
+.wb-btn .wb-sw { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
+.wb-btn svg { width: 13px; height: 13px; }
+.wb-cur { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; }
+.daypart-radios { display: flex; gap: 14px; align-items: center; }
+.daypart-radios label { display: flex; align-items: center; gap: 5px; font-weight: 400; font-size: 13px; cursor: pointer; }
+.daypart-radios input[type="radio"] { width: auto; }
+
+/* ---------- Users: inline scheduling rows for engineers (v4) ---------- */
+.eng-extra td { background: #fafbfc; padding: 12px 14px; }
+.eng-extra .ee-grid { display: flex; flex-wrap: wrap; gap: 10px 18px; align-items: flex-end; }
+.eng-extra .field { margin-bottom: 0; min-width: 150px; }
+.eng-extra .field.wide { min-width: 220px; }
+.eng-extra .regions-cbs { display: flex; gap: 10px; flex-wrap: wrap; }
+.eng-extra .regions-cbs label { display: flex; align-items: center; gap: 5px; font-weight: 400; font-size: 13px; }
+.eng-extra .regions-cbs input[type="checkbox"] { width: auto; }

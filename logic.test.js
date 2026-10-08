@@ -362,6 +362,88 @@ eq('dayState null date → remote', L.dayState(null, null), 'remote');
 eq('dayState Date object works', L.dayState(null, new Date(2026, 9, 10)), 'weekend');
 
 /* ------------------------------------------------------------------ */
+/* 6b. v4: resolveDayState — precedence, weekend, legacy mapping         */
+/* ------------------------------------------------------------------ */
+(function resolveDayStateTests() {
+  const R = L.resolveDayState;
+  // 1) field activity wins over everything
+  eq('resolveDayState: field status → campo',
+    R({ shiftStatus: 'field', holidayName: 'X', dateStr: '2026-10-07' }), 'campo');
+  eq('resolveDayState: field beats vacation',
+    R({ shiftStatus: 'field', dateStr: '2026-10-07' }), 'campo');
+  eq('resolveDayState: legacy assigned → campo',
+    R({ shiftStatus: 'assigned', dateStr: '2026-10-07' }), 'campo');
+  eq('resolveDayState: hasFieldTicket → campo',
+    R({ shiftStatus: 'vacation', hasFieldTicket: true, dateStr: '2026-10-07' }), 'campo');
+  // 2) absence mapping (incl. legacy leave)
+  eq('resolveDayState: vacation → ferie', R({ shiftStatus: 'vacation', dateStr: '2026-10-07' }), 'ferie');
+  eq('resolveDayState: sick → malattia', R({ shiftStatus: 'sick', dateStr: '2026-10-07' }), 'malattia');
+  eq('resolveDayState: training → formazione', R({ shiftStatus: 'training', dateStr: '2026-10-07' }), 'formazione');
+  eq('resolveDayState: travel → trasferta', R({ shiftStatus: 'travel', dateStr: '2026-10-07' }), 'trasferta');
+  eq('resolveDayState: legacy leave → ferie', R({ shiftStatus: 'leave', dateStr: '2026-10-07' }), 'ferie');
+  // absence beats holiday and weekend
+  eq('resolveDayState: absence beats holiday',
+    R({ shiftStatus: 'sick', holidayName: 'Natale', dateStr: '2026-12-25' }), 'malattia');
+  eq('resolveDayState: vacation on Saturday → ferie (absence beats weekend)',
+    R({ shiftStatus: 'vacation', dateStr: '2026-10-10' }), 'ferie');
+  // 3) holiday
+  eq('resolveDayState: holiday → festivo',
+    R({ holidayName: 'Ferragosto', dateStr: '2026-08-15' }), 'festivo');
+  // 4) weekend detection
+  eq('resolveDayState: Saturday → weekend', R({ dateStr: '2026-10-10' }), 'weekend'); // Sat
+  eq('resolveDayState: Sunday → weekend', R({ dateStr: '2026-10-11' }), 'weekend');   // Sun
+  eq('resolveDayState: weekday → remoto', R({ dateStr: '2026-10-07' }), 'remoto');    // Wed
+  // 5) default remoto incl. legacy mappings and no-row
+  eq('resolveDayState: no row → remoto', R({ dateStr: '2026-10-07' }), 'remoto');
+  eq('resolveDayState: legacy available → remoto',
+    R({ shiftStatus: 'available', dateStr: '2026-10-07' }), 'remoto');
+  eq('resolveDayState: legacy remote → remoto',
+    R({ shiftStatus: 'remote', dateStr: '2026-10-07' }), 'remoto');
+  eq('resolveDayState: unknown status → remoto',
+    R({ shiftStatus: 'bogus', dateStr: '2026-10-07' }), 'remoto');
+  eq('resolveDayState: null date → remoto', R({}), 'remoto');
+})();
+
+/* ------------------------------------------------------------------ */
+/* 6c. v4: regions + rankEngineers                                       */
+/* ------------------------------------------------------------------ */
+(function regionTests() {
+  eq('regionOfCountry DE → DACH', L.regionOfCountry('DE'), 'DACH');
+  eq('regionOfCountry lowercase at → DACH', L.regionOfCountry('at'), 'DACH');
+  eq('regionOfCountry IT → South EU', L.regionOfCountry('IT'), 'South EU');
+  eq('regionOfCountry GR → South EU', L.regionOfCountry('GR'), 'South EU');
+  eq('regionOfCountry RO → East EU', L.regionOfCountry('RO'), 'East EU');
+  eq('regionOfCountry SE → North EU', L.regionOfCountry('SE'), 'North EU');
+  eq('regionOfCountry FR → West EU', L.regionOfCountry('FR'), 'West EU');
+  eq('regionOfCountry XX → null', L.regionOfCountry('XX'), null);
+  eq('regionOfCountry empty → null', L.regionOfCountry(''), null);
+  eq('REGION_SET has 5 entries', L.REGION_SET.length, 5);
+
+  eq('engineerRegions: explicit regions win',
+    L.engineerRegions({ regions: ['DACH'], country: 'IT' }), ['DACH']);
+  eq('engineerRegions: falls back to country_code',
+    L.engineerRegions({ country_code: 'es' }), ['South EU']);
+  eq('engineerRegions: falls back to legacy country',
+    L.engineerRegions({ country: 'PL' }), ['East EU']);
+  eq('engineerRegions: unknown → []', L.engineerRegions({}), []);
+
+  const engs = [
+    { id: 'a', display_name: 'Zed', country: 'DE' },                       // DACH
+    { id: 'b', display_name: 'Amy', country: 'IT' },                       // South EU
+    { id: 'c', display_name: 'Bo', regions: ['South EU', 'DACH'] },        // explicit, matches
+    { id: 'd', display_name: 'Cy', country: 'XX' },                        // no region
+  ];
+  const ranked = L.rankEngineers(engs, 'ES'); // site in South EU
+  eq('rankEngineers: region matches first, then name',
+    ranked.map(r => r.eng.id), ['b', 'c', 'd', 'a']);
+  ok('rankEngineers: match flags', ranked[0].regionMatch && ranked[1].regionMatch &&
+    !ranked[2].regionMatch && !ranked[3].regionMatch);
+  const rankedNoSite = L.rankEngineers(engs, '');
+  eq('rankEngineers: no site country → pure name order',
+    rankedNoSite.map(r => r.eng.id), ['b', 'c', 'd', 'a']);
+})();
+
+/* ------------------------------------------------------------------ */
 /* 7. i18n parity — every key in en must exist in zh and vice versa     */
 /* ------------------------------------------------------------------ */
 (function i18nParity() {
