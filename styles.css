@@ -118,7 +118,17 @@ a:hover { color: var(--brand-red); }
 .lang-toggle:hover { border-color: var(--brand-red); color: var(--brand-red); }
 
 /* ---------------- Layout ---------------- */
-.page { max-width: 1200px; margin: 0 auto; padding: 24px 20px 60px; }
+.page { margin: 0; padding: 24px 28px 60px; }
+/* v3.1: full-width content — no more centered narrow column. */
+/* Two-column new-ticket form (fields pair up, full rows span both). */
+.nt-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px 18px; }
+.nt-grid .span2 { grid-column: 1 / -1; }
+.nt-grid .form-actions { margin-top: 4px; }
+@media (max-width: 700px) {
+  .nt-grid { grid-template-columns: 1fr; }
+  .nt-grid .span2 { grid-column: auto; }
+  .page { padding: 16px 14px 48px; }
+}
 .page-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 18px; }
 .page-head h1 { margin: 0; font-size: 22px; font-weight: 700; }
 .page-sub { color: var(--text-muted); margin: 4px 0 18px; }

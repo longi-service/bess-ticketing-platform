@@ -2176,21 +2176,19 @@
     view.innerHTML =
       '<div class="page-head"><h1>' + esc(t('new.title')) + '</h1></div>' +
       '<div class="card"><h2>' + esc(t('new.formTitle')) + '</h2>' +
-      '<form id="new-form">' +
-        '<div class="field"><label>' + esc(t('new.field.title')) + '<span class="req">*</span></label>' +
+      '<form id="new-form" class="nt-grid">' +
+        '<div class="field span2"><label>' + esc(t('new.field.title')) + '<span class="req">*</span></label>' +
           '<input type="text" id="nt-title" required></div>' +
-        '<div class="form-row">' +
-          '<div class="field"><label>' + esc(t('new.field.priority')) + '</label>' +
-            '<select id="nt-priority">' + L.PRIORITIES.map(function (pr) {
-              return '<option value="' + pr + '"' + (pr === 'medium' ? ' selected' : '') + '>' +
-                esc(t('priority.' + pr)) + '</option>';
-            }).join('') + '</select></div>' +
-          '<div class="field"><label>' + esc(t('new.field.source')) + '<span class="req">*</span></label>' +
-            '<select id="nt-source">' + sources.map(function (s) {
-              return '<option value="' + s + '">' + esc(t('source.' + s)) + '</option>';
-            }).join('') + '</select>' +
-            (role === 'customer' ? '<div class="hint">' + esc(t('new.sourceHint.customer')) + '</div>' : '') + '</div>' +
-        '</div>' +
+        '<div class="field"><label>' + esc(t('new.field.priority')) + '</label>' +
+          '<select id="nt-priority">' + L.PRIORITIES.map(function (pr) {
+            return '<option value="' + pr + '"' + (pr === 'medium' ? ' selected' : '') + '>' +
+              esc(t('priority.' + pr)) + '</option>';
+          }).join('') + '</select></div>' +
+        '<div class="field"><label>' + esc(t('new.field.source')) + '<span class="req">*</span></label>' +
+          '<select id="nt-source">' + sources.map(function (s) {
+            return '<option value="' + s + '">' + esc(t('source.' + s)) + '</option>';
+          }).join('') + '</select>' +
+          (role === 'customer' ? '<div class="hint">' + esc(t('new.sourceHint.customer')) + '</div>' : '') + '</div>' +
         '<div class="field"><label>' + esc(t('new.field.site')) + '</label>' +
           '<select id="nt-site"><option value="">' + esc(t('common.none')) + '</option>' +
           state.sites.map(function (s) {
@@ -2198,25 +2196,21 @@
           }).join('') + '</select>' +
           '<div class="inline-err" id="nt-contract-notice" style="display:none;margin-top:8px;margin-bottom:0">' +
             esc(t('new.contractNotice')) + '</div></div>' +
-        '<div class="form-row">' +
-          '<div class="field"><label>' + esc(t('detail.serialNumber')) + '<span class="req">*</span></label>' +
-            '<input type="text" id="nt-serial" required></div>' +
-          '<div class="field"><label>' + esc(t('detail.firmwareVersion')) + '<span class="req">*</span></label>' +
-            '<input type="text" id="nt-fw" required></div>' +
-        '</div>' +
-        '<div class="form-row">' +
-          '<div class="field"><label>' + esc(t('detail.errorCode')) + '<span class="req">*</span></label>' +
-            '<input type="text" id="nt-err" required></div>' +
-          '<div class="field"><label>' + esc(t('detail.actionsTaken')) + '<span class="req">*</span></label>' +
-            '<input type="text" id="nt-actions" required></div>' +
-        '</div>' +
-        '<div class="field"><label>' + esc(t('new.field.description')) + '<span class="req">*</span></label>' +
+        '<div class="field"><label>' + esc(t('detail.serialNumber')) + '<span class="req">*</span></label>' +
+          '<input type="text" id="nt-serial" required></div>' +
+        '<div class="field"><label>' + esc(t('detail.firmwareVersion')) + '<span class="req">*</span></label>' +
+          '<input type="text" id="nt-fw" required></div>' +
+        '<div class="field"><label>' + esc(t('detail.errorCode')) + '<span class="req">*</span></label>' +
+          '<input type="text" id="nt-err" required></div>' +
+        '<div class="field"><label>' + esc(t('detail.actionsTaken')) + '<span class="req">*</span></label>' +
+          '<input type="text" id="nt-actions" required></div>' +
+        '<div class="field span2"><label>' + esc(t('new.field.description')) + '<span class="req">*</span></label>' +
           '<textarea id="nt-desc" required></textarea></div>' +
         (state.v3
-          ? '<div class="field"><label>' + esc(t('new.field.tags')) + '</label>' +
+          ? '<div class="field span2"><label>' + esc(t('new.field.tags')) + '</label>' +
             '<input type="text" id="nt-tags" placeholder="' + esc(t('new.field.tagsPh')) + '"></div>'
           : '') +
-        '<div class="form-actions">' +
+        '<div class="form-actions span2">' +
           '<button type="submit" class="btn btn-primary" id="nt-submit">' + esc(t('common.create')) + '</button>' +
           '<button type="button" class="btn" id="nt-cancel">' + esc(t('common.cancel')) + '</button>' +
         '</div>' +
