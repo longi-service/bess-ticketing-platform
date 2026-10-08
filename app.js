@@ -205,7 +205,7 @@
     el.className = 'toast' + (kind ? ' ' + kind : '');
     el.textContent = msg;
     root.appendChild(el);
-    setTimeout(function () { el.remove(); }, kind === 'error' ? 6000 : 3500);
+    setTimeout(function () { el.remove(); }, (kind === 'error' || kind === 'warn') ? 6000 : 3500);
   }
 
   /** Human-readable Supabase/RLS error → toast + inline element message. */
@@ -488,8 +488,8 @@
         if (L.can('part.view', state.profile.role)) await viewParts(view);
         else viewPartsNoAccess(view);
       }
-      else if (route.name === 'planning') await viewPlanning(view);
-      else if (route.name === 'calendar') await viewCalendar(view);
+      else if (route.name === 'planning') { if (guard('plan.view')) await viewPlanning(view); }
+      else if (route.name === 'calendar') { if (guard('plan.view')) await viewCalendar(view); }
       else if (route.name === 'site') { if (guard('site.manage')) await viewSiteDetail(view, route.id); }
       else if (route.name === 'users') { if (guard('user.manage')) await viewUsers(view); }
       else if (route.name === 'sites') { if (guard('site.manage')) await viewSites(view); }
@@ -518,8 +518,8 @@
         { id: 'tickets',   href: '#/tickets',   label: t('nav.tickets'),   perm: null },
         { id: 'new',       href: '#/new',       label: t('nav.newTicket'), perm: 'ticket.create' },
         { id: 'parts',     href: '#/parts',     label: t('nav.parts'),     perm: 'part.view' },
-        { id: 'planning',  href: '#/planning',  label: t('nav.planning'),  perm: null },
-        { id: 'calendar',  href: '#/calendar',  label: t('nav.calendar'),  perm: null }
+        { id: 'planning',  href: '#/planning',  label: t('nav.planning'),  perm: 'plan.view' },
+        { id: 'calendar',  href: '#/calendar',  label: t('nav.calendar'),  perm: 'plan.view' }
       ] },
       { title: t('nav.group.manage'), links: [
         { id: 'sites',     href: '#/sites',     label: t('nav.sites'),     perm: 'site.manage' },
@@ -1480,11 +1480,12 @@
     var html =
       '<button class="btn btn-sm" id="back-btn" style="margin-bottom:12px">← ' + esc(t('detail.backToList')) + '</button>' +
       /* v4: print icon is inline SVG (no emoji). */
-      (!isCustomer
-        ? ' <button class="btn btn-sm" id="print-report-btn" style="margin-bottom:12px">' +
-          '<span class="note-ic">' + icon('printer', 12) + '</span> ' +
-          esc(t('detail.printReport')) + '</button>'
-        : '') +
+      /* v5: customers can print their own ticket's service report too —
+         the report body filters to public comments only and skips the
+         parts section for customers (no part.view). */
+      ' <button class="btn btn-sm" id="print-report-btn" style="margin-bottom:12px">' +
+        '<span class="note-ic">' + icon('printer', 12) + '</span> ' +
+        esc(t('detail.printReport')) + '</button>' +
       '<div class="detail-head"><span class="tnum">' + esc(L.formatTicketNo(ticket.ticket_no)) + '</span>' +
         statusBadge(ticket.status) + priBadge(ticket.priority) +
         badge('status-open', t('source.' + ticket.source)) +
@@ -1521,7 +1522,7 @@
         '<div class="card"><h2>' + esc(t('detail.photos')) + '</h2>' +
           '<div id="photo-gallery"></div>' +
           (canUpload
-            ? '<div style="margin-top:10px"><input type="file" id="photo-input" accept="image/*" multiple>' +
+            ? '<div style="margin-top:10px"><input type="file" id="photo-input" accept="image/*,video/*" multiple>' +
               '<div class="hint" style="font-size:12px;color:var(--text-muted);margin:6px 0">' +
               esc(t('detail.photos.hint')) + '</div>' +
               '<button class="btn btn-sm btn-primary" id="photo-upload-btn">' + esc(t('common.upload')) + '</button></div>'
@@ -1675,12 +1676,20 @@
     if (canUpload) {
       document.getElementById('photo-upload-btn').onclick = async function () {
         var input = document.getElementById('photo-input');
-        var files = input.files;
+        var files = Array.prototype.slice.call(input.files || []);
         if (!files.length) return;
+        /* v5 P4: hard media limits against the already-attached files. */
+        var existingVideos = photos.filter(function (p) {
+          return (p.content_type || '').indexOf('video/') === 0;
+        }).length;
+        var limErrs = L.checkMediaLimits(files.map(function (f) {
+          return { name: f.name, size: f.size, type: f.type };
+        }), existingVideos, photos.length);
+        if (limErrs.length) { toast(mediaLimitMsg(limErrs[0]), 'error'); return; }
         var btn = this; btn.disabled = true; btn.textContent = t('common.uploading');
         try {
           for (var i = 0; i < files.length; i++) {
-            await uploadPhoto(ticket, files[i]);
+            await uploadPhoto(ticket, await prepareUploadFile(files[i]));
           }
           toast(t('detail.photoUploaded'), 'ok');
           render();
@@ -1809,6 +1818,46 @@
     };
   }
 
+  /* v5 P4: human-readable message for a checkMediaLimits rejection. */
+  function mediaLimitMsg(err) {
+    if (err.key === 'videoSize') return t('media.limit.videoSize').replace('{name}', err.file);
+    if (err.key === 'videoCount') return t('media.limit.videoCount');
+    return t('media.limit.fileCount');
+  }
+
+  /* v5 P3: client-side image compression (Supabase free tier = 1GB).
+     Images larger than IMAGE_MAX_DIM px are downscaled and re-encoded
+     as JPEG 0.8; small images and non-images pass through untouched. */
+  function prepareUploadFile(file) {
+    return new Promise(function (resolve) {
+      var isImg = (file.type || '').indexOf('image/') === 0;
+      if (!isImg || typeof Image === 'undefined' || !document.createElement('canvas').getContext) {
+        resolve(file); return;
+      }
+      var url = URL.createObjectURL(file);
+      var img = new Image();
+      img.onload = function () {
+        URL.revokeObjectURL(url);
+        var ts = L.computeTargetSize(img.naturalWidth || img.width,
+          img.naturalHeight || img.height, L.IMAGE_MAX_DIM);
+        if (!ts) { resolve(file); return; } /* small enough — keep original */
+        try {
+          var cv = document.createElement('canvas');
+          cv.width = ts.w; cv.height = ts.h;
+          cv.getContext('2d').drawImage(img, 0, 0, ts.w, ts.h);
+          cv.toBlob(function (blob) {
+            if (!blob) { resolve(file); return; }
+            var nm = file.name.replace(/\.[^.]+$/, '') + '.jpg';
+            try { resolve(new File([blob], nm, { type: 'image/jpeg' })); }
+            catch (e) { resolve(file); }
+          }, 'image/jpeg', 0.8);
+        } catch (e) { resolve(file); }
+      };
+      img.onerror = function () { URL.revokeObjectURL(url); resolve(file); };
+      img.src = url;
+    });
+  }
+
   async function uploadPhoto(ticket, file) {
     var path = L.photoPath(ticket.id, file.name);
     var up = await sb.storage.from('ticket-photos').upload(path, file, {
@@ -1842,10 +1891,14 @@
     }
     el.innerHTML = '<div class="gallery">' + items.map(function (it) {
       var ph = it.ph;
-      var img = it.url
-        ? '<a href="' + esc(it.url) + '" target="_blank" rel="noopener"><img src="' + esc(it.url) + '" alt=""></a>'
+      /* v5 P4: videos render as <video>, images as before. */
+      var isVideo = (ph.content_type || '').indexOf('video/') === 0;
+      var media = it.url
+        ? (isVideo
+          ? '<video controls preload="metadata" src="' + esc(it.url) + '" class="gv"></video>'
+          : '<a href="' + esc(it.url) + '" target="_blank" rel="noopener"><img src="' + esc(it.url) + '" alt=""></a>')
         : '<div class="empty">—</div>';
-      return '<div class="photo">' + img +
+      return '<div class="photo">' + media +
         '<div class="pmeta" title="' + esc(ph.file_name || '') + '">' +
           esc(ph.file_name || ph.storage_path) + '<br>' + esc(fmtDate(ph.created_at)) + '</div>' +
         (L.canViewTicket(ticket, state.profile)
@@ -1917,8 +1970,11 @@
       pr.id = 'print-report';
       document.body.appendChild(pr);
     }
+    /* v5: customers have no part.view — skip the parts section for them. */
+    var showParts = state.profile.role !== 'customer';
     /* parts used on this ticket */
     var txRows = '';
+    if (showParts) {
     try {
       var trx = await sb.from('part_transactions').select('*').eq('ticket_id', ticket.id).order('created_at');
       var txs = trx.error ? [] : (trx.data || []);
@@ -1940,6 +1996,7 @@
         }).join('');
       }
     } catch (e) { /* parts section renders empty — non-fatal */ }
+    } /* end if (showParts) */
     /* status history (oldest first) */
     var hist = [];
     function hadd(ts, label) { if (ts) hist.push({ ts: ts, label: label }); }
@@ -1975,12 +2032,15 @@
         row(t('detail.problemCategory'), ticket.problem_category || '—') +
         row(t('detail.resolution'), ticket.resolution || '—') +
       '</tbody></table>' +
-      '<h2>' + esc(t('report.partsUsed')) + '</h2>' +
-      (txRows
-        ? '<table><thead><tr><th>' + esc(t('report.partCode')) + '</th><th>' + esc(t('report.partName')) +
-          '</th><th>' + esc(t('report.qty')) + '</th><th>' + esc(t('report.date')) +
-          '</th><th>' + esc(t('report.note')) + '</th></tr></thead><tbody>' + txRows + '</tbody></table>'
-        : '<div>—</div>') +
+      /* v5: parts section hidden for customers (no part.view). */
+      (showParts
+        ? '<h2>' + esc(t('report.partsUsed')) + '</h2>' +
+          (txRows
+            ? '<table><thead><tr><th>' + esc(t('report.partCode')) + '</th><th>' + esc(t('report.partName')) +
+              '</th><th>' + esc(t('report.qty')) + '</th><th>' + esc(t('report.date')) +
+              '</th><th>' + esc(t('report.note')) + '</th></tr></thead><tbody>' + txRows + '</tbody></table>'
+            : '<div>—</div>')
+        : '') +
       '<h2>' + esc(t('report.statusHistory')) + '</h2>' +
       '<table><tbody>' + hist.map(function (h) {
         return '<tr><td style="width:200px">' + esc(fmtDate(h.ts)) + '</td><td>' + esc(h.label) + '</td></tr>';
@@ -2370,6 +2430,20 @@
     }
     var role = state.profile.role;
     var sources = role === 'customer' ? ['customer_feedback'] : L.SOURCES;
+    /* v5 P1: role-differentiated required fields. Customers only need
+       title + site + description + a photo/video; the technical fields
+       (serial/fw/error/actions) become optional with an "if known" hint. */
+    var isCustomer = (role === 'customer');
+    var reqIds = L.requiredNewTicketFields(role);
+    if (isCustomer && !state.sites.length) {
+      /* Edge: a customer with no sites in scope must not be dead-ended. */
+      reqIds = reqIds.filter(function (id) { return id !== 'nt-site'; });
+    }
+    var need = function (id) { return reqIds.indexOf(id) !== -1; };
+    var star = function (id) { return need(id) ? '<span class="req">*</span>' : ''; };
+    var reqAttr = function (id) { return need(id) ? ' required' : ''; };
+    var ifKnown = isCustomer
+      ? '<div class="hint">' + esc(t('new.hint.ifKnown')) + '</div>' : '';
     view.innerHTML =
       '<div class="page-head"><h1>' + esc(t('new.title')) + '</h1></div>' +
       /* v4: banner when launched from the planning cell workbench. */
@@ -2381,8 +2455,8 @@
         : '') +
       '<div class="card"><h2>' + esc(t('new.formTitle')) + '</h2>' +
       '<form id="new-form" class="nt-grid">' +
-        '<div class="field span2"><label>' + esc(t('new.field.title')) + '<span class="req">*</span></label>' +
-          '<input type="text" id="nt-title" required></div>' +
+        '<div class="field span2"><label>' + esc(t('new.field.title')) + star('nt-title') + '</label>' +
+          '<input type="text" id="nt-title"' + reqAttr('nt-title') + '></div>' +
         '<div class="field"><label>' + esc(t('new.field.priority')) + '</label>' +
           '<select id="nt-priority">' + L.PRIORITIES.map(function (pr) {
             return '<option value="' + pr + '"' + (pr === 'medium' ? ' selected' : '') + '>' +
@@ -2392,24 +2466,31 @@
           '<select id="nt-source">' + sources.map(function (s) {
             return '<option value="' + s + '">' + esc(t('source.' + s)) + '</option>';
           }).join('') + '</select>' +
-          (role === 'customer' ? '<div class="hint">' + esc(t('new.sourceHint.customer')) + '</div>' : '') + '</div>' +
-        '<div class="field"><label>' + esc(t('new.field.site')) + '</label>' +
-          '<select id="nt-site"><option value="">' + esc(t('common.none')) + '</option>' +
+          (isCustomer ? '<div class="hint">' + esc(t('new.sourceHint.customer')) + '</div>' : '') + '</div>' +
+        '<div class="field"><label>' + esc(t('new.field.site')) + star('nt-site') + '</label>' +
+          '<select id="nt-site"' + reqAttr('nt-site') + '><option value="">' + esc(t('common.none')) + '</option>' +
           state.sites.map(function (s) {
             return '<option value="' + s.id + '">' + esc(s.code + ' — ' + s.name) + '</option>';
           }).join('') + '</select>' +
           '<div class="inline-err" id="nt-contract-notice" style="display:none;margin-top:8px;margin-bottom:0">' +
             esc(t('new.contractNotice')) + '</div></div>' +
-        '<div class="field"><label>' + esc(t('detail.serialNumber')) + '<span class="req">*</span></label>' +
-          '<input type="text" id="nt-serial" required></div>' +
-        '<div class="field"><label>' + esc(t('detail.firmwareVersion')) + '<span class="req">*</span></label>' +
-          '<input type="text" id="nt-fw" required></div>' +
-        '<div class="field"><label>' + esc(t('detail.errorCode')) + '<span class="req">*</span></label>' +
-          '<input type="text" id="nt-err" required></div>' +
-        '<div class="field"><label>' + esc(t('detail.actionsTaken')) + '<span class="req">*</span></label>' +
-          '<input type="text" id="nt-actions" required></div>' +
-        '<div class="field span2"><label>' + esc(t('new.field.description')) + '<span class="req">*</span></label>' +
-          '<textarea id="nt-desc" required></textarea></div>' +
+        '<div class="field"><label>' + esc(t('detail.serialNumber')) + star('nt-serial') + '</label>' +
+          '<input type="text" id="nt-serial"' + reqAttr('nt-serial') + '>' + ifKnown + '</div>' +
+        '<div class="field"><label>' + esc(t('detail.firmwareVersion')) + star('nt-fw') + '</label>' +
+          '<input type="text" id="nt-fw"' + reqAttr('nt-fw') + '>' + ifKnown + '</div>' +
+        '<div class="field"><label>' + esc(t('detail.errorCode')) + star('nt-err') + '</label>' +
+          '<input type="text" id="nt-err"' + reqAttr('nt-err') + '>' + ifKnown + '</div>' +
+        '<div class="field"><label>' + esc(t('detail.actionsTaken')) + star('nt-actions') + '</label>' +
+          '<input type="text" id="nt-actions"' + reqAttr('nt-actions') + '>' + ifKnown + '</div>' +
+        '<div class="field span2"><label>' + esc(t('new.field.description')) + star('nt-desc') + '</label>' +
+          '<textarea id="nt-desc"' + reqAttr('nt-desc') + '></textarea></div>' +
+        /* v5 P2: photo/video picker right on the form. Customers must
+           attach at least one file (it replaces the technical fields). */
+        '<div class="field span2"><label>' + esc(t('new.field.attachments')) +
+          (isCustomer ? '<span class="req">*</span>' : '') + '</label>' +
+          '<input type="file" id="nt-files" accept="image/*,video/*" multiple>' +
+          '<div class="hint">' + esc(t('new.attachments.hint')) + '</div>' +
+          '<div id="nt-preview" class="nt-preview"></div></div>' +
         (state.v3
           ? '<div class="field span2"><label>' + esc(t('new.field.tags')) + '</label>' +
             '<input type="text" id="nt-tags" placeholder="' + esc(t('new.field.tagsPh')) + '"></div>'
@@ -2440,12 +2521,43 @@
     }
     siteSel.onchange = refreshContractState;
     refreshContractState();
+    /* v5 P2: live preview thumbnails for the picked files. */
+    var ntPrevUrls = [];
+    document.getElementById('nt-files').onchange = function () {
+      ntPrevUrls.forEach(function (u) { try { URL.revokeObjectURL(u); } catch (e) {} });
+      ntPrevUrls = [];
+      var prev = document.getElementById('nt-preview');
+      var files = this.files || [];
+      var html = '';
+      for (var i = 0; i < files.length; i++) {
+        var f = files[i], url = URL.createObjectURL(f);
+        ntPrevUrls.push(url);
+        var isVideo = (f.type || '').indexOf('video/') === 0;
+        html += '<div class="nt-thumb" title="' + esc(f.name) + '">' +
+          (isVideo
+            ? '<video src="' + url + '" preload="metadata"></video><span class="nt-vid">▶</span>'
+            : '<img src="' + url + '" alt="">') +
+          '</div>';
+      }
+      prev.innerHTML = html;
+    };
     document.getElementById('new-form').onsubmit = async function (e) {
       e.preventDefault();
       var get = function (id) { return document.getElementById(id).value.trim(); };
-      var required = ['nt-title', 'nt-serial', 'nt-fw', 'nt-err', 'nt-actions', 'nt-desc'];
-      var missing = required.some(function (id) { return !get(id); });
+      /* v5 P1: required set depends on the role. */
+      var missing = reqIds.some(function (id) { return !get(id); });
       if (missing) { toast(t('new.fillRequired'), 'error'); return; }
+      /* v5 P2: collect the picked files; customers must attach ≥1. */
+      var pickedFiles = Array.prototype.slice.call(
+        (document.getElementById('nt-files') || {}).files || []);
+      if (isCustomer && !pickedFiles.length) {
+        toast(t('new.attachments.required'), 'error'); return;
+      }
+      /* v5 P4: hard media limits before anything is uploaded. */
+      var limErrs = L.checkMediaLimits(pickedFiles.map(function (f) {
+        return { name: f.name, size: f.size, type: f.type };
+      }), 0, 0);
+      if (limErrs.length) { toast(mediaLimitMsg(limErrs[0]), 'error'); return; }
       var btn = document.getElementById('nt-submit');
       btn.disabled = true;
       try {
@@ -2500,6 +2612,21 @@
           } catch (e) { /* assignee/date stay unset — non-fatal */ }
         }
         toast(t('new.created', { no: L.formatTicketNo(ins.data.ticket_no) }), 'ok');
+        /* v5 P2: upload the form-picked files against the new ticket.
+           Ticket stays even if some uploads fail — report the failures. */
+        if (pickedFiles.length) {
+          btn.textContent = t('common.uploading');
+          var failed = [];
+          for (var fi = 0; fi < pickedFiles.length; fi++) {
+            try {
+              await uploadPhoto({ id: ins.data.id }, await prepareUploadFile(pickedFiles[fi]));
+            } catch (e) { failed.push(pickedFiles[fi].name); }
+          }
+          if (failed.length) {
+            toast(t('new.upload.partial').replace('{names}', failed.join(', ')), 'warn');
+          }
+        }
+        ntPrevUrls.forEach(function (u) { try { URL.revokeObjectURL(u); } catch (e) {} });
         nav('#/ticket/' + ins.data.id);
       } catch (err) { apiError(err); btn.disabled = false; }
     };

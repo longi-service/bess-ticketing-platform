@@ -44,6 +44,7 @@ const EXPECT_CAN = {
   /* v2 additions */
   'part.view':             { admin:1, dispatcher:1, pm:1, engineer:1, customer:0 },
   'part.manage':           { admin:1, dispatcher:1, pm:0, engineer:0, customer:0 },
+  'plan.view':             { admin:1, dispatcher:1, pm:1, engineer:1, customer:0 }, /* v5: customers excluded */
   'plan.manage':           { admin:1, dispatcher:1, pm:0, engineer:0, customer:0 },
   'contract.manage':       { admin:1, dispatcher:1, pm:0, engineer:0, customer:0 },
 };
@@ -311,6 +312,49 @@ ok('sanitizeFileName caps length at 120', L.sanitizeFileName('x'.repeat(200)).le
 const pp = L.photoPath('tid-123', 'My Photo.png', 'fixed-uuid');
 eq('photoPath convention <ticket>/<uuid>-<sanitized>', pp, 'tid-123/fixed-uuid-My_Photo.png');
 ok('photoPath default uid present', L.photoPath('t','f.png').indexOf('t/') === 0);
+
+/* ------------------------------------------------------------------ */
+/* v5: role-differentiated required fields, media limits, image sizing  */
+(function () {
+  arrEq('requiredNewTicketFields(customer)',
+    L.requiredNewTicketFields('customer'), ['nt-title', 'nt-desc', 'nt-site']);
+  arrEq('requiredNewTicketFields(dispatcher)',
+    L.requiredNewTicketFields('dispatcher'), ['nt-title', 'nt-desc', 'nt-serial', 'nt-fw', 'nt-err', 'nt-actions']);
+  arrEq('requiredNewTicketFields(admin) = staff set',
+    L.requiredNewTicketFields('admin'), L.requiredNewTicketFields('engineer'));
+  ok('customer set excludes technical fields',
+    L.requiredNewTicketFields('customer').indexOf('nt-fw') === -1);
+
+  var MB = 1024 * 1024;
+  var mk = function (name, size, type) { return { name: name, size: size, type: type }; };
+  eq('checkMediaLimits: all clear',
+    L.checkMediaLimits([mk('a.jpg', 500000, 'image/jpeg'), mk('b.mp4', 50 * MB, 'video/mp4')], 0, 0), []);
+  eq('checkMediaLimits: oversize video rejected',
+    L.checkMediaLimits([mk('big.mp4', 101 * MB, 'video/mp4')], 0, 0),
+    [{ file: 'big.mp4', key: 'videoSize' }]);
+  ok('checkMediaLimits: exactly 100MB video passes',
+    L.checkMediaLimits([mk('ok.mp4', 100 * MB, 'video/mp4')], 0, 0).length === 0);
+  eq('checkMediaLimits: 4th video rejected (3 max)',
+    L.checkMediaLimits([mk('v.mp4', 10 * MB, 'video/mp4')], 3, 3),
+    [{ file: 'v.mp4', key: 'videoCount' }]);
+  eq('checkMediaLimits: 11th file rejected (10 max)',
+    L.checkMediaLimits([mk('a.jpg', 1000, 'image/jpeg')], 0, 10),
+    [{ file: 'a.jpg', key: 'fileCount' }]);
+  eq('checkMediaLimits: rejected file does not consume quota',
+    L.checkMediaLimits(
+      [mk('big.mp4', 200 * MB, 'video/mp4'), mk('a.jpg', 1000, 'image/jpeg'),
+       mk('b.jpg', 1000, 'image/jpeg'), mk('c.jpg', 1000, 'image/jpeg')],
+      0, 6),
+    [{ file: 'big.mp4', key: 'videoSize' }]);
+  eq('checkMediaLimits: missing type treated as non-video',
+    L.checkMediaLimits([mk('x', 200 * MB, '')], 0, 0), []);
+
+  eq('computeTargetSize: small image → null', L.computeTargetSize(800, 600, 1600), null);
+  eq('computeTargetSize: exactly max → null', L.computeTargetSize(1600, 1200, 1600), null);
+  eq('computeTargetSize: landscape scaled', L.computeTargetSize(3200, 2400, 1600), { w: 1600, h: 1200 });
+  eq('computeTargetSize: portrait scaled', L.computeTargetSize(1200, 3200, 1600), { w: 600, h: 1600 });
+  eq('computeTargetSize: zero dims → null', L.computeTargetSize(0, 0, 1600), null);
+})();
 
 /* ------------------------------------------------------------------ */
 /* 6. v2: isContractActive / applyContract / dayState                   */

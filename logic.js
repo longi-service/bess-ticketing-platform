@@ -61,6 +61,7 @@
     /* v2 additions */
     'part.view':             ['admin', 'dispatcher', 'pm', 'engineer'],  // catalog/warehouse read
     'part.manage':           ['admin', 'dispatcher'],                   // catalog/warehouse CRUD
+    'plan.view':             ['admin', 'dispatcher', 'pm', 'engineer'],  // v5: planning/calendar read (customers excluded — isolation audit)
     'plan.manage':           ['admin', 'dispatcher'],                   // shift write
     'contract.manage':       ['admin', 'dispatcher']                    // LTSA contract CRUD
   };
@@ -553,6 +554,45 @@
     return ticketId + '/' + u + '-' + sanitizeFileName(fileName);
   }
 
+  /* v5: role-differentiated required fields on the new-ticket form.
+     Customers only need title + site + description + a photo/video;
+     the technical fields become optional for them. */
+  function requiredNewTicketFields(role) {
+    var base = ['nt-title', 'nt-desc'];
+    if (role === 'customer') return base.concat(['nt-site']);
+    return base.concat(['nt-serial', 'nt-fw', 'nt-err', 'nt-actions']);
+  }
+
+  /* v5: media limits (Supabase free tier = 1GB storage).
+     checkMediaLimits(newFiles, existingVideos, existingTotal) →
+     array of {file, key} rejections; [] = all clear. Pure. */
+  var MAX_VIDEO_BYTES = 100 * 1024 * 1024; /* 100 MB per video */
+  var MAX_VIDEOS_PER_TICKET = 3;
+  var MAX_FILES_PER_TICKET = 10;
+  var IMAGE_MAX_DIM = 1600; /* px — client-side compression target */
+  function checkMediaLimits(newFiles, existingVideos, existingTotal) {
+    var errs = [], vids = existingVideos || 0, total = existingTotal || 0;
+    for (var i = 0; i < newFiles.length; i++) {
+      var f = newFiles[i];
+      var isVideo = (f.type || '').indexOf('video/') === 0;
+      if (isVideo && f.size > MAX_VIDEO_BYTES) { errs.push({ file: f.name, key: 'videoSize' }); continue; }
+      if (isVideo && vids >= MAX_VIDEOS_PER_TICKET) { errs.push({ file: f.name, key: 'videoCount' }); continue; }
+      if (total >= MAX_FILES_PER_TICKET) { errs.push({ file: f.name, key: 'fileCount' }); continue; }
+      if (isVideo) vids++;
+      total++;
+    }
+    return errs;
+  }
+
+  /** computeTargetSize(w, h, maxDim) → {w,h} scaled to fit, or null when
+      no scaling is needed. Pure — the canvas work lives in app.js. */
+  function computeTargetSize(w, h, maxDim) {
+    var m = Math.max(w, h);
+    if (!(m > 0) || m <= maxDim) return null;
+    var s = maxDim / m;
+    return { w: Math.max(1, Math.round(w * s)), h: Math.max(1, Math.round(h * s)) };
+  }
+
   /* ------------------------------------------------------------------ */
   return {
     ROLES: ROLES,
@@ -589,6 +629,13 @@
     rankEngineers: rankEngineers,
     formatTicketNo: formatTicketNo,
     sanitizeFileName: sanitizeFileName,
-    photoPath: photoPath
+    photoPath: photoPath,
+    requiredNewTicketFields: requiredNewTicketFields,
+    checkMediaLimits: checkMediaLimits,
+    computeTargetSize: computeTargetSize,
+    MAX_VIDEO_BYTES: MAX_VIDEO_BYTES,
+    MAX_VIDEOS_PER_TICKET: MAX_VIDEOS_PER_TICKET,
+    MAX_FILES_PER_TICKET: MAX_FILES_PER_TICKET,
+    IMAGE_MAX_DIM: IMAGE_MAX_DIM
   };
 }));
