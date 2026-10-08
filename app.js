@@ -66,8 +66,12 @@
     slaPolicies: L.normalizePolicies(L.DEFAULT_SLA_POLICIES),
     sites: [],
     contracts: {},     // v2: site_id -> ltsa_contracts row
+    v3: false,         // v3: true once migration_v3 tables are detected
+    customers: [],     // v3: customer companies
     nameCache: {},       // profile id -> display name (best effort)
-    listFilters: { status: '', priority: '', source: '', site: '', assignee: '', q: '' },
+    listFilters: { status: '', priority: '', source: '', site: '', assignee: '', q: '', tag: '', customer: '',
+                 unassignedOnly: false, contractOnly: false }, // v3 U6: quick filters
+    listPage: 0,           // v3 D7: pagination cursor (page index), reset on filter change
     siteSearch: ''       // v2: sites tree search text
   };
 
@@ -179,6 +183,22 @@
         (cr.data || []).forEach(function (c) { state.contracts[c.site_id] = c; });
       }
     } catch (e) {}
+    // v3: feature probe — ticket_links exists only after migration_v3.
+    // Gates all v3 UI (tags, links, onsite dates, duty types, holidays,
+    // customers) so the app keeps working on a v2-only backend.
+    state.v3 = false;
+    try {
+      var v3p = await sb.from('ticket_links').select('id', { count: 'exact', head: true });
+      state.v3 = !v3p.error;
+    } catch (e) { state.v3 = false; }
+    // v3: customer companies (for site.customer_id picker + filters).
+    state.customers = [];
+    if (state.v3) {
+      try {
+        var cu = await sb.from('customers').select('*').order('company_name');
+        if (!cu.error) state.customers = cu.data || [];
+      } catch (e) {}
+    }
   }
 
   /** Role-aware base ticket query (RLS is the real filter; this trims noise).
@@ -200,13 +220,35 @@
     return q;
   }
 
-  async function fetchTickets(filters) {
-    var q = baseTicketQuery().order('updated_at', { ascending: false }).limit(500);
+  async function fetchTickets(filters, opts) {
+    opts = opts || {};
+    var q = applyTicketFilters(baseTicketQuery(), filters).order('updated_at', { ascending: false });
+    // v3 D7: pagination. Default keeps the old behavior (first 500 rows).
+    var limit = opts.limit != null ? opts.limit : 500;
+    if (opts.offset) q = q.range(opts.offset, opts.offset + limit - 1);
+    else if (limit) q = q.limit(limit);
+    var res = await q;
+    if (res.error) { apiError(res.error); return []; }
+    return res.data || [];
+  }
+
+  /** v3 D7/U6: shared filter application for fetchTickets/countTickets. */
+  function applyTicketFilters(q, filters) {
     if (filters.status) q = q.eq('status', filters.status);
     if (filters.priority) q = q.eq('priority', filters.priority);
     if (filters.source) q = q.eq('source', filters.source);
     if (filters.site) q = q.eq('site_id', filters.site);
     if (filters.assignee) q = q.eq('assigned_to', filters.assignee);
+    if (filters.tag) q = q.contains('tags', [filters.tag]);
+    // v3 F6: customer filter resolves to that customer's site ids.
+    if (filters.customer) {
+      var cSiteIds = state.sites.filter(function (s) { return s.customer_id === filters.customer; })
+        .map(function (s) { return s.id; });
+      q = cSiteIds.length ? q.in('site_id', cSiteIds) : q.eq('site_id', '00000000-0000-0000-0000-000000000000');
+    }
+    // v3 U6: quick filters.
+    if (filters.unassignedOnly) q = q.is('assigned_to', null);
+    if (filters.contractOnly) q = q.eq('is_ltsa', true);
     if (filters.q) {
       var term = filters.q.trim();
       var m = term.match(/^t-?0*(\d+)$/i);
@@ -216,9 +258,15 @@
         q = q.or('title.ilike.' + like + ',description.ilike.' + like);
       }
     }
+    return q;
+  }
+
+  /** v3 D7/U5: exact count of tickets matching filters (RLS-scoped, no rows). */
+  async function countTickets(filters) {
+    var q = applyTicketFilters(baseTicketQuery('id', { count: 'exact', head: true }), filters);
     var res = await q;
-    if (res.error) { apiError(res.error); return []; }
-    return res.data || [];
+    if (res.error || res.count == null) return 0;
+    return res.count;
   }
 
   /**
@@ -254,7 +302,7 @@
     var ms = h.match(/^#\/site\/([0-9a-f-]{36})$/i);
     if (ms) return { name: 'site', id: ms[1] };
     var name = h.replace(/^#\//, '').split('?')[0];
-    if (['login', 'dashboard', 'tickets', 'new', 'parts', 'planning', 'calendar', 'users', 'sites'].indexOf(name) === -1) name = 'dashboard';
+    if (['login', 'dashboard', 'tickets', 'new', 'parts', 'planning', 'calendar', 'users', 'sites', 'sla-alerts'].indexOf(name) === -1) name = 'dashboard';
     return { name: name };
   }
 
@@ -292,55 +340,102 @@
       else if (route.name === 'tickets') await viewTicketList(view);
       else if (route.name === 'detail') await viewTicketDetail(view, route.id);
       else if (route.name === 'new') viewNewTicket(view);
-      else if (route.name === 'parts') { if (guard('part.view')) await viewParts(view); }
+      else if (route.name === 'parts') {
+        /* v3 I3: explicit empty state instead of the generic guard denial. */
+        if (L.can('part.view', state.profile.role)) await viewParts(view);
+        else viewPartsNoAccess(view);
+      }
       else if (route.name === 'planning') await viewPlanning(view);
       else if (route.name === 'calendar') await viewCalendar(view);
       else if (route.name === 'site') { if (guard('site.manage')) await viewSiteDetail(view, route.id); }
       else if (route.name === 'users') { if (guard('user.manage')) await viewUsers(view); }
       else if (route.name === 'sites') { if (guard('site.manage')) await viewSites(view); }
+      else if (route.name === 'sla-alerts') {
+        /* v3 F8: dashboard-linked only (no nav item); dispatcher/admin/pm only. */
+        if (['admin', 'dispatcher', 'pm'].indexOf(state.profile.role) === -1) {
+          app.innerHTML = '<div class="page"><div class="inline-err">' +
+            esc(t('common.noPermissionView')) + '</div></div>';
+        } else await viewSlaAlerts(view);
+      }
     } catch (e) {
       view.innerHTML = '<div class="inline-err">' + esc(e.message || t('common.error')) + '</div>';
     }
   }
 
   /* ------------------------------- shell -------------------------------- */
+  /* v3: light sidebar (230px) replaces the top nav bar. Layout-only change:
+     same 8 links, same order, same permission gating, same i18n labels. */
   function renderShell(active) {
     var p = state.profile;
-    var links = [
-      { id: 'dashboard', href: '#/dashboard', label: t('nav.dashboard'), perm: null },
-      { id: 'tickets',   href: '#/tickets',   label: t('nav.tickets'),   perm: null },
-      { id: 'new',       href: '#/new',       label: t('nav.newTicket'), perm: 'ticket.create' },
-      { id: 'parts',     href: '#/parts',     label: t('nav.parts'),     perm: 'part.view' },
-      { id: 'planning',  href: '#/planning',  label: t('nav.planning'),  perm: null },
-      { id: 'calendar',  href: '#/calendar',  label: t('nav.calendar'),  perm: null },
-      { id: 'sites',     href: '#/sites',     label: t('nav.sites'),     perm: 'site.manage' },
-      { id: 'users',     href: '#/users',     label: t('nav.users'),     perm: 'user.manage' }
+    var groups = [
+      { title: t('nav.group.overview'), links: [
+        { id: 'dashboard', href: '#/dashboard', label: t('nav.dashboard'), perm: null }
+      ] },
+      { title: t('nav.group.work'), links: [
+        { id: 'tickets',   href: '#/tickets',   label: t('nav.tickets'),   perm: null },
+        { id: 'new',       href: '#/new',       label: t('nav.newTicket'), perm: 'ticket.create' },
+        { id: 'parts',     href: '#/parts',     label: t('nav.parts'),     perm: 'part.view' },
+        { id: 'planning',  href: '#/planning',  label: t('nav.planning'),  perm: null },
+        { id: 'calendar',  href: '#/calendar',  label: t('nav.calendar'),  perm: null }
+      ] },
+      { title: t('nav.group.manage'), links: [
+        { id: 'sites',     href: '#/sites',     label: t('nav.sites'),     perm: 'site.manage' },
+        { id: 'users',     href: '#/users',     label: t('nav.users'),     perm: 'user.manage' }
+      ] }
     ];
-    var navHtml = links
-      .filter(function (l) { return !l.perm || L.can(l.perm, p.role); })
-      .map(function (l) {
-        return '<a href="' + l.href + '"' + (active === l.id ? ' class="active"' : '') + '>' +
-               esc(l.label) + '</a>';
-      }).join('');
+    var navHtml = groups.map(function (g) {
+      var items = g.links
+        .filter(function (l) { return !l.perm || L.can(l.perm, p.role); })
+        .map(function (l) {
+          return '<a href="' + l.href + '"' + (active === l.id ? ' class="active"' : '') + '>' +
+                 esc(l.label) + '</a>';
+        }).join('');
+      if (!items) return '';
+      return '<div class="nav-group"><div class="nav-group-title">' + esc(g.title) + '</div>' +
+             items + '</div>';
+    }).join('');
     app.innerHTML =
-      '<header class="app-header"><div class="header-inner">' +
-        '<div class="brand"><img src="assets/longi-logo.svg" alt="LONGi">' +
-        '<span class="tagline">' + esc(t('app.tagline')) + '</span></div>' +
-        '<nav class="main-nav">' + navHtml + '</nav>' +
-        '<div class="header-spacer"></div>' +
-        '<div class="header-user">' +
-          '<button class="lang-toggle" id="lang-toggle">' +
-            (lang === 'en' ? '中文' : 'EN') + '</button>' +
-          '<div class="who"><b>' + esc(p.display_name || p.email) + '</b>' +
-          '<span><span class="role-tag">' + esc(t('role.' + p.role)) + '</span></span></div>' +
-          '<button class="btn btn-sm" id="logout-btn">' + esc(t('nav.logout')) + '</button>' +
+      '<div class="app-shell">' +
+        '<aside class="sidebar" id="sidebar">' +
+          '<div class="side-brand"><img src="assets/longi-logo.svg" alt="LONGi">' +
+          '<span class="tagline">' + esc(t('app.tagline')) + '</span></div>' +
+          '<nav class="side-nav">' + navHtml + '</nav>' +
+          '<div class="side-user">' +
+            '<div class="who"><b>' + esc(p.display_name || p.email) + '</b>' +
+            '<span class="role-tag">' + esc(t('role.' + p.role)) + '</span></div>' +
+            '<div class="side-user-actions">' +
+              '<button class="lang-toggle" id="lang-toggle">' +
+                (lang === 'en' ? '中文' : 'EN') + '</button>' +
+              '<button class="btn btn-sm" id="logout-btn">' + esc(t('nav.logout')) + '</button>' +
+            '</div>' +
+          '</div>' +
+        '</aside>' +
+        '<div class="sidebar-scrim" id="sidebar-scrim"></div>' +
+        '<div class="main-col">' +
+          '<div class="mobile-topbar">' +
+            '<button class="hamburger" id="hamburger" aria-label="Menu">☰</button>' +
+            '<img src="assets/longi-logo.svg" alt="LONGi" class="mobile-logo">' +
+          '</div>' +
+          '<main class="page" id="view"></main>' +
         '</div>' +
-      '</div></header>' +
-      '<main class="page" id="view"></main>';
+      '</div>';
     document.getElementById('lang-toggle').onclick = function () {
       setLang(lang === 'en' ? 'zh' : 'en');
     };
     document.getElementById('logout-btn').onclick = logout;
+    // Mobile off-canvas behavior.
+    document.getElementById('hamburger').onclick = function () {
+      document.body.classList.toggle('sidebar-open');
+    };
+    document.getElementById('sidebar-scrim').onclick = function () {
+      document.body.classList.remove('sidebar-open');
+    };
+    // Close the off-canvas sidebar whenever navigation happens.
+    document.querySelectorAll('.side-nav a').forEach(function (a) {
+      a.addEventListener('click', function () {
+        document.body.classList.remove('sidebar-open');
+      });
+    });
   }
 
   async function logout() {
@@ -662,6 +757,29 @@
         '<td>' + (w.breached ? badge('sla-breached', String(w.breached)) : '<span class="muted">0</span>') + '</td></tr>';
     }).join('');
 
+    /* v3 U2: needs-attention queue — breached first, then unassigned, top 10 */
+    var breachedIds = {};
+    breached.forEach(function (x) { breachedIds[x.id] = true; });
+    var attn = breached.concat(unassigned.filter(function (x) {
+      return !breachedIds[x.id];
+    })).slice(0, 10);
+    var attnRows = attn.map(function (x) {
+      var ageD = Math.max(0, Math.floor((nowMs - new Date(x.created_at).getTime()) / 86400000));
+      var sla = L.ticketSla(x);
+      var st = ['response', 'onsite', 'resolution'].map(function (k) { return sla[k].state; });
+      var bCls = st.indexOf('breached') !== -1 ? 'sla-breached' :
+                 st.indexOf('warning') !== -1 ? 'sla-warning' : 'sla-ok';
+      var bLbl = bCls === 'sla-breached' ? t('detail.sla.breached') :
+                 bCls === 'sla-warning' ? t('detail.sla.warning') : t('detail.sla.ok');
+      return '<div class="attn-row" data-nav="#/ticket/' + x.id + '">' +
+        '<span class="tnum">' + esc(L.formatTicketNo(x.ticket_no)) + '</span>' +
+        '<span class="ttl">' + esc(x.title) + '</span>' +
+        '<span class="meta">' + esc(siteShort(x.site_id)) + ' · ' + ageD + 'd</span>' +
+        badge(bCls, bLbl) +
+        (!x.assigned_to ? ' <span class="pill-unassigned">' + esc(t('list.unassigned')) + '</span>' : '') +
+      '</div>';
+    }).join('');
+
     var html =
       '<div class="page-head"><div><h1>' + esc(t('dash.title')) + '</h1>' +
       '<p class="page-sub">' + esc(t('dash.welcome')) + ', ' + esc(state.profile.display_name || '') +
@@ -670,13 +788,19 @@
         counter(t('dash.openTickets'), open.length, false, '#/tickets') +
         counter(t('dash.contractOpen'), contractOpen.length, contractOpen.length > 0, '#/tickets') +
         counter(t('dash.unassigned'), unassigned.length, unassigned.length > 0, '#/tickets') +
-        counter(t('dash.breachedSla'), breached.length, breached.length > 0, '#/tickets') +
+        /* v3 F8: breached-SLA counter navigates to the SLA alerts view (staff only). */
+        counter(t('dash.breachedSla'), breached.length, breached.length > 0,
+                ['admin', 'dispatcher', 'pm'].indexOf(state.profile.role) !== -1 ? '#/sla-alerts' : '#/tickets') +
       '</div>' +
       '<div class="grid-4" style="margin-top:16px">' +
         counter(t('dash.myTickets'), mine.length, false, '#/tickets') +
         counter(t('dash.avgResponse'), avgRespHrs == null ? '—' : avgRespHrs.toFixed(1) + 'h', false, '#/tickets') +
         counter(t('dash.closed30'), closed30.length, false, '#/tickets') +
         gaugeCard(t('dash.slaCompliance'), slaPct, slaPct != null && slaPct < 90, '#/tickets') +
+      '</div>' +
+      '<div class="card" style="margin-top:16px"><h2 class="section-title">' +
+        esc(t('dash.needsAttention')) + '</h2>' +
+        (attnRows || '<div class="empty">' + esc(t('dash.attention.none')) + '</div>') +
       '</div>' +
       '<div class="grid-2" style="margin-top:16px">' +
         donutCard(t('dash.byStatus'), byStatus) +
@@ -718,6 +842,42 @@
     bindTableNav(view);
   }
 
+  /* v3 F8: SLA alerts — breached clocks + clocks with <2h left, sorted by
+     urgency. Dashboard-linked only (no nav item); dispatcher/admin/pm. */
+  async function viewSlaAlerts(view) {
+    var tickets = await fetchTickets({});
+    await runEscalationJob(tickets);
+    await resolveNames(collectIds(tickets));
+    var breached = [], warning = [];
+    tickets.forEach(function (x) {
+      var lvl = L.slaAlertLevel(x);
+      if (lvl === 'breached') breached.push(x);
+      else if (lvl === 'warning') warning.push(x);
+    });
+    /* urgency: smallest remaining time first (most overdue → negative). */
+    function worstRemaining(x) {
+      var sla = L.ticketSla(x);
+      var m = null;
+      ['response', 'onsite', 'resolution'].forEach(function (k) {
+        if (sla[k].remainingMs != null) m = m == null ? sla[k].remainingMs : Math.min(m, sla[k].remainingMs);
+      });
+      return m == null ? Infinity : m;
+    }
+    breached.sort(function (a, b) { return worstRemaining(a) - worstRemaining(b); });
+    warning.sort(function (a, b) { return worstRemaining(a) - worstRemaining(b); });
+
+    view.innerHTML =
+      '<div class="page-head"><h1>' + esc(t('sla.title')) + '</h1></div>' +
+      '<div class="card"><h2 class="section-title">' + esc(t('sla.breached')) + ' (' + breached.length + ')</h2>' +
+        (breached.length ? ticketTable(breached)
+                         : '<div class="empty">' + esc(t('sla.none')) + '</div>') + '</div>' +
+      '<div class="card" style="margin-top:16px"><h2 class="section-title">' +
+        esc(t('sla.warning2h')) + ' (' + warning.length + ')</h2>' +
+        (warning.length ? ticketTable(warning)
+                        : '<div class="empty">' + esc(t('sla.none')) + '</div>') + '</div>';
+    bindTableNav(view);
+  }
+
   function collectIds(tickets) {
     var ids = [];
     tickets.forEach(function (x) {
@@ -733,24 +893,68 @@
   function statusBadge(s) { return badge('status-' + s, t('status.' + s)); }
   function priBadge(p) { return badge('pri-' + p, t('priority.' + p)); }
 
-  function ticketTable(tickets) {
-    if (!tickets.length) return '<div class="empty">' + esc(t('list.noResults')) + '</div>';
-    var rows = tickets.map(function (x) {
+  /* v3 F3: tags — comma-separated input -> string array; pills renderer. */
+  function parseTags(s) {
+    var seen = {};
+    return String(s || '').split(',').map(function (x) { return x.trim(); })
+      .filter(function (x) { return x && !seen[x] && (seen[x] = true); }).slice(0, 20);
+  }
+  function tagPills(tags) {
+    tags = tags || [];
+    if (!tags.length) return '';
+    return '<span class="tag-pills">' + tags.map(function (x) {
+      return '<span class="tag-pill">' + esc(x) + '</span>';
+    }).join('') + '</span>';
+  }
+
+  /* v3 D7: single row HTML — "Load more" appends rows built by this. */
+  function ticketRowHtml(x) {
       var sla = L.ticketSla(x);
-      var worst = ['response', 'onsite', 'resolution'].some(function (k) { return sla[k].state === 'breached'; });
-      return '<tr class="clickable' + (x.is_ltsa ? ' is-ltsa' : '') + '" data-id="' + x.id + '">' +
+      var states = ['response', 'onsite', 'resolution'].map(function (k) { return sla[k].state; });
+      /* v3 U4: worst-clock badge — breached > warning > ok */
+      var bCls = states.indexOf('breached') !== -1 ? 'sla-breached' :
+                 states.indexOf('warning') !== -1 ? 'sla-warning' : 'sla-ok';
+      var bLbl = bCls === 'sla-breached' ? t('detail.sla.breached') :
+                 bCls === 'sla-warning' ? t('detail.sla.warning') : t('detail.sla.ok');
+      /* v3 U3: unassigned open rows glow orange so stalled tickets can't be missed */
+      var isOpen = L.TERMINAL_STATUSES.indexOf(x.status) === -1;
+      var unassignedOpen = isOpen && !x.assigned_to;
+      return '<tr class="clickable' + (x.is_ltsa ? ' is-ltsa' : '') +
+        (unassignedOpen ? ' unassigned-open' : '') + '" data-id="' + x.id + '">' +
         '<td class="tnum">' + esc(L.formatTicketNo(x.ticket_no)) + '</td>' +
         '<td>' + esc(x.title) + '</td>' +
         '<td>' + statusBadge(x.status) + '</td>' +
         '<td>' + priBadge(x.priority) + '</td>' +
         '<td class="muted">' + esc(siteShort(x.site_id)) + '</td>' +
-        '<td>' + esc(displayName(x.assigned_to)) + '</td>' +
-        '<td>' + (worst ? badge('sla-breached', t('detail.sla.breached'))
-                        : badge('sla-ok', t('detail.sla.ok'))) +
+        '<td>' + (x.assigned_to ? esc(displayName(x.assigned_to))
+                                : '<span class="pill-unassigned">' + esc(t('list.unassigned')) + '</span>') + '</td>' +
+        '<td>' + badge(bCls, bLbl) +
              (x.escalated ? ' ' + badge('escalated', t('detail.escalated')) : '') + '</td>' +
         '<td class="muted">' + esc(fmtDate(x.updated_at)) + '</td>' +
       '</tr>';
-    }).join('');
+  }
+
+  function ticketTable(tickets) {
+    if (!tickets.length) return '<div class="empty">' + esc(t('list.noResults')) + '</div>';
+    var rows = tickets.map(ticketRowHtml).join('');
+      return '<tr class="clickable' + (x.is_ltsa ? ' is-ltsa' : '') +
+        (unassignedOpen ? ' unassigned-open' : '') + '" data-id="' + x.id + '">' +
+        '<td class="tnum">' + esc(L.formatTicketNo(x.ticket_no)) + '</td>' +
+        '<td>' + esc(x.title) + '</td>' +
+        '<td>' + statusBadge(x.status) + '</td>' +
+        '<td>' + priBadge(x.priority) + '</td>' +
+        '<td class="muted">' + esc(siteShort(x.site_id)) + '</td>' +
+        '<td>' + (x.assigned_to ? esc(displayName(x.assigned_to))
+                                : '<span class="pill-unassigned">' + esc(t('list.unassigned')) + '</span>') + '</td>' +
+        '<td>' + badge(bCls, bLbl) +
+             (x.escalated ? ' ' + badge('escalated', t('detail.escalated')) : '') + '</td>' +
+        '<td class="muted">' + esc(fmtDate(x.updated_at)) + '</td>' +
+      '</tr>';
+  }
+
+  function ticketTable(tickets) {
+    if (!tickets.length) return '<div class="empty">' + esc(t('list.noResults')) + '</div>';
+    var rows = tickets.map(ticketRowHtml).join('');
     return '<div style="overflow-x:auto"><table class="tbl"><thead><tr>' +
       '<th>' + esc(t('list.columns.ticket')) + '</th>' +
       '<th>' + esc(t('list.columns.title')) + '</th>' +
@@ -778,11 +982,68 @@
   }
 
   /* ----------------------------- ticket list ---------------------------- */
+  /* v3 D7: page size for the ticket list ("Load more" pagination). */
+  var LIST_PAGE_SIZE = 50;
+
+  /* v3 U5: statuses shown as tracker tabs (excludes the unused 'pending'). */
+  var TRACKER_STATUSES = ['open', 'in_progress', 'pending_customer', 'resolved', 'closed'];
+
+  /* v3 U12: saved views live in localStorage — UI PREFERENCE ONLY.
+     Ticket/user data is NEVER written to localStorage (old-demo bug). */
+  var VIEWS_KEY = 'bess_views';
+  function blankFilters() {
+    return { status: '', priority: '', source: '', site: '', assignee: '', q: '', tag: '', customer: '',
+             unassignedOnly: false, contractOnly: false };
+  }
+  function loadSavedViews() {
+    try {
+      var raw = localStorage.getItem(VIEWS_KEY);
+      var arr = raw ? JSON.parse(raw) : [];
+      return Array.isArray(arr) ? arr : [];
+    } catch (e) { return []; }
+  }
+  function storeSavedViews(arr) {
+    try { localStorage.setItem(VIEWS_KEY, JSON.stringify(arr)); } catch (e) {}
+  }
+
   async function viewTicketList(view) {
     var f = state.listFilters;
-    var tickets = await fetchTickets(f);
+    state.listPage = 0; // v3 D7: pagination cursor resets on every filter change
+    var tickets = await fetchTickets(f, { limit: LIST_PAGE_SIZE });
     await runEscalationJob(tickets);
     await resolveNames(collectIds(tickets));
+
+    /* v3 U8/D7: scope/filter transparency — never silently hide records.
+       filteredCount = matches for the CURRENT filters (all pages);
+       totalVisible  = unfiltered visible count (RLS already applied). */
+    var filteredCount = await countTickets(f);
+    var totalVisible = filteredCount;
+    try {
+      var cntRes = await baseTicketQuery('id', { count: 'exact', head: true });
+      if (cntRes && cntRes.count != null) totalVisible = cntRes.count;
+    } catch (e) {}
+
+    /* v3 U5: tracker-tab counts respect every filter EXCEPT the tab (status) itself. */
+    var fNoStatus = Object.assign({}, f, { status: '' });
+    var tabCounts = {};
+    tabCounts[''] = await countTickets(fNoStatus);
+    for (var ti = 0; ti < TRACKER_STATUSES.length; ti++) {
+      var tst = TRACKER_STATUSES[ti];
+      tabCounts[tst] = await countTickets(Object.assign({}, fNoStatus, { status: tst }));
+    }
+
+    var role = state.profile.role;
+    var filtersActive = !!(f.status || f.priority || f.source || f.site || f.q || f.tag || f.customer ||
+                           f.unassignedOnly || f.contractOnly); // v3 U6 quick filters count too
+    var scopeLimited = role === 'engineer' || role === 'customer' ||
+      (role === 'pm' && (state.profile.project_scope || []).length > 0);
+    /* v3 D7: "Showing X of Y" = loaded rows vs. filter matches (all pages). */
+    function scopeLineInner(loaded) {
+      return esc(t('list.showing').replace('{x}', String(loaded)).replace('{y}', String(filteredCount))) +
+        (scopeLimited ? ' · ' + esc(t('list.scopeLimited')) : '') +
+        (filtersActive && totalVisible > filteredCount
+          ? ' · ' + esc(t('list.filtersHide').replace('{n}', String(totalVisible - filteredCount))) : '');
+    }
 
     function opt(val, label, sel) {
       return '<option value="' + esc(val) + '"' + (sel === val ? ' selected' : '') + '>' + esc(label) + '</option>';
@@ -794,11 +1055,30 @@
     var siteOpts = '<option value="">' + esc(t('common.all')) + '</option>' +
       state.sites.map(function (s) { return opt(s.id, s.code + ' — ' + s.name, f.site); }).join('');
 
+    /* v3 U5: status tracker tabs with counts (above the filter card). */
+    var tabBtns = [{ st: '', label: t('list.tab.all') }].concat(TRACKER_STATUSES.map(function (st) {
+      return { st: st, label: t('status.' + st) };
+    })).map(function (tb) {
+      return '<button data-tab="' + tb.st + '"' + (f.status === tb.st ? ' class="active"' : '') + '>' +
+        esc(tb.label) + ' <span class="tab-count">' + (tabCounts[tb.st] || 0) + '</span></button>';
+    }).join('');
+
+    /* v3 U12: saved views (localStorage, UI preference only). */
+    var savedViews = loadSavedViews();
+    var viewsSel = '<select id="view-sel" style="max-width:220px"><option value="">' + esc(t('list.views')) + '</option>' +
+      savedViews.map(function (v, i) {
+        return '<option value="' + i + '">' + esc(v.name) + '</option>';
+      }).join('') + '</select>';
+
+    /* v3 U11: CSV export — dispatcher/admin/pm only. */
+    var canExport = ['admin', 'dispatcher', 'pm'].indexOf(role) !== -1;
+
     view.innerHTML =
       '<div class="page-head"><h1>' + esc(t('list.title')) + '</h1>' +
-      (L.can('ticket.create', state.profile.role)
+      (L.can('ticket.create', role)
         ? '<button class="btn btn-primary" id="new-ticket-btn">+ ' + esc(t('nav.newTicket')) + '</button>' : '') +
       '</div>' +
+      '<div class="tabs" id="status-tabs">' + tabBtns + '</div>' +
       '<div class="card"><div class="filters">' +
         '<div class="f search"><label>' + esc(t('common.search')) + '</label>' +
           '<input type="text" id="f-q" placeholder="' + esc(t('list.searchPh')) + '" value="' + esc(f.q) + '"></div>' +
@@ -810,11 +1090,44 @@
           '<select id="f-source">' + selectOpts(L.SOURCES, 'source.', f.source) + '</select></div>' +
         '<div class="f"><label>' + esc(t('list.filter.site')) + '</label>' +
           '<select id="f-site">' + siteOpts + '</select></div>' +
+        (state.v3
+          ? '<div class="f"><label>' + esc(t('list.filter.tag')) + '</label>' +
+            '<input type="text" id="f-tag" placeholder="' + esc(t('list.filter.tagPh')) +
+            '" value="' + esc(f.tag || '') + '"></div>'
+          : '') +
+        (state.v3 && state.customers.length
+          ? '<div class="f"><label>' + esc(t('list.filter.customer')) + '</label>' +
+            '<select id="f-customer"><option value="">' + esc(t('common.all')) + '</option>' +
+            state.customers.map(function (c) {
+              return '<option value="' + c.id + '"' + (f.customer === c.id ? ' selected' : '') + '>' +
+                esc(c.company_name) + '</option>';
+            }).join('') + '</select></div>'
+          : '') +
+        /* v3 U6: quick-filter toggle chips */
+        '<div class="f"><label>&nbsp;</label><div class="qf-chips">' +
+          '<button class="chip' + (f.unassignedOnly ? ' active' : '') + '" id="qf-unassigned">' +
+            esc(t('list.quickFilter.unassignedOnly')) + '</button>' +
+          '<button class="chip' + (f.contractOnly ? ' active' : '') + '" id="qf-contract">' +
+            esc(t('list.quickFilter.contractOnly')) + '</button>' +
+        '</div></div>' +
       '</div>' +
-      '<div style="margin-bottom:12px"><button class="btn btn-sm" id="f-clear">' + esc(t('common.clear')) + '</button></div>' +
-      '<div id="list-result">' + ticketTable(tickets) + '</div></div>';
+      '<div style="margin-bottom:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">' +
+        '<button class="btn btn-sm" id="f-clear">' + esc(t('common.clear')) + '</button>' +
+        (canExport ? '<button class="btn btn-sm" id="export-csv">' + esc(t('list.exportCsv')) + '</button>' : '') +
+        viewsSel +
+        '<button class="btn btn-sm" id="view-save">' + esc(t('list.saveView')) + '</button>' +
+        '<button class="btn btn-sm btn-danger" id="view-del">' + esc(t('list.viewDelete')) + '</button>' +
+      '</div>' +
+      '<div class="list-scope-line" id="list-scope-line">' + scopeLineInner(tickets.length) + '</div>' +
+      '<div id="list-result">' + ticketTable(tickets) + '</div>' +
+      /* v3 D7: shown when the fetched page is full (more may exist) */
+      (tickets.length === LIST_PAGE_SIZE
+        ? '<div style="margin-top:12px;text-align:center"><button class="btn" id="load-more">' +
+          esc(t('list.loadMore')) + '</button></div>'
+        : '') +
+      '</div>';
 
-    if (L.can('ticket.create', state.profile.role)) {
+    if (L.can('ticket.create', role)) {
       document.getElementById('new-ticket-btn').onclick = function () { nav('#/new'); };
     }
     var deb = null;
@@ -824,19 +1137,141 @@
       f.source = document.getElementById('f-source').value;
       f.site = document.getElementById('f-site').value;
       f.q = document.getElementById('f-q').value;
+      var tagEl = document.getElementById('f-tag');
+      if (tagEl) f.tag = tagEl.value.trim();
+      var custEl = document.getElementById('f-customer');
+      if (custEl) f.customer = custEl.value;
       render();
     }
+    /* v3 U5: tab click sets the status filter and re-renders. */
+    view.querySelectorAll('#status-tabs button').forEach(function (b) {
+      b.onclick = function () { f.status = b.getAttribute('data-tab'); render(); };
+    });
+    /* v3 U6: quick-filter chips toggle and re-render. */
+    document.getElementById('qf-unassigned').onclick = function () {
+      f.unassignedOnly = !f.unassignedOnly; render();
+    };
+    document.getElementById('qf-contract').onclick = function () {
+      f.contractOnly = !f.contractOnly; render();
+    };
     ['f-status', 'f-priority', 'f-source', 'f-site'].forEach(function (id) {
       document.getElementById(id).onchange = refetch;
     });
+    var custSel = document.getElementById('f-customer');
+    if (custSel) custSel.onchange = refetch;
     document.getElementById('f-q').oninput = function () {
       clearTimeout(deb); deb = setTimeout(refetch, 400);
     };
+    var tagInput = document.getElementById('f-tag');
+    if (tagInput) tagInput.oninput = function () {
+      clearTimeout(deb); deb = setTimeout(refetch, 400);
+    };
     document.getElementById('f-clear').onclick = function () {
-      state.listFilters = { status: '', priority: '', source: '', site: '', assignee: '', q: '' };
+      state.listFilters = blankFilters();
       render();
     };
+    /* v3 U12: saved views. */
+    document.getElementById('view-save').onclick = function () {
+      var name = window.prompt(t('list.viewName'), '');
+      if (name == null) return;
+      name = name.trim();
+      if (!name) return;
+      var arr = loadSavedViews();
+      var dup = arr.some(function (v) { return v.name === name; });
+      if (dup) { toast(t('list.viewExists'), 'error'); return; }
+      arr.push({ name: name, filters: {
+        status: f.status, priority: f.priority, source: f.source, site: f.site,
+        tag: f.tag || '', customer: f.customer || '',
+        unassignedOnly: !!f.unassignedOnly, contractOnly: !!f.contractOnly, q: f.q || ''
+      } });
+      storeSavedViews(arr);
+      toast(t('list.viewSaved'), 'ok');
+      render();
+    };
+    document.getElementById('view-sel').onchange = function () {
+      var idx = this.value;
+      if (idx === '') return;
+      var v = loadSavedViews()[Number(idx)];
+      if (!v) return;
+      var nf = blankFilters();
+      Object.keys(nf).forEach(function (k) {
+        if (v.filters && v.filters[k] != null) nf[k] = v.filters[k];
+      });
+      state.listFilters = nf;
+      render();
+    };
+    document.getElementById('view-del').onclick = function () {
+      var sel = document.getElementById('view-sel');
+      if (sel.value === '') return;
+      var arr = loadSavedViews();
+      arr.splice(Number(sel.value), 1);
+      storeSavedViews(arr);
+      toast(t('list.viewDeleted'), 'ok');
+      render();
+    };
+    /* v3 U11: CSV export (all pages of the current filters, capped). */
+    var expBtn = document.getElementById('export-csv');
+    if (expBtn) expBtn.onclick = function () { exportTicketsCsv(f, expBtn); };
+    /* v3 D7: load more appends rows without a full re-render. */
+    var loadBtn = document.getElementById('load-more');
+    if (loadBtn) loadBtn.onclick = async function () {
+      var btn = this; btn.disabled = true;
+      state.listPage++;
+      var more = await fetchTickets(f, { limit: LIST_PAGE_SIZE, offset: state.listPage * LIST_PAGE_SIZE });
+      await runEscalationJob(more);
+      await resolveNames(collectIds(more));
+      var tbody = view.querySelector('#list-result tbody');
+      if (tbody && more.length) {
+        tbody.insertAdjacentHTML('beforeend', more.map(ticketRowHtml).join(''));
+        bindTableNav(view);
+      }
+      var scopeEl = document.getElementById('list-scope-line');
+      if (scopeEl) {
+        var loadedNow = (view.querySelectorAll('#list-result tbody tr') || []).length;
+        scopeEl.innerHTML = scopeLineInner(loadedNow);
+      }
+      if (more.length < LIST_PAGE_SIZE) { if (btn.parentNode) btn.parentNode.remove(); }
+      else btn.disabled = false;
+    };
     bindTableNav(view);
+  }
+
+  /* v3 U11: export the CURRENTLY filtered tickets (all pages, cap 2000).
+     Semicolon delimiter + UTF-8 BOM so Excel opens it directly. */
+  async function exportTicketsCsv(f, btn) {
+    btn.disabled = true;
+    try {
+      var rows = await fetchTickets(f, { limit: 2000 });
+      await resolveNames(collectIds(rows));
+      function cell(v) {
+        var s = v == null ? '' : String(v);
+        if (/[;"\r\n]/.test(s)) s = '"' + s.replace(/"/g, '""') + '"';
+        return s;
+      }
+      var lines = [[ 'ticket_no', 'title', 'status', 'priority', 'site', 'assignee',
+                     'created_at', 'updated_at', 'sla_response_at', 'sla_onsite_at', 'sla_resolve_at'
+                   ].map(cell).join(';')];
+      rows.forEach(function (x) {
+        lines.push([
+          L.formatTicketNo(x.ticket_no), x.title, x.status, x.priority,
+          siteShort(x.site_id), x.assigned_to ? displayName(x.assigned_to) : '',
+          x.created_at, x.updated_at, x.sla_response_at, x.sla_onsite_at, x.sla_resolve_at
+        ].map(cell).join(';'));
+      });
+      function p2(n) { return String(n).padStart(2, '0'); }
+      var d = new Date();
+      var fname = 'tickets-' + d.getFullYear() + p2(d.getMonth() + 1) + p2(d.getDate()) +
+                  '-' + p2(d.getHours()) + p2(d.getMinutes()) + '.csv';
+      var blob = new Blob(['﻿' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8' });
+      var a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = fname;
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 500);
+      toast(t('list.exported', { n: rows.length }), 'ok');
+    } catch (e) { apiError(e); }
+    btn.disabled = false;
   }
 
   /* ---------------------------- ticket detail --------------------------- */
@@ -901,14 +1336,20 @@
     /* ----- header ----- */
     var html =
       '<button class="btn btn-sm" id="back-btn" style="margin-bottom:12px">← ' + esc(t('detail.backToList')) + '</button>' +
+      /* v3 F9: printable service report — staff only */
+      (!isCustomer
+        ? ' <button class="btn btn-sm" id="print-report-btn" style="margin-bottom:12px">🖨 ' +
+          esc(t('detail.printReport')) + '</button>'
+        : '') +
       '<div class="detail-head"><span class="tnum">' + esc(L.formatTicketNo(ticket.ticket_no)) + '</span>' +
         statusBadge(ticket.status) + priBadge(ticket.priority) +
         badge('status-open', t('source.' + ticket.source)) +
         (ticket.is_ltsa ? badge('escalated', t('detail.contractTicket')) : '') +
-        (ticket.escalated ? badge('escalated', t('detail.escalated')) : '') + '</div>' +
+        (ticket.escalated ? badge('escalated', t('detail.escalated')) : '') +
+        (state.v3 ? tagPills(ticket.tags) : '') + '</div>' +
       '<h1 class="detail-title">' + esc(ticket.title) + '</h1>' +
-      '<div class="grid-2">' +
-      '<div>' + // left column
+      '<div class="t-detail">' +
+      '<div>' + // left column: work area
         '<div class="card"><h2>' + esc(t('detail.sla')) + '</h2>' +
           '<div class="sla-clocks">' + clockCard('response') + clockCard('onsite') + clockCard('resolution') + '</div>' +
         '</div>' +
@@ -943,6 +1384,20 @@
             : '') +
         '</div>' +
         '<div id="parts-block"></div>' +
+        (state.v3 && !isCustomer
+          ? '<div class="card"><h2 class="section-title">' + esc(t('detail.fieldActivity')) + '</h2>' +
+            '<div class="fact-grid">' +
+              '<div class="fact"><span class="fact-label">' + esc(t('detail.onsiteFrom')) + '</span>' +
+                '<span class="fact-value">' + esc(ticket.onsite_from ? fmtDate(ticket.onsite_from) : '—') + '</span></div>' +
+              '<div class="fact"><span class="fact-label">' + esc(t('detail.onsiteTo')) + '</span>' +
+                '<span class="fact-value">' + esc(ticket.onsite_to ? fmtDate(ticket.onsite_to) : '—') + '</span></div>' +
+            '</div>' +
+            '<div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">' +
+              '<button class="btn btn-sm" id="onsite-edit-btn">' + esc(t('detail.setOnsiteDates')) + '</button>' +
+              (canAssign ? '<button class="btn btn-sm btn-primary" id="book-resource-btn">' +
+                esc(t('detail.bookResource')) + '</button>' : '') +
+            '</div></div>'
+          : '') +
         '<div class="card"><h2>' + esc(t('detail.comments')) + '</h2>' +
           '<div class="tabs" id="comment-tabs">' +
             '<button data-tab="public" class="active">' + esc(t('detail.comments.public')) + '</button>' +
@@ -957,22 +1412,30 @@
             esc(t('detail.comments.post')) + '</button></div>' +
         '</div>' +
       '</div>' +
-      '<div>' + // right column
-        '<div class="card"><h2>' + esc(t('common.details')) + '</h2><dl class="kv">' +
-          '<dt>' + esc(t('detail.source')) + '</dt><dd>' + esc(t('source.' + ticket.source)) + '</dd>' +
-          '<dt>' + esc(t('detail.site')) + '</dt><dd>' + esc(siteLabel(ticket.site_id)) + '</dd>' +
-          '<dt>' + esc(t('detail.createdBy')) + '</dt><dd>' + esc(displayName(ticket.created_by)) + '</dd>' +
-          '<dt>' + esc(t('common.createdAt')) + '</dt><dd>' + esc(fmtDate(ticket.created_at)) + '</dd>' +
-          '<dt>' + esc(t('common.updatedAt')) + '</dt><dd>' + esc(fmtDate(ticket.updated_at)) + '</dd>' +
-          (ticket.escalated_at ? '<dt>' + esc(t('detail.escalated')) + '</dt><dd>' + esc(fmtDate(ticket.escalated_at)) + '</dd>' : '') +
-        '</dl></div>' +
+      '<div>' + // right column: facts rail
+        '<div class="card"><h2>' + esc(t('common.details')) + '</h2>' +
+          '<div class="sf-row"><span class="k">' + esc(t('detail.source')) + '</span>' +
+            '<span class="v">' + esc(t('source.' + ticket.source)) + '</span></div>' +
+          '<div class="sf-row"><span class="k">' + esc(t('detail.site')) + '</span>' +
+            '<span class="v">' + esc(siteLabel(ticket.site_id)) + '</span></div>' +
+          '<div class="sf-row"><span class="k">' + esc(t('detail.createdBy')) + '</span>' +
+            '<span class="v">' + esc(displayName(ticket.created_by)) + '</span></div>' +
+          '<div class="sf-row"><span class="k">' + esc(t('common.createdAt')) + '</span>' +
+            '<span class="v">' + esc(fmtDate(ticket.created_at)) + '</span></div>' +
+          '<div class="sf-row"><span class="k">' + esc(t('common.updatedAt')) + '</span>' +
+            '<span class="v">' + esc(fmtDate(ticket.updated_at)) + '</span></div>' +
+          (ticket.escalated_at ? '<div class="sf-row"><span class="k">' + esc(t('detail.escalated')) + '</span>' +
+            '<span class="v">' + esc(fmtDate(ticket.escalated_at)) + '</span></div>' : '') +
+        '</div>' +
         (canAssign
           ? '<div class="card"><h2>' + esc(t('detail.assignment')) + '</h2>' +
             '<div id="assign-box"><div class="empty">' + esc(t('common.loading')) + '</div></div></div>'
-          : '<div class="card"><h2>' + esc(t('detail.assignment')) + '</h2><dl class="kv">' +
-            '<dt>' + esc(t('detail.assignee')) + '</dt><dd>' + esc(displayName(ticket.assigned_to)) + '</dd>' +
-            '<dt>' + esc(t('detail.plannedCheckAt')) + '</dt><dd>' + esc(fmtDate(ticket.planned_check_at)) + '</dd>' +
-            '</dl></div>') +
+          : '<div class="card"><h2>' + esc(t('detail.assignment')) + '</h2>' +
+            '<div class="sf-row"><span class="k">' + esc(t('detail.assignee')) + '</span>' +
+              '<span class="v">' + esc(displayName(ticket.assigned_to)) + '</span></div>' +
+            '<div class="sf-row"><span class="k">' + esc(t('detail.plannedCheckAt')) + '</span>' +
+              '<span class="v">' + esc(fmtDate(ticket.planned_check_at)) + '</span></div>' +
+            '</div>') +
         (transitions.length
           ? '<div class="card"><h2>' + esc(t('detail.transitions')) + '</h2>' +
             '<div class="status-btns">' + transitions.map(function (to) {
@@ -981,10 +1444,19 @@
             }).join('') + '</div></div>'
           : '') +
         '<div class="card"><h2>' + esc(t('detail.timeline')) + '</h2><ul class="timeline" id="timeline"></ul></div>' +
+        (state.v3 && !isCustomer
+          ? '<div class="card"><h2>' + esc(t('detail.relatedTickets')) + '</h2>' +
+            '<div id="related-list"><div class="empty">' + esc(t('common.loading')) + '</div></div>' +
+            '<div style="margin-top:10px"><button class="btn btn-sm" id="link-ticket-btn">+ ' +
+              esc(t('detail.linkTicket')) + '</button></div></div>'
+          : '') +
       '</div></div>';
 
     view.innerHTML = html;
     document.getElementById('back-btn').onclick = function () { nav('#/tickets'); };
+    /* v3 F9: print report (staff only). */
+    var prBtn = document.getElementById('print-report-btn');
+    if (prBtn) prBtn.onclick = function () { printServiceReport(ticket, comments); };
     renderPartsBlock(ticket);
 
     /* ----- edit core fields ----- */
@@ -1003,6 +1475,16 @@
 
     /* ----- assignment ----- */
     if (canAssign) renderAssignBox(ticket, function () { render(); });
+
+    /* ----- v3 I2: field activity dates + resource booking ----- */
+    var oseBtn = document.getElementById('onsite-edit-btn');
+    if (oseBtn) oseBtn.onclick = function () {
+      openOnsiteDatesModal(ticket, function () { render(); });
+    };
+    var brBtn = document.getElementById('book-resource-btn');
+    if (brBtn) brBtn.onclick = function () {
+      openBookResourceModal(ticket, function () { render(); });
+    };
 
     /* ----- transitions ----- */
     view.querySelectorAll('[data-transition]').forEach(function (btn) {
@@ -1027,6 +1509,17 @@
           if (to === 'closed') patch.closed_at = new Date().toISOString();
           var r = await sb.from('tickets').update(patch).eq('id', ticket.id);
           if (r.error) throw r.error;
+          /* v3 F7: reopening a closed ticket leaves an internal timeline note
+             (internal ⇒ does not stop the response clock). */
+          if (ticket.status === 'closed' && to === 'open') {
+            try {
+              await sb.from('ticket_comments').insert({
+                ticket_id: ticket.id, author_id: state.profile.id,
+                body: t('detail.reopened', { name: state.profile.display_name || state.profile.email }),
+                is_internal: true
+              });
+            } catch (e) { apiError(e); }
+          }
           toast(t('detail.transition.done'), 'ok');
           render();
         } catch (e) { apiError(e); btn.disabled = false; }
@@ -1104,6 +1597,7 @@
 
     /* ----- timeline (synthesized — no audit table in v1 contract) ----- */
     renderTimeline(ticket, comments, photos);
+    if (state.v3 && !isCustomer) loadRelatedTickets(ticket.id);
   }
 
   async function renderAssignBox(ticket, done) {
@@ -1227,31 +1721,222 @@
     });
   }
 
+  /* v3 U7: icon timeline — each event kind gets its own icon dot + color,
+     so status changes, assignments, part issues and notes are instantly
+     distinguishable (matters for LTSA penalty disputes). */
+  var TL_ICONS = {
+    created: '＋', responded: '↗', visited: '⚒', escalated: '⚠',
+    resolved: '✓', closed: '■', comment: '💬', internal: '🔒', photo: '📷'
+  };
   function renderTimeline(ticket, comments, photos) {
     var el = document.getElementById('timeline');
     var ev = [];
-    function add(ts, label, hot) { if (ts) ev.push({ ts: ts, label: label, hot: !!hot }); }
-    add(ticket.created_at, t('detail.tl.created'));
-    add(ticket.responded_at, t('detail.tl.responded'));
-    add(ticket.visited_at, t('detail.tl.visited'));
-    add(ticket.escalated_at, t('detail.tl.escalated'), true);
-    add(ticket.resolved_at || (ticket.status === 'closed' ? ticket.updated_at : null), t('detail.tl.resolved'));
-    add(ticket.closed_at, t('detail.tl.closed'));
+    function add(ts, label, kind) { if (ts) ev.push({ ts: ts, label: label, kind: kind || 'created' }); }
+    add(ticket.created_at, t('detail.tl.created'), 'created');
+    add(ticket.responded_at, t('detail.tl.responded'), 'responded');
+    add(ticket.visited_at, t('detail.tl.visited'), 'visited');
+    add(ticket.escalated_at, t('detail.tl.escalated'), 'escalated');
+    add(ticket.resolved_at || (ticket.status === 'closed' ? ticket.updated_at : null), t('detail.tl.resolved'), 'resolved');
+    add(ticket.closed_at, t('detail.tl.closed'), 'closed');
     comments.forEach(function (c) {
       add(c.created_at, t('detail.tl.comment') + ' — ' + displayName(c.author_id) +
-        (c.is_internal ? ' (' + t('detail.comments.internal') + ')' : ''));
+        (c.is_internal ? ' (' + t('detail.comments.internal') + ')' : ''),
+        c.is_internal ? 'internal' : 'comment');
     });
     photos.forEach(function (p) {
-      add(p.created_at, t('detail.tl.photo') + ' — ' + (p.file_name || ''));
+      add(p.created_at, t('detail.tl.photo') + ' — ' + (p.file_name || ''), 'photo');
     });
     ev.sort(function (a, b) { return new Date(b.ts) - new Date(a.ts); });
     el.innerHTML = ev.map(function (e) {
-      return '<li class="' + (e.hot ? 'hot' : '') + '">' + esc(e.label) +
+      var ic = TL_ICONS[e.kind] || TL_ICONS.created;
+      return '<li><i class="tl-ic k-' + e.kind + '">' + ic + '</i>' + esc(e.label) +
         '<div class="t-time">' + esc(fmtDate(e.ts)) + '</div></li>';
     }).join('') || '<li>—</li>';
   }
 
-  /* ------------------------- modals: edit ticket ------------------------ */
+  /* v3 F9: printable service report. A print-only #print-report div is
+     populated on click; @media print shows ONLY that div (sidebar/topbar/
+     buttons/nav hidden). Includes public comments only — internal notes
+     never go on the customer-facing report. */
+  async function printServiceReport(ticket, comments) {
+    var pr = document.getElementById('print-report');
+    if (!pr) {
+      pr = document.createElement('div');
+      pr.id = 'print-report';
+      document.body.appendChild(pr);
+    }
+    /* parts used on this ticket */
+    var txRows = '';
+    try {
+      var trx = await sb.from('part_transactions').select('*').eq('ticket_id', ticket.id).order('created_at');
+      var txs = trx.error ? [] : (trx.data || []);
+      if (txs.length) {
+        var pids = [];
+        txs.forEach(function (x) { if (x.part_id && pids.indexOf(x.part_id) === -1) pids.push(x.part_id); });
+        var pmap = {};
+        if (pids.length) {
+          try {
+            var pr2 = await sb.from('spare_parts').select('id,code,name,unit').in('id', pids);
+            (pr2.error ? [] : (pr2.data || [])).forEach(function (p) { pmap[p.id] = p; });
+          } catch (e) {}
+        }
+        txRows = txs.map(function (x) {
+          var p = pmap[x.part_id] || {};
+          return '<tr><td>' + esc(p.code || '—') + '</td><td>' + esc(p.name || '') + '</td>' +
+            '<td>' + esc(String(x.qty_delta)) + ' ' + esc(p.unit || '') + '</td>' +
+            '<td>' + esc(fmtDate(x.created_at)) + '</td><td>' + esc(x.note || '') + '</td></tr>';
+        }).join('');
+      }
+    } catch (e) { /* parts section renders empty — non-fatal */ }
+    /* status history (oldest first) */
+    var hist = [];
+    function hadd(ts, label) { if (ts) hist.push({ ts: ts, label: label }); }
+    hadd(ticket.created_at, t('detail.tl.created'));
+    hadd(ticket.responded_at, t('detail.tl.responded'));
+    hadd(ticket.visited_at, t('detail.tl.visited'));
+    hadd(ticket.resolved_at || (ticket.status === 'closed' ? ticket.updated_at : null), t('detail.tl.resolved'));
+    hadd(ticket.closed_at, t('detail.tl.closed'));
+    hist.sort(function (a, b) { return new Date(a.ts) - new Date(b.ts); });
+    /* public comments only */
+    var pubComments = (comments || []).filter(function (c) { return !c.is_internal; });
+    function row(k, v) {
+      return '<tr><th style="width:200px">' + esc(k) + '</th><td>' + esc(v) + '</td></tr>';
+    }
+    pr.innerHTML =
+      '<h1>' + esc(t('report.title')) + ' — ' + esc(L.formatTicketNo(ticket.ticket_no)) + '</h1>' +
+      '<div class="pr-meta">' + esc(t('report.generatedAt')) + ': ' + esc(fmtDate(new Date().toISOString())) + '</div>' +
+      '<h2>' + esc(ticket.title) + '</h2>' +
+      '<table><tbody>' +
+        row(t('detail.site'), siteLabel(ticket.site_id)) +
+        row(t('common.status'), t('status.' + ticket.status)) +
+        row(t('common.priority'), t('priority.' + ticket.priority)) +
+        row(t('detail.source'), t('source.' + ticket.source)) +
+        row(t('detail.assignee'), displayName(ticket.assigned_to)) +
+        row(t('detail.createdBy'), displayName(ticket.created_by)) +
+        row(t('common.createdAt'), fmtDate(ticket.created_at)) +
+        row(t('common.updatedAt'), fmtDate(ticket.updated_at)) +
+      '</tbody></table>' +
+      '<h2>' + esc(t('detail.description')) + '</h2><div>' + esc(ticket.description || '—') + '</div>' +
+      '<h2>' + esc(t('detail.fieldReport')) + '</h2>' +
+      '<table><tbody>' +
+        row(t('detail.visitedAt'), fmtDate(ticket.visited_at)) +
+        row(t('detail.problemCategory'), ticket.problem_category || '—') +
+        row(t('detail.resolution'), ticket.resolution || '—') +
+      '</tbody></table>' +
+      '<h2>' + esc(t('report.partsUsed')) + '</h2>' +
+      (txRows
+        ? '<table><thead><tr><th>' + esc(t('report.partCode')) + '</th><th>' + esc(t('report.partName')) +
+          '</th><th>' + esc(t('report.qty')) + '</th><th>' + esc(t('report.date')) +
+          '</th><th>' + esc(t('report.note')) + '</th></tr></thead><tbody>' + txRows + '</tbody></table>'
+        : '<div>—</div>') +
+      '<h2>' + esc(t('report.statusHistory')) + '</h2>' +
+      '<table><tbody>' + hist.map(function (h) {
+        return '<tr><td style="width:200px">' + esc(fmtDate(h.ts)) + '</td><td>' + esc(h.label) + '</td></tr>';
+      }).join('') + '</tbody></table>' +
+      '<h2>' + esc(t('detail.comments')) + '</h2>' +
+      (pubComments.length
+        ? pubComments.map(function (c) {
+            return '<div style="margin-bottom:8px"><b>' + esc(displayName(c.author_id)) + '</b> · ' +
+              esc(fmtDate(c.created_at)) + '<div>' + esc(c.body) + '</div></div>';
+          }).join('')
+        : '<div>—</div>');
+    window.print();
+  }
+
+  /* v3 F2: related tickets — bidirectional links via ticket_links.
+     Stored normalized (ticket_a < ticket_b) to satisfy uq_ticket_links_pair. */
+  function normPair(id1, id2) {
+    return id1 < id2 ? [id1, id2] : [id2, id1];
+  }
+  async function loadRelatedTickets(ticketId) {
+    var box = document.getElementById('related-list');
+    if (!box) return;
+    try {
+      var lr = await sb.from('ticket_links').select('*')
+        .or('ticket_a.eq.' + ticketId + ',ticket_b.eq.' + ticketId);
+      if (lr.error) throw lr.error;
+      var links = lr.data || [];
+      if (!links.length) {
+        box.innerHTML = '<div class="empty">' + esc(t('detail.related.none')) + '</div>';
+      } else {
+        var otherIds = links.map(function (l) {
+          return l.ticket_a === ticketId ? l.ticket_b : l.ticket_a;
+        });
+        var tr = await sb.from('tickets').select('id,ticket_no,title,status')
+          .in('id', otherIds);
+        var map = {};
+        (tr.error ? [] : (tr.data || [])).forEach(function (x) { map[x.id] = x; });
+        box.innerHTML = links.map(function (l) {
+          var o = l.ticket_a === ticketId ? l.ticket_b : l.ticket_a;
+          var x = map[o];
+          if (!x) return '';
+          return '<div class="related-row">' +
+            '<a href="#/ticket/' + x.id + '" class="tnum">' + esc(L.formatTicketNo(x.ticket_no)) + '</a> ' +
+            '<span class="ttl">' + esc(x.title) + '</span> ' + statusBadge(x.status) +
+            ' <button class="btn-link danger" data-unlink="' + l.id + '" title="' +
+              esc(t('common.remove')) + '">✕</button></div>';
+        }).join('');
+        box.querySelectorAll('[data-unlink]').forEach(function (b) {
+          b.onclick = async function () {
+            try {
+              var dr = await sb.from('ticket_links').delete().eq('id', b.getAttribute('data-unlink'));
+              if (dr.error) throw dr.error;
+              toast(t('detail.related.unlinked'), 'ok');
+              loadRelatedTickets(ticketId);
+            } catch (e) { apiError(e); }
+          };
+        });
+      }
+      var btn = document.getElementById('link-ticket-btn');
+      if (btn) btn.onclick = function () { openLinkTicketModal(ticketId, function () { loadRelatedTickets(ticketId); }); };
+    } catch (e) {
+      box.innerHTML = '<div class="inline-err">' + esc(e.message || t('common.error')) + '</div>';
+    }
+  }
+  function openLinkTicketModal(ticketId, done) {
+    var body =
+      '<div class="field"><label>' + esc(t('detail.related.searchPh')) + '</label>' +
+        '<input type="text" id="lt-q" placeholder="' + esc(t('list.searchPh')) + '"></div>' +
+      '<div id="lt-results" style="max-height:260px;overflow-y:auto"></div>';
+    var close = openModal(t('detail.linkTicket'), body,
+      '<button class="btn" id="m-cancel">' + esc(t('common.cancel')) + '</button>');
+    document.getElementById('m-cancel').onclick = close;
+    var deb = null;
+    async function search() {
+      var q = document.getElementById('lt-q').value.trim();
+      var box = document.getElementById('lt-results');
+      if (!q) { box.innerHTML = ''; return; }
+      try {
+        var r = await baseTicketQuery('id,ticket_no,title,status')
+          .neq('id', ticketId)
+          .or('title.ilike.%' + q + '%,description.ilike.%' + q + '%')
+          .order('updated_at', { ascending: false }).limit(15);
+        if (r.error) throw r.error;
+        box.innerHTML = (r.data || []).map(function (x) {
+          return '<div class="related-row">' +
+            '<a href="#/ticket/' + x.id + '" class="tnum">' + esc(L.formatTicketNo(x.ticket_no)) + '</a> ' +
+            '<span class="ttl">' + esc(x.title) + '</span> ' + statusBadge(x.status) +
+            ' <button class="btn btn-sm" data-link="' + x.id + '">' + esc(t('common.add')) + '</button></div>';
+        }).join('') || '<div class="empty">' + esc(t('list.noResults')) + '</div>';
+        box.querySelectorAll('[data-link]').forEach(function (b) {
+          b.onclick = async function () {
+            try {
+              var pair = normPair(ticketId, b.getAttribute('data-link'));
+              var ir = await sb.from('ticket_links').insert({
+                ticket_a: pair[0], ticket_b: pair[1], created_by: state.profile.id
+              });
+              if (ir.error) throw ir.error;
+              toast(t('detail.related.linked'), 'ok');
+              close(); done();
+            } catch (e) { apiError(e); }
+          };
+        });
+      } catch (e) { apiError(e); }
+    }
+    document.getElementById('lt-q').oninput = function () {
+      clearTimeout(deb); deb = setTimeout(search, 400);
+    };
+  }
   function openModal(title, bodyHtml, footHtml, wide) {
     var root = document.getElementById('modal-root');
     root.innerHTML =
@@ -1269,6 +1954,136 @@
     return close;
   }
 
+  /* ------------------------- modals: edit ticket ------------------------ */
+
+  /* v3 I2: field-activity dates + "book resource" with conflict warnings.
+     Dates live on tickets (onsite_from/to); booking writes shifts rows
+     (status=assigned, ticket_id set) so the planning board shows the work. */
+  function openOnsiteDatesModal(ticket, done) {
+    var body =
+      '<div class="form-row">' +
+        '<div class="field"><label>' + esc(t('detail.onsiteFrom')) + '</label>' +
+          '<input type="date" id="os-from" value="' + esc(ticket.onsite_from || '') + '"></div>' +
+        '<div class="field"><label>' + esc(t('detail.onsiteTo')) + '</label>' +
+          '<input type="date" id="os-to" value="' + esc(ticket.onsite_to || '') + '"></div>' +
+      '</div>' +
+      '<div class="hint">' + esc(t('detail.onsiteHint')) + '</div>';
+    var close = openModal(t('detail.setOnsiteDates'), body,
+      '<button class="btn" id="m-cancel">' + esc(t('common.cancel')) + '</button>' +
+      '<button class="btn btn-primary" id="m-save">' + esc(t('common.save')) + '</button>');
+    document.getElementById('m-cancel').onclick = close;
+    document.getElementById('m-save').onclick = async function () {
+      var from = document.getElementById('os-from').value || null;
+      var to = document.getElementById('os-to').value || null;
+      if (from && to && to < from) { toast(t('detail.onsiteDateErr'), 'error'); return; }
+      this.disabled = true;
+      try {
+        var r = await sb.from('tickets').update({ onsite_from: from, onsite_to: to }).eq('id', ticket.id);
+        if (r.error) throw r.error;
+        close(); toast(t('common.saved'), 'ok'); done();
+      } catch (e) { apiError(e); this.disabled = false; }
+    };
+  }
+  function eachDay(from, to) {
+    var out = [], d = new Date(from + 'T12:00:00'), end = new Date(to + 'T12:00:00');
+    while (d <= end) { out.push(ymd(d)); d.setDate(d.getDate() + 1); }
+    return out;
+  }
+  async function openBookResourceModal(ticket, done) {
+    if (!ticket.onsite_from || !ticket.onsite_to) {
+      toast(t('detail.bookNeedsDates'), 'error');
+      return;
+    }
+    var er = await sb.from('profiles').select('id,display_name,email,country')
+      .eq('role', 'engineer').eq('is_active', true).order('display_name');
+    if (er.error) { apiError(er.error); return; }
+    var engineers = er.data || [];
+    var body =
+      '<div class="field"><label>' + esc(t('detail.bookEngineer')) + '</label>' +
+        '<select id="bk-eng">' + engineers.map(function (e) {
+          return '<option value="' + e.id + '"' +
+            (ticket.assigned_to === e.id ? ' selected' : '') + '>' +
+            esc(e.display_name || e.email) + '</option>';
+        }).join('') + '</select></div>' +
+      '<div class="muted">' + esc(t('detail.bookRange')
+        .replace('{from}', fmtDate(ticket.onsite_from)).replace('{to}', fmtDate(ticket.onsite_to))) + '</div>' +
+      '<div id="bk-warnings" style="margin-top:10px"></div>';
+    var close = openModal(t('detail.bookResource'), body,
+      '<button class="btn" id="m-cancel">' + esc(t('common.cancel')) + '</button>' +
+      '<button class="btn" id="bk-check">' + esc(t('detail.checkConflicts')) + '</button>' +
+      '<button class="btn btn-primary" id="m-save">' + esc(t('detail.bookConfirm')) + '</button>');
+    document.getElementById('m-cancel').onclick = close;
+    var lastCheck = null;
+    async function check() {
+      var engId = document.getElementById('bk-eng').value;
+      var box = document.getElementById('bk-warnings');
+      box.innerHTML = '<div class="empty">' + esc(t('common.loading')) + '</div>';
+      var warnings = [];
+      try {
+        var days = eachDay(ticket.onsite_from, ticket.onsite_to);
+        // 1) existing shifts (leave / other assignments)
+        var sr = await sb.from('shifts').select('day,status').eq('engineer_id', engId)
+          .gte('day', ticket.onsite_from).lte('day', ticket.onsite_to);
+        (sr.error ? [] : (sr.data || [])).forEach(function (s) {
+          if (s.status === 'leave') warnings.push({ day: s.day, kind: 'leave' });
+          else if (s.status === 'assigned') warnings.push({ day: s.day, kind: 'busy' });
+        });
+        // 2) holidays in the engineer's country
+        var eng = engineers.filter(function (e) { return e.id === engId; })[0] || {};
+        var cc = (eng.country || '').toUpperCase();
+        if (cc) {
+          var hr = await sb.from('holidays').select('day,name').eq('country_code', cc)
+            .gte('day', ticket.onsite_from).lte('day', ticket.onsite_to);
+          (hr.error ? [] : (hr.data || [])).forEach(function (h) {
+            warnings.push({ day: h.day, kind: 'holiday', name: h.name });
+          });
+        }
+        // 3) weekends
+        days.forEach(function (d) {
+          var dw = new Date(d + 'T12:00:00').getDay();
+          if (dw === 0 || dw === 6) warnings.push({ day: d, kind: 'weekend' });
+        });
+        lastCheck = { engId: engId, days: days, warnings: warnings };
+        box.innerHTML = warnings.length
+          ? '<div class="inline-err">' + warnings.map(function (w) {
+              var lbl = w.kind === 'leave' ? t('detail.warn.leave')
+                      : w.kind === 'busy' ? t('detail.warn.busy')
+                      : w.kind === 'holiday' ? t('detail.warn.holiday').replace('{name}', w.name || '')
+                      : t('detail.warn.weekend');
+              return esc(w.day + ' — ' + lbl);
+            }).join('<br>') + '</div>'
+          : '<div class="ok-line">' + esc(t('detail.warn.none')) + '</div>';
+      } catch (e) {
+        box.innerHTML = '<div class="inline-err">' + esc(e.message || t('common.error')) + '</div>';
+      }
+    }
+    document.getElementById('bk-check').onclick = check;
+    document.getElementById('m-save').onclick = async function () {
+      if (!lastCheck || lastCheck.engId !== document.getElementById('bk-eng').value) {
+        toast(t('detail.bookCheckFirst'), 'error');
+        return;
+      }
+      if (lastCheck.warnings.length &&
+          !window.confirm(t('detail.bookWarnConfirm').replace('{n}', String(lastCheck.warnings.length)))) return;
+      this.disabled = true;
+      try {
+        var rows = lastCheck.days.map(function (d) {
+          return {
+            engineer_id: lastCheck.engId, day: d, status: 'assigned',
+            site_id: ticket.site_id || null, ticket_id: ticket.id,
+            note: L.formatTicketNo(ticket.ticket_no)
+          };
+        });
+        var r = await sb.from('shifts').upsert(rows, { onConflict: 'engineer_id,day' });
+        if (r.error) throw r.error;
+        // Keep the ticket's assignee in sync with the booked engineer.
+        if (ticket.assigned_to !== lastCheck.engId) {
+          await sb.from('tickets').update({ assigned_to: lastCheck.engId }).eq('id', ticket.id);
+        }
+        close(); toast(t('detail.booked'), 'ok'); done();
+      } catch (e) { apiError(e); this.disabled = false; }
+    };
+  }
   function openTicketEditModal(ticket, done) {
     var body =
       '<div class="field"><label>' + esc(t('new.field.title')) + '<span class="req">*</span></label>' +
@@ -1287,7 +2102,12 @@
           }).join('') + '</select></div>' +
       '</div>' +
       '<div class="field"><label>' + esc(t('new.field.description')) + '</label>' +
-        '<textarea id="et-desc">' + esc(ticket.description || '') + '</textarea></div>';
+        '<textarea id="et-desc">' + esc(ticket.description || '') + '</textarea></div>' +
+      (state.v3
+        ? '<div class="field"><label>' + esc(t('new.field.tags')) + '</label>' +
+          '<input type="text" id="et-tags" placeholder="' + esc(t('new.field.tagsPh')) +
+          '" value="' + esc((ticket.tags || []).join(', ')) + '"></div>'
+        : '');
     var close = openModal(t('detail.editTicket'), body,
       '<button class="btn" id="m-cancel">' + esc(t('common.cancel')) + '</button>' +
       '<button class="btn btn-primary" id="m-save">' + esc(t('common.save')) + '</button>');
@@ -1297,12 +2117,17 @@
       if (!title) { toast(t('new.fillRequired'), 'error'); return; }
       this.disabled = true;
       try {
-        var r = await sb.from('tickets').update({
+        var upd = {
           title: title,
           description: document.getElementById('et-desc').value,
           priority: document.getElementById('et-priority').value,
           site_id: document.getElementById('et-site').value || null
-        }).eq('id', ticket.id);
+        };
+        if (state.v3) {
+          var etTags = document.getElementById('et-tags');
+          upd.tags = etTags ? parseTags(etTags.value) : (ticket.tags || []);
+        }
+        var r = await sb.from('tickets').update(upd).eq('id', ticket.id);
         if (r.error) throw r.error;
         close(); toast(t('detail.editSaved'), 'ok'); done();
       } catch (e) { apiError(e); this.disabled = false; }
@@ -1387,6 +2212,10 @@
         '</div>' +
         '<div class="field"><label>' + esc(t('new.field.description')) + '<span class="req">*</span></label>' +
           '<textarea id="nt-desc" required></textarea></div>' +
+        (state.v3
+          ? '<div class="field"><label>' + esc(t('new.field.tags')) + '</label>' +
+            '<input type="text" id="nt-tags" placeholder="' + esc(t('new.field.tagsPh')) + '"></div>'
+          : '') +
         '<div class="form-actions">' +
           '<button type="submit" class="btn btn-primary" id="nt-submit">' + esc(t('common.create')) + '</button>' +
           '<button type="button" class="btn" id="nt-cancel">' + esc(t('common.cancel')) + '</button>' +
@@ -1434,7 +2263,7 @@
           slaO = dl.onsite && dl.onsite.toISOString();
           slaS = dl.resolve && dl.resolve.toISOString();
         }
-        var ins = await sb.from('tickets').insert({
+        var insData = {
           title: get('nt-title'),
           description: get('nt-desc'),
           priority: priority,
@@ -1449,7 +2278,12 @@
           sla_response_at: slaR,
           sla_onsite_at: slaO,
           sla_resolve_at: slaS
-        }).select('id,ticket_no').single();
+        };
+        if (state.v3) {
+          var tagEl = document.getElementById('nt-tags');
+          insData.tags = tagEl ? parseTags(tagEl.value) : [];
+        }
+        var ins = await sb.from('tickets').insert(insData).select('id,ticket_no').single();
         if (ins.error) throw ins.error;
         toast(t('new.created', { no: L.formatTicketNo(ins.data.ticket_no) }), 'ok');
         nav('#/ticket/' + ins.data.id);
@@ -1487,7 +2321,8 @@
     view.innerHTML =
       '<div class="page-head"><h1>' + esc(t('users.title')) + '</h1>' +
       '<button class="btn btn-primary" id="user-new">+ ' + esc(t('users.new')) + '</button></div>' +
-      '<div class="card"><div style="overflow-x:auto"><table class="tbl"><thead><tr>' +
+      '<div class="card"><h2 class="section-title">' + esc(t('users.listTitle')) + '</h2>' +
+      '<div style="overflow-x:auto"><table class="tbl"><thead><tr>' +
       '<th>' + esc(t('users.displayName')) + '</th><th>' + esc(t('common.role')) + '</th>' +
       '<th>' + esc(t('users.certLevel')) + '</th>' +
       '<th>' + esc(t('common.country')) + '</th><th>' + esc(t('users.projectScope')) + '</th>' +
@@ -1801,10 +2636,11 @@
     view.innerHTML =
       '<div class="page-head"><h1>' + esc(t('sites.title')) + '</h1>' +
       '<button class="btn btn-primary" id="site-new">+ ' + esc(t('sites.new')) + '</button></div>' +
-      '<div class="card"><h2>' + esc(t('sites.tree')) + '</h2>' +
+      '<div class="card"><h2 class="section-title">' + esc(t('sites.tree')) + '</h2>' +
       '<div class="field" style="max-width:360px"><input type="text" id="site-q" placeholder="' +
         esc(t('sites.searchPh')) + '" value="' + esc(state.siteSearch || '') + '"></div>' +
-      '<div id="site-tree">' + bodyHtml + '</div></div>';
+      '<div id="site-tree">' + bodyHtml + '</div></div>' +
+      (state.v3 ? '<div class="card" id="customers-card"></div>' : '');
     var deb = null;
     document.getElementById('site-q').oninput = function () {
       var v = this.value;
@@ -1817,6 +2653,90 @@
     view.querySelectorAll('[data-site]').forEach(function (el) {
       el.onclick = function () { nav('#/site/' + el.getAttribute('data-site')); };
     });
+    if (state.v3) renderCustomersCard();
+  }
+
+  /* v3 F6: customer company register (admin/dispatcher via site.manage gate). */
+  function renderCustomersCard() {
+    var card = document.getElementById('customers-card');
+    if (!card) return;
+    var siteCount = {};
+    state.sites.forEach(function (s) {
+      if (s.customer_id) siteCount[s.customer_id] = (siteCount[s.customer_id] || 0) + 1;
+    });
+    card.innerHTML =
+      '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">' +
+        '<h2 class="section-title" style="margin:0">' + esc(t('customers.title')) + '</h2>' +
+        '<button class="btn btn-sm btn-primary" id="cust-new">+ ' + esc(t('customers.new')) + '</button></div>' +
+      '<div style="overflow-x:auto"><table class="tbl"><thead><tr>' +
+      '<th>' + esc(t('customers.company')) + '</th><th>' + esc(t('common.country')) + '</th>' +
+      '<th>' + esc(t('customers.contact')) + '</th><th>' + esc(t('sites.title')) + '</th>' +
+      '<th>' + esc(t('common.actions')) + '</th></tr></thead><tbody>' +
+      ((state.customers || []).map(function (c) {
+        return '<tr><td><b>' + esc(c.company_name) + '</b></td>' +
+          '<td class="muted">' + esc(c.country || '—') + '</td>' +
+          '<td class="muted">' + esc(c.contact_name || c.contact_email || '—') + '</td>' +
+          '<td>' + (siteCount[c.id] || 0) + '</td>' +
+          '<td><button class="btn btn-sm" data-custedit="' + c.id + '">' + esc(t('common.edit')) + '</button></td></tr>';
+      }).join('') || '<tr><td colspan="5"><div class="empty">' + esc(t('customers.none')) + '</div></td></tr>') +
+      '</tbody></table></div>';
+    document.getElementById('cust-new').onclick = function () {
+      openCustomerModal(null, function () { loadReferenceData().then(render); });
+    };
+    card.querySelectorAll('[data-custedit]').forEach(function (b) {
+      b.onclick = function () {
+        var c = state.customers.filter(function (x) { return x.id === b.getAttribute('data-custedit'); })[0];
+        openCustomerModal(c, function () { loadReferenceData().then(render); });
+      };
+    });
+  }
+  function openCustomerModal(customer, done) {
+    customer = customer || {};
+    function fld(id, label, val, ph) {
+      return '<div class="field"><label>' + esc(label) + '</label>' +
+        '<input type="text" id="' + id + '" value="' + esc(val || '') + '"' +
+        (ph ? ' placeholder="' + esc(ph) + '"' : '') + '></div>';
+    }
+    var body =
+      '<div class="field"><label>' + esc(t('customers.company')) + '<span class="req">*</span></label>' +
+        '<input type="text" id="cu-name" value="' + esc(customer.company_name || '') + '"></div>' +
+      '<div class="form-row">' +
+        fld('cu-country', t('common.country'), customer.country) +
+        fld('cu-vat', t('customers.vat'), customer.vat_id) +
+      '</div>' +
+      '<div class="form-row">' +
+        fld('cu-contact', t('customers.contactName'), customer.contact_name) +
+        fld('cu-email', t('customers.contactEmail'), customer.contact_email) +
+      '</div>' +
+      '<div class="form-row">' +
+        fld('cu-phone', t('customers.contactPhone'), customer.contact_phone) +
+        fld('cu-note', t('customers.note'), customer.note) +
+      '</div>';
+    var close = openModal(customer.id ? t('customers.edit') : t('customers.new'), body,
+      '<button class="btn" id="m-cancel">' + esc(t('common.cancel')) + '</button>' +
+      '<button class="btn btn-primary" id="m-save">' + esc(t('common.save')) + '</button>');
+    document.getElementById('m-cancel').onclick = close;
+    document.getElementById('m-save').onclick = async function () {
+      var btn = this; btn.disabled = true;
+      try {
+        var name = document.getElementById('cu-name').value.trim();
+        if (!name) { toast(t('new.fillRequired'), 'error'); btn.disabled = false; return; }
+        var row = {
+          company_name: name,
+          country: document.getElementById('cu-country').value.trim().toUpperCase() || null,
+          vat_id: document.getElementById('cu-vat').value.trim() || null,
+          contact_name: document.getElementById('cu-contact').value.trim() || null,
+          contact_email: document.getElementById('cu-email').value.trim() || null,
+          contact_phone: document.getElementById('cu-phone').value.trim() || null,
+          note: document.getElementById('cu-note').value.trim() || null
+        };
+        var r = customer.id
+          ? await sb.from('customers').update(row).eq('id', customer.id)
+          : await sb.from('customers').insert(row);
+        if (r.error) throw r.error;
+        close(); toast(t('common.saved'), 'ok'); done();
+      } catch (e) { apiError(e); btn.disabled = false; }
+    };
   }
 
   function openSiteModal(site, done) {
@@ -1862,7 +2782,15 @@
             esc(x.code + ' — ' + x.name) + '</option>';
         }).join('') + '</select></div>' +
       '<div class="field"><label>' + esc(t('sites.remoteOwner')) + '</label>' +
-        '<select id="s-owner"><option value="">' + esc(t('sites.noOwner')) + '</option></select></div>';
+        '<select id="s-owner"><option value="">' + esc(t('sites.noOwner')) + '</option></select></div>' +
+      (state.v3
+        ? '<div class="field"><label>' + esc(t('sites.customer')) + '</label>' +
+          '<select id="s-customer"><option value="">' + esc(t('common.none')) + '</option>' +
+          state.customers.map(function (c) {
+            return '<option value="' + c.id + '"' + (site.customer_id === c.id ? ' selected' : '') + '>' +
+              esc(c.company_name) + '</option>';
+          }).join('') + '</select></div>'
+        : '');
     var close = openModal(site.id ? t('sites.edit') : t('sites.new'), body,
       '<button class="btn" id="m-cancel">' + esc(t('common.cancel')) + '</button>' +
       '<button class="btn btn-primary" id="m-save">' + esc(t('common.save')) + '</button>');
@@ -1899,6 +2827,10 @@
           parent_site_id: document.getElementById('s-parent').value || null,
           remote_owner_id: document.getElementById('s-owner').value || null
         };
+        if (state.v3) {
+          var custSel = document.getElementById('s-customer');
+          fields.customer_id = custSel ? (custSel.value || null) : (site.customer_id || null);
+        }
         if (fields.country) fields.country = fields.country.toUpperCase();
         var r = site.id
           ? await sb.from('sites').update(fields).eq('id', site.id)
@@ -1929,6 +2861,16 @@
   }
 
   /* ============================ v2: spare parts ============================ */
+  /* v3 I3: explicit empty state when the user lacks part.view —
+     never a blank page; deep link to #/sites. */
+  function viewPartsNoAccess(view) {
+    view.innerHTML =
+      '<div class="page-head"><h1>' + esc(t('nav.parts')) + '</h1></div>' +
+      '<div class="card"><div class="empty">' + esc(t('parts.noAccess')) + '</div>' +
+      '<div style="margin-top:12px"><button class="btn btn-primary" id="noaccess-sites">' +
+        esc(t('parts.noAccessBtn')) + '</button></div></div>';
+    document.getElementById('noaccess-sites').onclick = function () { nav('#/sites'); };
+  }
   async function viewParts(view) {
     var canManage = L.can('part.manage', state.profile.role);
     var pr = await sb.from('spare_parts').select('*').order('code');
@@ -2034,7 +2976,11 @@
 
     view.innerHTML =
       '<div class="page-head"><h1>' + esc(t('parts.title')) + '</h1>' +
-      (canManage ? '<button class="btn btn-primary" id="part-new">+ ' + esc(t('parts.newPart')) + '</button>' : '') +
+      (canManage
+        ? '<div style="display:flex;gap:8px">' +
+          '<button class="btn" id="part-import">⇪ ' + esc(t('parts.import')) + '</button>' +
+          '<button class="btn btn-primary" id="part-new">+ ' + esc(t('parts.newPart')) + '</button></div>'
+        : '') +
       '</div>' +
       '<div class="card"><h2>' + esc(t('parts.catalog')) + '</h2>' +
         '<div style="overflow-x:auto"><table class="tbl"><thead><tr>' +
@@ -2060,6 +3006,9 @@
     if (canManage) {
       document.getElementById('part-new').onclick = function () {
         openPartModal(null, function () { render(); });
+      };
+      document.getElementById('part-import').onclick = function () {
+        openPartsImportModal(warehouses, function () { render(); });
       };
     }
     view.querySelectorAll('[data-partedit]').forEach(function (b) {
@@ -2132,6 +3081,227 @@
       if (r.error) throw r.error;
       toast(t('parts.deleted'), 'ok'); done();
     } catch (e) { apiError(e); }
+  }
+
+  async function deletePart(part, done) {
+    if (!window.confirm(t('parts.deleteConfirm', { code: part.code }))) return;
+    try {
+      var r = await sb.from('spare_parts').delete().eq('id', part.id);
+      if (r.error) throw r.error;
+      toast(t('parts.deleted'), 'ok'); done();
+    } catch (e) { apiError(e); }
+  }
+
+  /* v3 F1: spare-parts bulk import — paste or upload CSV/TSV ->
+     column mapping -> preview -> upsert by part code.
+     (Works on v2 tables; does not need migration_v3.) */
+  var IMPORT_FIELDS = [
+    { key: 'code', req: true }, { key: 'name', req: true },
+    { key: 'warehouse_code', req: true }, { key: 'qty', req: true },
+    { key: 'category', req: false }, { key: 'unit', req: false }, { key: 'min_qty', req: false }
+  ];
+  function parseDelimited(text) {
+    var lines = String(text || '').replace(/\r\n?/g, '\n').split('\n')
+      .filter(function (l) { return l.trim() !== ''; });
+    if (!lines.length) return { headers: [], rows: [] };
+    var first = lines[0];
+    var delim = '\t';
+    var counts = [',', ';', '\t'].map(function (d) { return first.split(d).length; });
+    if (counts[0] > counts[2] && counts[0] >= counts[1]) delim = ',';
+    else if (counts[1] > counts[2] && counts[1] > counts[0]) delim = ';';
+    function splitLine(l) {
+      var out = [], cur = '', inQ = false;
+      for (var i = 0; i < l.length; i++) {
+        var c = l[i];
+        if (inQ) {
+          if (c === '"') {
+            if (l[i + 1] === '"') { cur += '"'; i++; } else inQ = false;
+          } else cur += c;
+        } else if (c === '"') inQ = true;
+        else if (c === delim) { out.push(cur); cur = ''; }
+        else cur += c;
+      }
+      out.push(cur);
+      return out.map(function (x) { return x.trim(); });
+    }
+    var headers = splitLine(lines[0]);
+    var rows = lines.slice(1).map(splitLine);
+    return { headers: headers, rows: rows };
+  }
+  function guessMapping(headers) {
+    var map = {};
+    var norm = headers.map(function (h) { return h.toLowerCase().replace(/[^a-z0-9]/g, ''); });
+    IMPORT_FIELDS.forEach(function (f) {
+      var keys = {
+        code: ['code', 'partcode', 'partno', 'sku', 'itemcode'],
+        name: ['name', 'partname', 'description', 'desc', 'itemname'],
+        warehouse_code: ['warehousecode', 'warehouse', 'whcode', 'wh', 'location'],
+        qty: ['qty', 'quantity', 'stock', 'amount', 'count'],
+        category: ['category', 'cat', 'type', 'group'],
+        unit: ['unit', 'uom'],
+        min_qty: ['minqty', 'min', 'minimum', 'safetystock', 'reorder']
+      }[f.key];
+      for (var i = 0; i < norm.length; i++) {
+        if (keys.indexOf(norm[i]) !== -1) { map[f.key] = headers[i]; break; }
+      }
+      if (map[f.key] == null) map[f.key] = '';
+    });
+    return map;
+  }
+  function openPartsImportModal(warehouses, done) {
+    var whByCode = {};
+    warehouses.forEach(function (w) { whByCode[(w.code || '').toUpperCase()] = w; });
+    var parsed = null, mapping = {};
+    var body =
+      '<div id="pi-step1">' +
+        '<div class="field"><label>' + esc(t('parts.imp.paste')) + '</label>' +
+          '<textarea id="pi-text" rows="6" placeholder="' +
+            esc(t('parts.imp.pastePh')) + '"></textarea></div>' +
+        '<div class="field"><label>' + esc(t('parts.imp.upload')) + '</label>' +
+          '<input type="file" id="pi-file" accept=".csv,.tsv,.txt"></div>' +
+        '<button class="btn btn-primary" id="pi-parse">' + esc(t('parts.imp.parse')) + '</button>' +
+      '</div>' +
+      '<div id="pi-step2" style="display:none">' +
+        '<div class="field"><label>' + esc(t('parts.imp.mapping')) + '</label>' +
+          '<div id="pi-map"></div></div>' +
+        '<div class="field"><label>' + esc(t('parts.imp.qtyMode')) + '</label>' +
+          '<label style="font-weight:400"><input type="radio" name="pi-mode" value="set" checked style="width:auto"> ' +
+            esc(t('parts.imp.modeSet')) + '</label><br>' +
+          '<label style="font-weight:400"><input type="radio" name="pi-mode" value="add" style="width:auto"> ' +
+            esc(t('parts.imp.modeAdd')) + '</label></div>' +
+        '<div style="display:flex;gap:8px">' +
+          '<button class="btn" id="pi-back1">← ' + esc(t('common.back')) + '</button>' +
+          '<button class="btn btn-primary" id="pi-preview">' + esc(t('parts.imp.preview')) + '</button></div>' +
+      '</div>' +
+      '<div id="pi-step3" style="display:none">' +
+        '<div id="pi-summary" style="margin-bottom:10px"></div>' +
+        '<div style="overflow-x:auto;max-height:320px;overflow-y:auto"><table class="tbl"><thead><tr>' +
+          '<th>#</th>' + IMPORT_FIELDS.map(function (f) {
+            return '<th>' + esc(t('parts.imp.f.' + f.key)) + (f.req ? '<span class="req">*</span>' : '') + '</th>';
+          }).join('') + '<th>' + esc(t('parts.imp.status')) + '</th></tr></thead>' +
+          '<tbody id="pi-rows"></tbody></table></div>' +
+        '<div style="display:flex;gap:8px;margin-top:12px">' +
+          '<button class="btn" id="pi-back2">← ' + esc(t('common.back')) + '</button>' +
+          '<button class="btn btn-primary" id="pi-run">' + esc(t('parts.imp.run')) + '</button></div>' +
+        '<div id="pi-progress" style="margin-top:10px"></div>' +
+      '</div>';
+    var close = openModal(t('parts.import'), body, '', true);
+    function show(step) {
+      [1, 2, 3].forEach(function (n) {
+        document.getElementById('pi-step' + n).style.display = n === step ? 'block' : 'none';
+      });
+    }
+    function validateRows() {
+      var rows = [];
+      parsed.rows.forEach(function (cells, idx) {
+        var rec = {};
+        IMPORT_FIELDS.forEach(function (f) {
+          var hi = parsed.headers.indexOf(mapping[f.key]);
+          rec[f.key] = hi === -1 ? '' : (cells[hi] || '').trim();
+        });
+        var errs = [];
+        if (!rec.code) errs.push(t('parts.imp.f.code'));
+        if (!rec.name) errs.push(t('parts.imp.f.name'));
+        if (!rec.warehouse_code) errs.push(t('parts.imp.f.warehouse_code'));
+        else if (!whByCode[rec.warehouse_code.toUpperCase()]) errs.push(t('parts.imp.badWh'));
+        if (rec.qty === '' || isNaN(Number(rec.qty))) errs.push(t('parts.imp.f.qty'));
+        if (rec.min_qty && isNaN(Number(rec.min_qty))) errs.push(t('parts.imp.f.min_qty'));
+        rows.push({ rec: rec, errs: errs, line: idx + 2 });
+      });
+      return rows;
+    }
+    document.getElementById('pi-file').onchange = function () {
+      var f = this.files && this.files[0];
+      if (!f) return;
+      var rd = new FileReader();
+      rd.onload = function () { document.getElementById('pi-text').value = rd.result; };
+      rd.readAsText(f);
+    };
+    document.getElementById('pi-parse').onclick = function () {
+      parsed = parseDelimited(document.getElementById('pi-text').value);
+      if (!parsed.headers.length) { toast(t('parts.imp.empty'), 'error'); return; }
+      mapping = guessMapping(parsed.headers);
+      document.getElementById('pi-map').innerHTML = IMPORT_FIELDS.map(function (f) {
+        return '<div class="form-row" style="margin-bottom:6px;align-items:center">' +
+          '<div style="width:150px;font-weight:600">' + esc(t('parts.imp.f.' + f.key)) +
+            (f.req ? '<span class="req">*</span>' : '') + '</div>' +
+          '<select id="pi-map-' + f.key + '" style="flex:1">' +
+            '<option value="">' + esc(t('common.none')) + '</option>' +
+            parsed.headers.map(function (h) {
+              return '<option value="' + esc(h) + '"' +
+                (mapping[f.key] === h ? ' selected' : '') + '>' + esc(h) + '</option>';
+            }).join('') + '</select></div>';
+      }).join('');
+      show(2);
+    };
+    document.getElementById('pi-back1').onclick = function () { show(1); };
+    document.getElementById('pi-back2').onclick = function () { show(2); };
+    document.getElementById('pi-preview').onclick = function () {
+      IMPORT_FIELDS.forEach(function (f) {
+        mapping[f.key] = document.getElementById('pi-map-' + f.key).value;
+      });
+      var missing = IMPORT_FIELDS.filter(function (f) { return f.req && !mapping[f.key]; });
+      if (missing.length) {
+        toast(t('parts.imp.mapMissing', { f: missing.map(function (x) { return t('parts.imp.f.' + x.key); }).join(', ') }), 'error');
+        return;
+      }
+      var rows = validateRows();
+      var ok = rows.filter(function (r) { return !r.errs.length; }).length;
+      document.getElementById('pi-summary').innerHTML =
+        '<div class="muted">' + esc(t('parts.imp.summary')
+          .replace('{ok}', String(ok)).replace('{bad}', String(rows.length - ok))) + '</div>';
+      document.getElementById('pi-rows').innerHTML = rows.map(function (r, i) {
+        return '<tr class="' + (r.errs.length ? 'low-stock-red' : '') + '"><td class="muted">' + r.line + '</td>' +
+          IMPORT_FIELDS.map(function (f) {
+            return '<td>' + esc(r.rec[f.key]) + '</td>';
+          }).join('') +
+          '<td>' + (r.errs.length
+            ? '<span class="pill-unassigned">' + esc(r.errs.join(', ')) + '</span>'
+            : '<span style="color:var(--ok)">✓</span>') + '</td></tr>';
+      }).join('');
+      document.getElementById('pi-run').disabled = ok === 0;
+      show(3);
+    };
+    document.getElementById('pi-run').onclick = async function () {
+      var btn = this; btn.disabled = true;
+      var rows = validateRows().filter(function (r) { return !r.errs.length; });
+      var mode = document.querySelector('input[name="pi-mode"]:checked').value;
+      var prog = document.getElementById('pi-progress');
+      var okN = 0, failN = 0, fails = [];
+      for (var i = 0; i < rows.length; i++) {
+        var rec = rows[i].rec;
+        prog.innerHTML = '<div class="muted">' + esc(t('parts.imp.progress')
+          .replace('{i}', String(i + 1)).replace('{n}', String(rows.length))) + '</div>';
+        try {
+          var up = await sb.from('spare_parts').upsert({
+            code: rec.code, name: rec.name,
+            category: rec.category || null, unit: rec.unit || null
+          }, { onConflict: 'code' }).select('id').single();
+          if (up.error) throw up.error;
+          var wh = whByCode[rec.warehouse_code.toUpperCase()];
+          var cur = await sb.from('stock_levels').select('id,qty')
+            .eq('warehouse_id', wh.id).eq('part_id', up.data.id).maybeSingle();
+          if (cur.error) throw cur.error;
+          var qty = mode === 'add'
+            ? Number((cur.data && cur.data.qty) || 0) + Number(rec.qty)
+            : Number(rec.qty);
+          var srow = { warehouse_id: wh.id, part_id: up.data.id, qty: qty };
+          if (rec.min_qty !== '') srow.min_qty = Number(rec.min_qty);
+          var su = await sb.from('stock_levels').upsert(srow, { onConflict: 'warehouse_id,part_id' });
+          if (su.error) throw su.error;
+          await sb.from('part_transactions').insert({
+            warehouse_id: wh.id, part_id: up.data.id,
+            qty_delta: mode === 'add' ? Number(rec.qty) : (qty - Number((cur.data && cur.data.qty) || 0)),
+            actor_id: state.profile.id, note: 'bulk import'
+          });
+          okN++;
+        } catch (e) { failN++; fails.push('L' + rows[i].line + ': ' + (e.message || 'error')); }
+      }
+      prog.innerHTML = '<div class="' + (failN ? 'inline-err' : 'ok-line') + '">' +
+        esc(t('parts.imp.done').replace('{ok}', String(okN)).replace('{bad}', String(failN))) +
+        (fails.length ? '<br>' + esc(fails.slice(0, 5).join('; ')) : '') + '</div>';
+      if (okN) done();
+    };
   }
 
   function openWarehouseModal(site, warehouse, allWarehouses, done) {
@@ -2393,6 +3563,11 @@
     var tr = await baseTicketQuery().eq('site_id', id).order('updated_at', { ascending: false }).limit(8);
     var tickets = tr.error ? [] : (tr.data || []);
     if (tr.error) apiError(tr.error);
+    /* v3 I4: this site's open tickets (for the contract SLA table). */
+    var openTr = await baseTicketQuery().eq('site_id', id).not('status', 'in', '(resolved,closed)')
+      .order('updated_at', { ascending: false });
+    var openTickets = openTr.error ? [] : (openTr.data || []);
+    if (openTr.error) apiError(openTr.error);
     var openCount = 0;
     try {
       var cc = await baseTicketQuery('id', { count: 'exact', head: true })
@@ -2449,7 +3624,7 @@
         '</dl>'
       : '<div class="empty">' + esc(t('sites.contract.none')) + '</div>';
     var ccard =
-      '<div class="card"><h2>' + esc(t('sites.contractInfo')) + '</h2>' + csum +
+      '<div class="card"><h2>' + esc(t('sites.contractInfo')) + '</h2>' + csum + contractOpenTicketsTable() +
       (canContract ? '<div class="form-actions">' +
         '<button class="btn btn-sm btn-primary" id="contract-edit">' +
           esc(contract ? t('sites.contractEdit') : t('sites.contractNew')) + '</button>' +
@@ -2457,6 +3632,38 @@
           esc(t('sites.contractDelete')) + '</button>' : '') +
         '</div>' : '') +
       '</div>';
+
+    /* v3 I4: this site's open tickets with the 3 SLA clock badges, reusing
+       the badge() helper and L.ticketSla() (no v3 migration needed). */
+    function slaBadgeCell(clockState) {
+      var cls = clockState === 'breached' ? 'sla-breached' :
+                clockState === 'warning' ? 'sla-warning' : 'sla-ok';
+      var lbl = clockState === 'breached' ? t('detail.sla.breached') :
+                clockState === 'warning' ? t('detail.sla.warning') : t('detail.sla.ok');
+      return badge(cls, lbl);
+    }
+    function contractOpenTicketsTable() {
+      var rows = openTickets.map(function (x) {
+        var sla = L.ticketSla(x);
+        return '<tr class="clickable" data-id="' + x.id + '">' +
+          '<td class="tnum">' + esc(L.formatTicketNo(x.ticket_no)) + '</td>' +
+          '<td>' + esc(x.title) + '</td>' +
+          '<td>' + slaBadgeCell(sla.response.state) + '</td>' +
+          '<td>' + slaBadgeCell(sla.onsite.state) + '</td>' +
+          '<td>' + slaBadgeCell(sla.resolution.state) + '</td></tr>';
+      }).join('');
+      return '<h3 class="section-title" style="margin-top:14px">' +
+        esc(t('sites.contractOpenTickets')) + '</h3>' +
+        (rows
+          ? '<div style="overflow-x:auto"><table class="tbl"><thead><tr>' +
+            '<th>' + esc(t('list.columns.ticket')) + '</th>' +
+            '<th>' + esc(t('list.columns.title')) + '</th>' +
+            '<th>' + esc(t('detail.sla.response')) + '</th>' +
+            '<th>' + esc(t('detail.sla.onsite')) + '</th>' +
+            '<th>' + esc(t('detail.sla.resolution')) + '</th>' +
+            '</tr></thead><tbody>' + rows + '</tbody></table></div>'
+          : '<div class="empty">' + esc(t('sites.contractOpenTickets.none')) + '</div>');
+    }
 
     var whRows = warehouses.map(function (w) {
       var pw = w.parent_warehouse_id && warehouses.find(function (x) { return x.id === w.parent_warehouse_id; });
@@ -2682,6 +3889,34 @@
     (sr.error ? [] : (sr.data || [])).forEach(function (s) {
       shiftMap[s.engineer_id + '|' + s.day] = s;
     });
+    // v3 F5: holidays for the visible range (matched per engineer by country).
+    var holidayMap = {};
+    if (state.v3) {
+      try {
+        var hr = await sb.from('holidays').select('country_code,day,name')
+          .gte('day', from).lte('day', to);
+        (hr.error ? [] : (hr.data || [])).forEach(function (h) {
+          holidayMap[(h.country_code || '').toUpperCase() + '|' + h.day] = h.name;
+        });
+      } catch (e) {}
+    }
+    // v3 I2: ticket numbers for shifts that carry a ticket_id.
+    var shiftTicketNos = {};
+    if (state.v3) {
+      var sTids = [];
+      Object.keys(shiftMap).forEach(function (k) {
+        var tid = shiftMap[k].ticket_id;
+        if (tid && sTids.indexOf(tid) === -1) sTids.push(tid);
+      });
+      if (sTids.length) {
+        try {
+          var tr2 = await sb.from('tickets').select('id,ticket_no').in('id', sTids);
+          (tr2.error ? [] : (tr2.data || [])).forEach(function (x) {
+            shiftTicketNos[x.id] = x.ticket_no;
+          });
+        } catch (e) {}
+      }
+    }
 
     var q = planUi.q.trim().toLowerCase();
     var list = engineers.filter(function (e) {
@@ -2693,8 +3928,11 @@
 
     var cols = '200px repeat(' + nDays + ', minmax(70px, 1fr))';
     var loc = lang === 'zh' ? 'zh-CN' : 'en-GB';
+    var todayKey = ymd(new Date());
     var headCells = days.map(function (d) {
-      return '<div class="plan-cell plan-head">' +
+      /* v3 U9: highlight today's column header */
+      var isToday = ymd(d) === todayKey;
+      return '<div class="plan-cell plan-head' + (isToday ? ' plan-today' : '') + '">' +
         esc(d.toLocaleDateString(loc, { weekday: 'short', day: 'numeric', month: 'numeric' })) + '</div>';
     }).join('');
     var rowsHtml = list.map(function (e) {
@@ -2702,13 +3940,26 @@
         var key = ymd(d);
         var sh = shiftMap[e.id + '|' + key];
         var st = L.dayState(sh && sh.status, key);
+        // v3 F5: public holiday in the engineer's country.
+        var holName = state.v3 ? holidayMap[((e.country || '').toUpperCase()) + '|' + key] : null;
         var inner = '<div><b>' + esc(t('plan.' + st)) + '</b></div>';
+        if (holName) inner += '<div class="muted" title="' + esc(holName) + '">🎉</div>';
         if (sh && sh.status === 'assigned' && sh.site_id) {
           inner += '<div class="muted">' + esc(siteShort(sh.site_id)) + '</div>';
         } else if (sh && sh.note) {
           inner += '<div class="muted" title="' + esc(sh.note) + '">✎</div>';
         }
-        return '<div class="plan-cell cell-' + st + (canWrite ? ' clickable' : '') + '"' +
+        // v3 I2: ticket number on the planning cell.
+        if (state.v3 && sh && sh.ticket_id && shiftTicketNos[sh.ticket_id]) {
+          inner += '<div><a href="#/ticket/' + sh.ticket_id + '" class="tnum" style="font-size:11px">' +
+            esc(L.formatTicketNo(shiftTicketNos[sh.ticket_id])) + '</a></div>';
+        }
+        // v3 F4: duty-type badge.
+        if (state.v3 && sh && sh.duty_type) {
+          inner += '<div><span class="duty-badge">' + esc(t('plan.duty.' + sh.duty_type)) + '</span></div>';
+        }
+        var cellCls = 'plan-cell cell-' + st + (canWrite ? ' clickable' : '') + (holName ? ' cell-holiday' : '');
+        return '<div class="' + cellCls + '"' +
           ' data-eng="' + e.id + '" data-day="' + key + '">' + inner + '</div>';
       }).join('');
       return '<div class="plan-row" style="grid-template-columns:' + cols + '">' +
@@ -2769,6 +4020,8 @@
 
   function openShiftModal(engineer, day, existing, done) {
     existing = existing || {};
+    var dutyTypes = ['remote_call', 'phone_oncall', 'field_oncall'];
+    var covSites = existing.covered_site_ids || [];
     var body =
       '<div class="field"><label>' + esc(t('plan.engineer')) + '</label>' +
         '<div><b>' + esc(engineer.display_name || engineer.email) + '</b> ' + certBadge(engineer.cert_level) +
@@ -2785,6 +4038,27 @@
           return '<option value="' + s.id + '"' + (existing.site_id === s.id ? ' selected' : '') + '>' +
             esc(s.code + ' — ' + s.name) + '</option>';
         }).join('') + '</select></div>' +
+      /* v3 I1: assign an open ticket from the planning cell */
+      (state.v3
+        ? '<div class="field" id="sh-ticket-wrap"><label>' + esc(t('plan.assignTicket')) + '</label>' +
+          '<select id="sh-ticket"><option value="">' + esc(t('common.none')) + '</option></select>' +
+          '<div class="hint">' + esc(t('plan.assignTicketHint')) + '</div></div>'
+        : '') +
+      /* v3 F4: duty type + covered sites */
+      (state.v3
+        ? '<div class="field"><label>' + esc(t('plan.dutyType')) + '</label>' +
+          '<select id="sh-duty"><option value="">' + esc(t('common.none')) + '</option>' +
+          dutyTypes.map(function (d) {
+            return '<option value="' + d + '"' + (existing.duty_type === d ? ' selected' : '') + '>' +
+              esc(t('plan.duty.' + d)) + '</option>';
+          }).join('') + '</select></div>' +
+          '<div class="field"><label>' + esc(t('plan.coveredSites')) + '</label>' +
+            '<div class="check-list">' + state.sites.map(function (s) {
+              return '<label><input type="checkbox" data-cov="' + s.id + '"' +
+                (covSites.indexOf(s.id) !== -1 ? ' checked' : '') + ' style="width:auto"> ' +
+                esc(s.code) + '</label>';
+            }).join('') + '</div></div>'
+        : '') +
       '<div class="field"><label>' + esc(t('plan.note')) + '</label>' +
         '<input type="text" id="sh-note" value="' + esc(existing.note || '') + '"></div>';
     var close = openModal(t('plan.setStatus'), body,
@@ -2793,11 +4067,52 @@
       '<button class="btn btn-primary" id="m-save">' + esc(t('common.save')) + '</button>');
     document.getElementById('m-cancel').onclick = close;
     function toggleSite() {
-      document.getElementById('sh-site-wrap').style.display =
-        document.getElementById('sh-status').value === 'assigned' ? 'block' : 'none';
+      var assigned = document.getElementById('sh-status').value === 'assigned';
+      document.getElementById('sh-site-wrap').style.display = assigned ? 'block' : 'none';
+      var tw = document.getElementById('sh-ticket-wrap');
+      if (tw) tw.style.display = assigned ? 'block' : 'none';
     }
     document.getElementById('sh-status').onchange = toggleSite;
     toggleSite();
+    // v3 I1: open-ticket picker (unassigned, not terminal).
+    // The shift's current ticket is included even though it's now assigned.
+    (function loadOpenTickets() {
+      var sel = document.getElementById('sh-ticket');
+      if (!sel) return;
+      var curTid = existing.ticket_id || null;
+      baseTicketQuery('id,ticket_no,title,site_id,assigned_to')
+        .is('assigned_to', null)
+        .not('status', 'in', '(resolved,closed,pending_customer)')
+        .order('created_at', { ascending: true }).limit(100)
+        .then(function (r) {
+          if (r.error || !document.getElementById('sh-ticket')) return;
+          var list = r.data || [];
+          function renderOpts(extra) {
+            var s = document.getElementById('sh-ticket');
+            if (!s) return;
+            var all = (extra ? [extra] : []).concat(list.filter(function (x) {
+              return !extra || x.id !== extra.id;
+            }));
+            s.innerHTML = '<option value="">' + esc(t('common.none')) + '</option>' +
+              all.map(function (x) {
+                return '<option value="' + x.id + '"' +
+                  (curTid === x.id ? ' selected' : '') +
+                  ' data-site="' + (x.site_id || '') + '">' +
+                  esc(L.formatTicketNo(x.ticket_no) + ' — ' + x.title) + '</option>';
+              }).join('');
+            s.onchange = function () {
+              var o = s.options[s.selectedIndex];
+              var siteId = o && o.getAttribute('data-site');
+              var siteSel = document.getElementById('sh-site');
+              if (siteId && siteSel) siteSel.value = siteId;
+            };
+          }
+          if (curTid) {
+            sb.from('tickets').select('id,ticket_no,title,site_id').eq('id', curTid).single()
+              .then(function (cr) { renderOpts(cr.error ? null : cr.data); });
+          } else renderOpts(null);
+        });
+    })();
     var clearBtn = document.getElementById('m-clear');
     if (clearBtn) clearBtn.onclick = async function () {
       try {
@@ -2810,6 +4125,8 @@
       var btn = this; btn.disabled = true;
       try {
         var status = document.getElementById('sh-status').value;
+        var ticketSel = document.getElementById('sh-ticket');
+        var ticketId = status === 'assigned' && ticketSel ? (ticketSel.value || null) : null;
         var row = {
           engineer_id: engineer.id,
           day: day,
@@ -2817,8 +4134,27 @@
           site_id: status === 'assigned' ? (document.getElementById('sh-site').value || null) : null,
           note: document.getElementById('sh-note').value.trim() || null
         };
+        if (state.v3) {
+          var dutySel = document.getElementById('sh-duty');
+          row.duty_type = dutySel ? (dutySel.value || null) : null;
+          row.covered_site_ids = Array.prototype.map.call(
+            document.querySelectorAll('[data-cov]:checked'), function (c) {
+              return c.getAttribute('data-cov');
+            });
+          row.ticket_id = ticketId;
+        }
         var r = await sb.from('shifts').upsert(row, { onConflict: 'engineer_id,day' });
         if (r.error) throw r.error;
+        // v3 I1: assigning a ticket from planning sets the ticket's owner
+        // and stamps that day as the field-visit date.
+        if (state.v3 && ticketId) {
+          var tr = await sb.from('tickets').update({
+            assigned_to: engineer.id,
+            onsite_from: day,
+            onsite_to: day
+          }).eq('id', ticketId);
+          if (tr.error) throw tr.error;
+        }
         close(); toast(t('plan.saved'), 'ok'); done();
       } catch (e) { apiError(e); btn.disabled = false; }
     };

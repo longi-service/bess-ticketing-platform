@@ -83,13 +83,17 @@
     in_progress:      ['resolved', 'assigned'],
     resolved:         ['pending_customer', 'in_progress', 'closed'],
     pending_customer: ['closed', 'in_progress'],
-    closed:           []
+    /* v3 F7: closed tickets can be reopened to open (staff only —
+       customer/engineer excluded; audit trail via internal comment). */
+    closed:           ['open']
   };
 
   /**
    * allowedTransitions(status, role, ctx) → array of target statuses the
    * user may move the ticket to. ctx: { isAssignee, isCreator, inScope }.
-   * - assign / unassign / reopen / close      → dispatcher, admin
+   * - assign / unassign / close           → dispatcher, admin
+   * - reopen (closed → open)              → dispatcher, admin, pm
+   *   (customer and engineer are excluded)
    * - accept (assigned→in_progress) / resolve → assigned engineer, or dispatcher/admin
    * - resolved → pending_customer ("request confirmation"): assigned
    *   engineer, dispatcher, admin
@@ -133,6 +137,8 @@
                                              (role === 'customer' && isCreator);
         case 'pending_customer->in_progress': return role === 'admin' || role === 'dispatcher' ||
                                              (role === 'engineer' && isAssignee);
+        // v3 F7: reopen — dispatcher/admin/pm only (NOT customer, NOT engineer).
+        case 'closed->open': return role === 'admin' || role === 'dispatcher' || role === 'pm';
         default: return false;
       }
     });
@@ -241,6 +247,26 @@
     return ['response', 'onsite', 'resolution'].some(function (k) {
       return clocks[k].state === 'breached';
     });
+  }
+
+  /**
+   * slaAlertLevel(ticket, now) → 'breached' | 'warning' | 'none'.
+   * v3 F8: 'breached' when any clock is breached (not terminal);
+   * 'warning' when any clock is in warning state with < 2h remaining
+   * (computed from sla_*_at minus now, not terminal).
+   */
+  function slaAlertLevel(ticket, now) {
+    if (!ticket || TERMINAL_STATUSES.indexOf(ticket.status) !== -1) return 'none';
+    var clocks = ticketSla(ticket, now);
+    var warned = false;
+    var breached = ['response', 'onsite', 'resolution'].some(function (k) {
+      var c = clocks[k];
+      if (c.state === 'warning' && c.remainingMs != null &&
+          c.remainingMs < WARNING_THRESHOLD_MS) warned = true;
+      return c.state === 'breached';
+    });
+    if (breached) return 'breached';
+    return warned ? 'warning' : 'none';
   }
 
   /* ------------------------------------------------------------------ */
@@ -435,6 +461,7 @@
     slaState: slaState,
     ticketSla: ticketSla,
     isSlaBreached: isSlaBreached,
+    slaAlertLevel: slaAlertLevel,
     canViewTicket: canViewTicket,
     visibilityReason: visibilityReason,
     canUploadPhoto: canUploadPhoto,

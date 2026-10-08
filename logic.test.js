@@ -123,10 +123,15 @@ arrEq('pending_customer: customer creator → confirm close',
       T('pending_customer','customer',{isCreator:true}), ['closed']);
 arrEq('pending_customer: customer NOT creator',
       T('pending_customer','customer',{isCreator:false}), []);
-arrEq('closed: admin',          T('closed','admin'),          []);
-arrEq('closed: dispatcher',     T('closed','dispatcher'),     []);
-arrEq('closed: engineer',       T('closed','engineer'),       []);
-arrEq('closed: customer',       T('closed','customer'),       []);
+arrEq('closed: admin → reopen',   T('closed','admin'),          ['open']);
+arrEq('closed: dispatcher → reopen', T('closed','dispatcher'),     ['open']);
+arrEq('closed: pm → reopen',     T('closed','pm'),             ['open']);
+arrEq('closed: engineer → none', T('closed','engineer'),       []);
+arrEq('closed: customer → none', T('closed','customer'),       []);
+arrEq('closed: engineer assignee still cannot reopen',
+      T('closed','engineer',{isAssignee:true}), []);
+arrEq('closed: customer creator still cannot reopen',
+      T('closed','customer',{isCreator:true}), []);
 arrEq('pending: admin (unused status)', T('pending','admin'), []);
 ok('unknown status → []', JSON.stringify(T('bogus','admin')) === '[]');
 ok('unknown role → []', JSON.stringify(T('open','superadmin')) === '[]');
@@ -206,6 +211,23 @@ ok('null ticket → false', L.isSlaBreached(null, '2026-10-01T00:00:00Z') === fa
 const tLateResp = { status:'open', sla_response_at:'2026-10-01T01:00:00Z', responded_at:'2026-10-01T05:00:00Z' };
 ok('stopped-late response clock counts as breached (documents behavior)',
    L.isSlaBreached(tLateResp, '2026-10-02T00:00:00Z') === true);
+
+// slaAlertLevel — v3 F8: breached | warning(<2h) | none, never terminal
+eq('slaAlertLevel: breached running clock', L.slaAlertLevel(t0, '2026-10-05T00:00:00Z'), 'breached');
+eq('slaAlertLevel: closed → none even with breached clocks', L.slaAlertLevel(tClosed, '2026-10-05T00:00:00Z'), 'none');
+eq('slaAlertLevel: resolved → none', L.slaAlertLevel(tResolved, '2026-10-05T00:00:00Z'), 'none');
+eq('slaAlertLevel: null → none', L.slaAlertLevel(null, '2026-10-05T00:00:00Z'), 'none');
+const tWarn = { status:'open', sla_response_at:'2026-10-01T01:30:00Z',
+                sla_onsite_at:'2026-10-10T00:00:00Z', sla_resolve_at:'2026-10-20T00:00:00Z' };
+eq('slaAlertLevel: 1.5h remaining → warning', L.slaAlertLevel(tWarn, '2026-10-01T00:00:00Z'), 'warning');
+const tWarnEdge = { status:'open', sla_response_at:'2026-10-01T02:00:00Z',
+                    sla_onsite_at:'2026-10-10T00:00:00Z', sla_resolve_at:'2026-10-20T00:00:00Z' };
+eq('slaAlertLevel: exactly 2h remaining → none (warning is strictly <2h)',
+   L.slaAlertLevel(tWarnEdge, '2026-10-01T00:00:00Z'), 'none');
+eq('slaAlertLevel: stopped-late clock → breached',
+   L.slaAlertLevel(tLateResp, '2026-10-02T00:00:00Z'), 'breached');
+eq('slaAlertLevel: healthy ticket → none',
+   L.slaAlertLevel(tFresh, '2026-10-01T00:00:00Z'), 'none');
 
 /* ------------------------------------------------------------------ */
 /* 4. Visibility — contract §8, edge cases                              */
