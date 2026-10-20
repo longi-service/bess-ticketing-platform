@@ -69,7 +69,9 @@
     'workflow.manage':       ['admin'],                                // workflow states/transitions
     'field.manage':          ['admin', 'dispatcher'],                    // custom fields
     /* v6.1 additions */
-    'group.manage':          ['admin', 'dispatcher', 'pm']              // support groups
+    'group.manage':          ['admin', 'dispatcher', 'pm'],             // support groups
+    /* v6.2 additions */
+    'email.manage':          ['admin']                                  // email templates / log / customer-mail switch
   };
 
   /**
@@ -1052,6 +1054,125 @@
    */
 
   /* ------------------------------------------------------------------ */
+  /* v6.2: email notifications (item 15 — sending only; inbound          */
+  /* auto-ticketing stays out of scope). Pure helpers: the app assembles */
+  /* recipients + variables, the send-email Edge Function renders and    */
+  /* delivers via the company SMTP mailbox.                              */
+  /* ------------------------------------------------------------------ */
+
+  /** Notification events. Keys double as email_templates.key values. */
+  var EMAIL_EVENTS = ['ticket_created', 'ticket_assigned', 'status_changed',
+    'comment_added', 'sla_warning', 'sla_breach'];
+
+  function _escapeHtmlValue(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  function _substituteTemplate(text, vars, escapeValues) {
+    if (text == null) return '';
+    return String(text).replace(/\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g, function (m, k) {
+      var v = vars ? vars[k] : null;
+      if (v == null) return '';
+      return escapeValues ? _escapeHtmlValue(v) : String(v);
+    });
+  }
+
+  /**
+   * renderEmailTemplate(text, vars) → {{key}} substitution for HTML
+   * bodies: substituted values are HTML-escaped (template HTML itself
+   * is trusted — it is written by admins). Unknown keys render empty.
+   */
+  function renderEmailTemplate(text, vars) {
+    return _substituteTemplate(text, vars, true);
+  }
+
+  /** renderEmailSubject(text, vars) → same substitution, NO escaping
+   *  (subjects are plain text). */
+  function renderEmailSubject(text, vars) {
+    return _substituteTemplate(text, vars, false);
+  }
+
+  /**
+   * assembleRecipients(input) → [{ email, user_id, lang, kind }]
+   *
+   * input:
+   *   ticket      { created_by, assigned_to, assigned_group_id, site_id }
+   *   profilesById  { id → { id, email, role, language, is_active } }
+   *   groupMembers  [ { group_id, member_type, member_id } ] (v6.1)
+   *   contactsById  { id → { id, email } }   (external group members)
+   *   site          { remote_owner_id, remote_owner_email } | null
+   *   prefsByUser   { userId → { eventKey → bool } } (absent = enabled)
+   *   eventKey      one of EMAIL_EVENTS
+   *   customerNotifyEnabled  bool — customer-ROLE profiles only get mail
+   *                            when the admin switch is on.
+   *   staffOnly     bool — internal events (e.g. internal comments):
+   *                            only staff profiles, no contacts/remote.
+   *   actorId / actorEmail — the user who triggered the event never
+   *                            mails themselves.
+   *
+   * Order is stable (creator → assignee → group → remote owner) and
+   * de-duplicated by lowercased email; first occurrence wins.
+   */
+  function assembleRecipients(input) {
+    var o = input || {};
+    var ticket = o.ticket || {};
+    var profiles = o.profilesById || {};
+    var contacts = o.contactsById || {};
+    var prefs = o.prefsByUser || {};
+    var out = [], seen = {};
+    var actorId = o.actorId || null;
+    var actorEmail = o.actorEmail ? String(o.actorEmail).toLowerCase() : null;
+
+    function push(email, userId, lang, kind) {
+      if (!email) return;
+      var key = String(email).toLowerCase();
+      if (seen[key]) return;
+      if (actorEmail && key === actorEmail) return;
+      seen[key] = true;
+      out.push({ email: String(email), user_id: userId || null,
+                 lang: (lang === 'zh' ? 'zh' : 'en'), kind: kind });
+    }
+    function pushProfile(p, kind) {
+      if (!p || !p.email) return;
+      if (p.is_active === false) return;
+      if (actorId && p.id === actorId) return;
+      if (p.role === 'customer' && !o.customerNotifyEnabled) return;
+      if (o.staffOnly && p.role === 'customer') return;
+      var pu = prefs[p.id];
+      if (pu && pu[o.eventKey] === false) return;
+      push(p.email, p.id, p.language, kind);
+    }
+
+    pushProfile(profiles[ticket.created_by], 'creator');
+    pushProfile(profiles[ticket.assigned_to], 'assignee');
+    if (ticket.assigned_group_id) {
+      (o.groupMembers || []).forEach(function (m) {
+        if (m.group_id !== ticket.assigned_group_id) return;
+        if (m.member_type === 'profile') {
+          pushProfile(profiles[m.member_id], 'group');
+        } else if (m.member_type === 'contact' && !o.staffOnly) {
+          var c = contacts[m.member_id];
+          if (c && c.email) push(c.email, null, 'en', 'group');
+        }
+      });
+    }
+    if (o.site) {
+      /* The remote owner PROFILE is a staff member — included even for
+         staffOnly events. The raw remote_owner_email list is an external
+         channel and is skipped for staffOnly events. */
+      pushProfile(profiles[o.site.remote_owner_id], 'remote_owner');
+      if (!o.staffOnly) {
+        extractEmails(o.site.remote_owner_email).forEach(function (e) {
+          push(e, null, 'en', 'remote_owner');
+        });
+      }
+    }
+    return out;
+  }
+
+  /* ------------------------------------------------------------------ */
   return {
     ROLES: ROLES,
     STATUSES: STATUSES,
@@ -1118,6 +1239,11 @@
     canCloseTicket: canCloseTicket,
     monthlyPlanDates: monthlyPlanDates,
     maintenanceProgress: maintenanceProgress,
+    /* v6.2 additions */
+    EMAIL_EVENTS: EMAIL_EVENTS,
+    renderEmailTemplate: renderEmailTemplate,
+    renderEmailSubject: renderEmailSubject,
+    assembleRecipients: assembleRecipients,
     MAX_VIDEO_BYTES: MAX_VIDEO_BYTES,
     MAX_VIDEOS_PER_TICKET: MAX_VIDEOS_PER_TICKET,
     MAX_FILES_PER_TICKET: MAX_FILES_PER_TICKET,

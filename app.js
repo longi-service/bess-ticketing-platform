@@ -403,6 +403,22 @@
         if (!gmr.error) state.groupMembers = gmr.data || [];
       } catch (e) { /* groups stay empty */ }
     }
+    /* v6.2: feature probe — email_templates exists only after
+       migration_v6_2. Flag state.emailAvailable turns false for the
+       session if the send-email Edge Function is not deployed yet,
+       so notification attempts degrade silently instead of spamming
+       the console. */
+    state.v62 = false; state.appSettings = {}; state.emailAvailable = true;
+    try {
+      var v62p = await sb.from('email_templates').select('id', { count: 'exact', head: true });
+      state.v62 = !v62p.error;
+    } catch (e) { state.v62 = false; }
+    if (state.v62) {
+      try {
+        var sr = await sb.from('app_settings').select('*');
+        if (!sr.error) (sr.data || []).forEach(function (r) { state.appSettings[r.key] = r.value; });
+      } catch (e) { /* defaults: master on, customer mail off */ }
+    }
   }
 
   /**
@@ -555,8 +571,155 @@
             .update({ escalated: true, escalated_at: now }).eq('id', tk.id);
           if (!r.error) { tk.escalated = true; tk.escalated_at = now; }
         } catch (e) {}
+        /* v6.2 item 15: first time this ticket breaches → notify
+           (session-deduped: a viewer without update rights would
+           otherwise re-trigger on every render). */
+        if (!state._slaBreachSent) state._slaBreachSent = {};
+        if (!state._slaBreachSent[tk.id]) {
+          state._slaBreachSent[tk.id] = true;
+          notifyTicketEvent('sla_breach', tk, null);
+        }
+      } else {
+        /* v6.2 item 15: SLA warning-state clocks → notify once per
+           ticket+clock per session (client-side dedupe; there is no
+           cron in this architecture). */
+        var clocks = L.ticketSla(tk, now);
+        ['response', 'onsite', 'resolution'].forEach(function (ck) {
+          var st = clocks[ck].state;
+          if (st === 'warning') {
+            var key = tk.id + ':' + ck;
+            if (state._slaWarnSent && state._slaWarnSent[key]) return;
+            if (!state._slaWarnSent) state._slaWarnSent = {};
+            state._slaWarnSent[key] = true;
+            var dl = tk['sla_' + (ck === 'resolution' ? 'resolve' : ck) + '_at'];
+            notifyTicketEvent('sla_warning', tk,
+              { sla_deadline: fmtDate(dl), sla_clock: t('detail.sla.' + ck) });
+          }
+        });
       }
     }
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* v6.2 item 15 — email notifier (fire-and-forget).                   */
+  /* The send-email Edge Function does SMTP + email_log; this side only */
+  /* assembles recipients + template variables. Any failure is          */
+  /* console-only and never blocks the UI.                              */
+  /* ------------------------------------------------------------------ */
+  function appBaseUrl() {
+    return window.location.origin +
+      window.location.pathname.replace(/index\.html?$/, '');
+  }
+
+  function emailEventVars(ticket, extraVars) {
+    var site = ticket.site_id
+      ? (state.sites || []).filter(function (s) { return s.id === ticket.site_id; })[0]
+      : null;
+    var vars = {
+      ticket_no: L.formatTicketNo(ticket.ticket_no),
+      ticket_title: ticket.title || '',
+      site_name: site ? (site.name || site.code || '') : '',
+      actor_name: state.profile
+        ? (state.profile.display_name || state.profile.email || '') : '',
+      status: ticket.status ? t('status.' + ticket.status) : '',
+      priority: ticket.priority ? t('priority.' + ticket.priority) : '',
+      app_url: appBaseUrl() + '#/ticket/' + ticket.id
+    };
+    if (extraVars) Object.keys(extraVars).forEach(function (k) { vars[k] = extraVars[k]; });
+    return vars;
+  }
+
+  /** collectRecipients(ticket, eventKey, opts) → L.assembleRecipients input,
+   *  resolved against live state (profiles fetched on demand). */
+  async function collectRecipients(ticket, eventKey, opts) {
+    opts = opts || {};
+    var ids = [];
+    function need(id) { if (id && ids.indexOf(id) === -1) ids.push(id); }
+    need(ticket.created_by); need(ticket.assigned_to);
+    var site = ticket.site_id
+      ? (state.sites || []).filter(function (s) { return s.id === ticket.site_id; })[0]
+      : null;
+    if (site) need(site.remote_owner_id);
+    (state.groupMembers || []).forEach(function (m) {
+      if (m.group_id === ticket.assigned_group_id && m.member_type === 'profile') need(m.member_id);
+    });
+    var profilesById = {};
+    if (ids.length) {
+      try {
+        var pr = await sb.from('profiles')
+          .select('id,email,role,language,is_active').in('id', ids);
+        if (!pr.error) (pr.data || []).forEach(function (p) { profilesById[p.id] = p; });
+      } catch (e) { /* recipients degrade to remote emails only */ }
+    }
+    var prefsByUser = {};
+    if (state.v62 && ids.length) {
+      try {
+        var nr = await sb.from('notification_preferences').select('*').in('user_id', ids);
+        if (!nr.error) (nr.data || []).forEach(function (r) {
+          (prefsByUser[r.user_id] = prefsByUser[r.user_id] || {})[r.event_key] = !!r.enabled;
+        });
+      } catch (e) { /* absent row = enabled */ }
+    }
+    var contactsById = {};
+    (state.contacts || []).forEach(function (c) { contactsById[c.id] = c; });
+    return L.assembleRecipients({
+      ticket: ticket,
+      profilesById: profilesById,
+      groupMembers: state.groupMembers || [],
+      contactsById: contactsById,
+      site: site,
+      prefsByUser: prefsByUser,
+      eventKey: eventKey,
+      customerNotifyEnabled: state.appSettings.customer_email_notifications === 'true',
+      staffOnly: !!opts.staffOnly,
+      actorId: state.profile ? state.profile.id : null,
+      actorEmail: state.profile ? state.profile.email : null
+    });
+  }
+
+  /** Mark the send-email function unavailable for this session when the
+   *  error shows it is not deployed (404 / relay / fetch errors).
+   *  Transient SMTP 5xx keeps the flag — next invoke retries. */
+  function emailMarkUnavailable(e) {
+    if (!e) return;
+    var st = e.context && e.context.status;
+    if (st === 404 || e.name === 'FunctionsFetchError' || e.name === 'FunctionsRelayError') {
+      state.emailAvailable = false;
+    }
+  }
+
+  function notifyTicketEvent(eventKey, ticket, extraVars, opts) {
+    if (!state.v62 || !state.emailAvailable || !sb || !ticket || !ticket.id) return;
+    if (state.appSettings.email_enabled === 'false') return;  // master kill switch
+    collectRecipients(ticket, eventKey, opts).then(function (recs) {
+      if (!recs.length) return;
+      var vars = emailEventVars(ticket, extraVars);
+      recs.forEach(function (r) {
+        try {
+          Promise.resolve(sb.functions.invoke('send-email', {
+            body: {
+              to: r.email,
+              template_key: eventKey,
+              lang: r.lang,
+              variables: vars,
+              ticket_id: ticket.id,
+              event_key: eventKey
+            }
+          })).then(function (res) {
+            if (res && res.error) {
+              console.warn('[email] send failed for ' + r.email + ':', res.error.message);
+              emailMarkUnavailable(res.error);
+            }
+          }).catch(function (e) {
+            console.warn('[email] invoke failed for ' + r.email + ':', e);
+            emailMarkUnavailable(e);
+          });
+        } catch (e) {
+          console.warn('[email] invoke threw for ' + r.email + ':', e);
+          emailMarkUnavailable(e);
+        }
+      });
+    }).catch(function (e) { console.warn('[email] notify failed:', e); });
   }
 
   /* ------------------------------ router -------------------------------- */
@@ -571,7 +734,7 @@
     var ms = h.match(/^#\/site\/([0-9a-f-]{36})$/i);
     if (ms) return { name: 'site', id: ms[1] };
     var name = h.replace(/^#\//, '').split('?')[0];
-    if (['login', 'dashboard', 'tickets', 'new', 'parts', 'planning', 'calendar', 'users', 'sites', 'sla-alerts', 'contacts', 'workflow', 'fields', 'groups'].indexOf(name) === -1) name = 'dashboard';
+    if (['login', 'dashboard', 'tickets', 'new', 'parts', 'planning', 'calendar', 'users', 'sites', 'sla-alerts', 'contacts', 'workflow', 'fields', 'groups', 'email'].indexOf(name) === -1) name = 'dashboard';
     return { name: name };
   }
 
@@ -622,6 +785,8 @@
       else if (route.name === 'contacts') { if (guard('contact.manage')) await viewContacts(view); }
       /* v6.1: support groups management */
       else if (route.name === 'groups') { if (guard('group.manage')) await viewGroups(view); }
+      /* v6.2: email notification settings (admin) */
+      else if (route.name === 'email') { if (guard('email.manage')) await viewEmail(view); }
       else if (route.name === 'workflow') { if (guard('workflow.manage')) await viewWorkflow(view); }
       else if (route.name === 'fields') { if (guard('field.manage')) await viewCustomFields(view); }
       else if (route.name === 'sla-alerts') {
@@ -657,6 +822,8 @@
         { id: 'contacts',  href: '#/contacts',  label: t('nav.contacts'),  perm: 'contact.manage' },
         /* v6.1: support groups (dispatch rules per Massimo) */
         { id: 'groups',    href: '#/groups',    label: t('nav.groups'),    perm: 'group.manage' },
+        /* v6.2: email notifications admin (item 15) */
+        { id: 'email',     href: '#/email',     label: t('nav.email'),     perm: 'email.manage' },
         { id: 'workflow',  href: '#/workflow',  label: t('nav.workflow'),  perm: 'workflow.manage' },
         { id: 'fields',    href: '#/fields',    label: t('nav.fields'),    perm: 'field.manage' },
         { id: 'users',     href: '#/users',     label: t('nav.users'),     perm: 'user.manage' }
@@ -685,6 +852,8 @@
             '<div class="side-user-actions">' +
               '<button class="lang-toggle" id="lang-toggle">' +
                 (lang === 'en' ? '中文' : 'EN') + '</button>' +
+              /* v6.2: personal email-notification preferences */
+              '<button class="btn btn-sm" id="notif-prefs-btn">' + esc(t('nav.myNotifications')) + '</button>' +
               '<button class="btn btn-sm" id="logout-btn">' + esc(t('nav.logout')) + '</button>' +
             '</div>' +
           '</div>' +
@@ -702,6 +871,8 @@
       setLang(lang === 'en' ? 'zh' : 'en');
     };
     document.getElementById('logout-btn').onclick = logout;
+    /* v6.2: personal notification preferences modal (all roles). */
+    document.getElementById('notif-prefs-btn').onclick = openMyNotificationsModal;
     // Mobile off-canvas behavior.
     document.getElementById('hamburger').onclick = function () {
       document.body.classList.toggle('sidebar-open');
@@ -1933,6 +2104,9 @@
           if (to === 'closed') patch.closed_at = new Date().toISOString();
           var r = await sb.from('tickets').update(patch).eq('id', ticket.id);
           if (r.error) throw r.error;
+          /* v6.2 item 15: notify status change (separate from assignment
+             notifications — that path never reaches here). */
+          notifyTicketEvent('status_changed', Object.assign({}, ticket, { status: to }), null);
           /* v3 F7: reopening a closed ticket leaves an internal timeline note
              (internal ⇒ does not stop the response clock). */
           if (ticket.status === 'closed' && to === 'open') {
@@ -2016,6 +2190,10 @@
           body: body, is_internal: isInternal
         });
         if (ins.error) throw ins.error;
+        /* v6.2 item 15: notify comment; internal comments stay inside
+           staff (no customers, no external contacts/remote addresses). */
+        notifyTicketEvent('comment_added', ticket, { comment: body },
+          { staffOnly: isInternal });
         // First PUBLIC comment stops the response clock (contract §4).
         if (!isInternal && !ticket.responded_at) {
           var up = await sb.from('tickets')
@@ -2337,6 +2515,9 @@
         if (ticket.status === 'open') patch.status = 'assigned';
         var r = await sb.from('tickets').update(patch).eq('id', ticket.id);
         if (r.error) throw r.error;
+        /* v6.2 item 15: notify assignment (single event — the implied
+           open→assigned status change does not send a second mail). */
+        notifyTicketEvent('ticket_assigned', Object.assign({}, ticket, patch), null);
         toast(t('common.saved'), 'ok');
         done();
       } catch (e) { apiError(e); btn.disabled = false; }
@@ -3220,6 +3401,10 @@
         }
         var ins = await sb.from('tickets').insert(insData).select('id,ticket_no').single();
         if (ins.error) throw ins.error;
+        /* v6.2 item 15: notify creation (creator is excluded by the
+           notifier itself — they don't need mail about their own action). */
+        notifyTicketEvent('ticket_created',
+          Object.assign({}, insData, { id: ins.data.id, ticket_no: ins.data.ticket_no }), null);
         /* v4: planning workbench prefill — set the assignee and the field
            date right after creation, then consume the prefill. */
         var pf = newTicketPrefill; newTicketPrefill = null;
@@ -3989,6 +4174,165 @@
 
   /* v7.8: workflow management — states CRUD + transition matrix per
      template (C&I / Utility). DB rows drive ticketTransitions() at runtime. */
+  /* v6.2 item 15: email notification admin — send log, templates,
+     switches, test send. Gated on state.v62 (migration_v6_2). */
+  async function viewEmail(view) {
+    if (!state.v62) {
+      view.innerHTML = '<div class="page"><div class="inline-err">' +
+        esc(t('common.migrationRequired').replace('{v}', 'v6.2')) + '</div></div>';
+      return;
+    }
+    var logRes = await sb.from('email_log').select('*')
+      .order('sent_at', { ascending: false }).limit(150);
+    var tplRes = await sb.from('email_templates').select('*').order('key').order('lang');
+    var logs = logRes.data || [];
+    var tpls = tplRes.data || [];
+    var sent = logs.filter(function (l) { return l.status === 'sent'; }).length;
+    var failed = logs.filter(function (l) { return l.status === 'failed'; }).length;
+
+    var logRows = logs.map(function (l) {
+      return '<tr><td class="muted">' + esc(fmtDate(l.sent_at)) + '</td>' +
+        '<td>' + esc(l.event_key ? t('email.event.' + l.event_key) : '—') + '</td>' +
+        '<td>' + esc(l.recipient) + '</td>' +
+        '<td>' + esc(l.subject || '') + '</td>' +
+        '<td>' + (l.status === 'sent' ? badge('sla-ok', t('email.statusSent'))
+                                       : badge('sla-breached', t('email.statusFailed'))) + '</td>' +
+        '<td class="muted">' + esc(l.error || '') + '</td></tr>';
+    }).join('');
+    if (!logRows) logRows = '<tr><td colspan="6" class="muted">' + esc(t('email.logEmpty')) + '</td></tr>';
+
+    var tplRows = L.EMAIL_EVENTS.map(function (k) {
+      return tpls.filter(function (x) { return x.key === k; }).map(function (x) {
+        return '<tr><td><b>' + esc(t('email.event.' + k)) + '</b><br>' +
+          '<span class="muted">' + esc(x.key) + ' · ' + esc(x.lang.toUpperCase()) + '</span></td>' +
+          '<td>' + esc(x.subject) + '</td>' +
+          '<td>' + (x.is_active ? badge('sla-ok', t('email.active')) : badge('status-closed', t('email.inactive'))) + '</td>' +
+          '<td><button class="btn btn-sm" data-tpl="' + x.id + '">' + esc(t('common.edit')) + '</button></td></tr>';
+      }).join('');
+    }).join('');
+
+    view.innerHTML =
+      '<div class="page-head"><h1>' + esc(t('email.title')) + '</h1></div>' +
+      '<div class="card"><h3>' + esc(t('email.settings')) + '</h3>' +
+        '<label class="checkbox"><input type="checkbox" id="em-enabled"' +
+          (state.appSettings.email_enabled !== 'false' ? ' checked' : '') + '> ' +
+          esc(t('email.masterSwitch')) + '</label>' +
+        '<label class="checkbox"><input type="checkbox" id="em-cust"' +
+          (state.appSettings.customer_email_notifications === 'true' ? ' checked' : '') + '> ' +
+          esc(t('email.customerSwitch')) + '</label>' +
+        '<div class="form-actions">' +
+          '<button class="btn btn-primary btn-sm" id="em-test">' + esc(t('email.testSend')) + '</button>' +
+          '<span class="muted" style="margin-left:8px">' + esc(t('email.testSendHint')) + '</span>' +
+        '</div>' +
+        '<div class="muted" style="margin-top:6px">' +
+          esc(t('email.recent')) + ': ' + sent + ' ' + esc(t('email.statusSent')) + ' / ' +
+          failed + ' ' + esc(t('email.statusFailed')) + '</div>' +
+      '</div>' +
+      '<div class="card"><h3>' + esc(t('email.templates')) + '</h3>' +
+        '<div class="muted" style="margin-bottom:8px">' + esc(t('email.varsHint')) + '</div>' +
+        '<table class="tbl"><thead><tr><th>' + esc(t('email.colEvent')) + '</th><th>' +
+          esc(t('email.colSubject')) + '</th><th></th><th></th></tr></thead>' +
+          '<tbody>' + tplRows + '</tbody></table></div>' +
+      '<div class="card"><h3>' + esc(t('email.log')) + '</h3>' +
+        '<table class="tbl"><thead><tr><th>' + esc(t('email.colTime')) + '</th><th>' +
+          esc(t('email.colEvent')) + '</th><th>' + esc(t('email.colRecipient')) + '</th><th>' +
+          esc(t('email.colSubject')) + '</th><th>' + esc(t('email.colStatus')) + '</th><th>' +
+          esc(t('email.colError')) + '</th></tr></thead>' +
+          '<tbody>' + logRows + '</tbody></table></div>';
+
+    async function saveSetting(key, value) {
+      var r = await sb.from('app_settings').upsert({ key: key, value: value }, { onConflict: 'key' });
+      if (r.error) { apiError(r.error); return; }
+      state.appSettings[key] = value;
+      toast(t('common.saved'), 'ok');
+    }
+    document.getElementById('em-enabled').onchange = function () {
+      saveSetting('email_enabled', this.checked ? 'true' : 'false');
+    };
+    document.getElementById('em-cust').onchange = function () {
+      saveSetting('customer_email_notifications', this.checked ? 'true' : 'false');
+    };
+    document.getElementById('em-test').onclick = async function () {
+      var btn = this; btn.disabled = true;
+      try {
+        var res = await sb.functions.invoke('send-email', {
+          body: {
+            to: state.profile.email,
+            subject: t('email.testSubject'),
+            html: '<p>' + esc(t('email.testBody')) + '</p>',
+            event_key: 'test'
+          }
+        });
+        if (res.error) throw res.error;
+        toast(t('email.testSent'), 'ok');
+        setTimeout(function () { viewEmail(view); }, 600);
+      } catch (e) {
+        toast(t('email.testFailed') + ': ' + (e.message || e), 'error');
+        btn.disabled = false;
+      }
+    };
+    view.querySelectorAll('[data-tpl]').forEach(function (btn) {
+      btn.onclick = function () {
+        var tpl = tpls.filter(function (x) { return x.id === btn.getAttribute('data-tpl'); })[0];
+        if (!tpl) return;
+        var close = openModal(t('email.editTemplate') + ' — ' + tpl.key + ' (' + tpl.lang.toUpperCase() + ')',
+          '<div class="field"><label>' + esc(t('email.colSubject')) + '</label>' +
+          '<input type="text" id="tpl-subject" value="' + esc(tpl.subject) + '"></div>' +
+          '<div class="field"><label>' + esc(t('email.bodyHtml')) + '</label>' +
+          '<textarea id="tpl-body" rows="12" style="width:100%">' + esc(tpl.body_html) + '</textarea></div>' +
+          '<label class="checkbox"><input type="checkbox" id="tpl-active"' +
+            (tpl.is_active ? ' checked' : '') + '> ' + esc(t('email.active')) + '</label>',
+          '<button class="btn btn-primary" id="tpl-save">' + esc(t('common.save')) + '</button>');
+        document.getElementById('tpl-save').onclick = async function () {
+          var r = await sb.from('email_templates').upsert({
+            key: tpl.key, lang: tpl.lang,
+            subject: document.getElementById('tpl-subject').value,
+            body_html: document.getElementById('tpl-body').value,
+            is_active: document.getElementById('tpl-active').checked
+          }, { onConflict: 'key,lang' });
+          if (r.error) { apiError(r.error); return; }
+          toast(t('common.saved'), 'ok');
+          close();
+          viewEmail(view);
+        };
+      };
+    });
+  }
+
+  /* v6.2 item 15: personal notification preferences — every logged-in
+     user toggles each event for themselves (absent row = enabled). */
+  async function openMyNotificationsModal() {
+    if (!state.v62) { toast(t('nav.myNotifications') + ': ' +
+      t('common.migrationRequired').replace('{v}', 'v6.2'), 'error'); return; }
+    var mine = {};
+    try {
+      var r = await sb.from('notification_preferences').select('*')
+        .eq('user_id', state.profile.id);
+      if (!r.error) (r.data || []).forEach(function (x) { mine[x.event_key] = !!x.enabled; });
+    } catch (e) { /* defaults apply */ }
+    var body = '<div class="muted" style="margin-bottom:8px">' + esc(t('email.prefsHint')) + '</div>' +
+      L.EMAIL_EVENTS.map(function (k) {
+        var on = mine[k] !== false;
+        return '<label class="checkbox"><input type="checkbox" data-ev="' + k + '"' +
+          (on ? ' checked' : '') + '> ' + esc(t('email.event.' + k)) + '</label>';
+      }).join('');
+    var close = openModal(t('nav.myNotifications'), body,
+      '<button class="btn btn-primary" id="np-save">' + esc(t('common.save')) + '</button>');
+    document.getElementById('np-save').onclick = async function () {
+      var rows = [];
+      document.querySelectorAll('[data-ev]').forEach(function (cb) {
+        rows.push({ user_id: state.profile.id, event_key: cb.getAttribute('data-ev'),
+                    enabled: cb.checked,
+                    updated_at: new Date().toISOString() });
+      });
+      var r = await sb.from('notification_preferences')
+        .upsert(rows, { onConflict: 'user_id,event_key' });
+      if (r.error) { apiError(r.error); return; }
+      toast(t('common.saved'), 'ok');
+      close();
+    };
+  }
+
   async function viewWorkflow(view) {
     if (!state.v7) {
       view.innerHTML = '<div class="page"><div class="inline-err">migration_v7 required</div></div>';

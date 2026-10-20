@@ -682,5 +682,104 @@ eq('dayState Date object works', L.dayState(null, new Date(2026, 9, 10)), 'weeke
 })();
 
 /* ------------------------------------------------------------------ */
+/* 10. v6.2 — email notifications (item 15)                            */
+/* ------------------------------------------------------------------ */
+(function () {
+  // EXPECT_CAN entry for the new permission
+  ok('can email.manage admin', L.can('email.manage', 'admin') === true);
+  ok('can email.manage dispatcher denied', L.can('email.manage', 'dispatcher') === false);
+  ok('can email.manage customer denied', L.can('email.manage', 'customer') === false);
+
+  eq('EMAIL_EVENTS list', L.EMAIL_EVENTS,
+    ['ticket_created', 'ticket_assigned', 'status_changed', 'comment_added', 'sla_warning', 'sla_breach']);
+
+  // renderEmailTemplate — HTML context escapes values
+  eq('render basic', L.renderEmailTemplate('Ticket {{ticket_no}}: {{title}}',
+    { ticket_no: 'T-001', title: 'Pump fault' }), 'Ticket T-001: Pump fault');
+  eq('render escapes html in values', L.renderEmailTemplate('<p>{{v}}</p>', { v: '<b>&"' }),
+    '<p>&lt;b&gt;&amp;&quot;</p>');
+  eq('render unknown key → empty', L.renderEmailTemplate('[{{nope}}]', {}), '[]');
+  eq('render null text', L.renderEmailTemplate(null, { a: 1 }), '');
+  eq('render spaces in key', L.renderEmailTemplate('{{ a }}', { a: 'x' }), 'x');
+  eq('render number value', L.renderEmailTemplate('{{n}}', { n: 42 }), '42');
+
+  // renderEmailSubject — plain text, no escaping
+  eq('subject no escape', L.renderEmailSubject('{{v}}', { v: '<b>&' }), '<b>&');
+  eq('subject basic', L.renderEmailSubject('[{{ticket_no}}] {{title}}',
+    { ticket_no: 'T-002', title: 'Hi' }), '[T-002] Hi');
+
+  // assembleRecipients — full rule set
+  var P = {
+    u1: { id: 'u1', email: 'Creator@Longi.com', role: 'dispatcher', language: 'en', is_active: true },
+    u2: { id: 'u2', email: 'eng@longi.com', role: 'engineer', language: 'zh', is_active: true },
+    u3: { id: 'u3', email: 'cust@client.com', role: 'customer', language: 'en', is_active: true },
+    u4: { id: 'u4', email: 'gone@longi.com', role: 'engineer', language: 'en', is_active: false },
+    u5: { id: 'u5', email: 'owner@longi.com', role: 'pm', language: 'en', is_active: true }
+  };
+  var GM = [
+    { group_id: 'g1', member_type: 'profile', member_id: 'u2' },
+    { group_id: 'g1', member_type: 'profile', member_id: 'u3' },
+    { group_id: 'g1', member_type: 'contact', member_id: 'c1' },
+    { group_id: 'gX', member_type: 'profile', member_id: 'u5' }
+  ];
+  var CT = { c1: { id: 'c1', email: 'tech@repsit.it' } };
+  var TK = { created_by: 'u1', assigned_to: 'u2', assigned_group_id: 'g1', site_id: 's1' };
+  var SITE = { remote_owner_id: 'u5', remote_owner_email: 'Owner@Longi.com, extra@client.it' };
+
+  var base = { ticket: TK, profilesById: P, groupMembers: GM, contactsById: CT,
+               site: SITE, prefsByUser: {}, eventKey: 'ticket_created',
+               customerNotifyEnabled: true };
+  var r1 = L.assembleRecipients(base);
+  // creator + assignee + group customer + group contact + remote profile
+  // (dup email skipped) + remote extra email = 6 unique
+  eq('recipients count', r1.length, 6);
+  eq('recipients order', r1.map(function (r) { return r.kind; }),
+    ['creator', 'assignee', 'group', 'group', 'remote_owner', 'remote_owner']);
+  eq('recipients emails', r1.map(function (r) { return r.email; }),
+    ['Creator@Longi.com', 'eng@longi.com', 'cust@client.com', 'tech@repsit.it',
+     'owner@longi.com', 'extra@client.it']);
+  eq('assignee lang zh', r1[1].lang, 'zh');
+  eq('contact has no user_id', r1[3].user_id, null);
+
+  // customer switch OFF → customer-role profile dropped, contacts stay
+  var r2 = L.assembleRecipients(Object.assign({}, base, { customerNotifyEnabled: false }));
+  eq('customer switch off drops role=customer only',
+    r2.map(function (r) { return r.email; }),
+    ['Creator@Longi.com', 'eng@longi.com', 'tech@repsit.it', 'owner@longi.com', 'extra@client.it']);
+
+  // preference OFF for the assignee on this event
+  var r3 = L.assembleRecipients(Object.assign({}, base,
+    { prefsByUser: { u2: { ticket_created: false } } }));
+  ok('pref off skips assignee', !r3.some(function (r) { return r.email === 'eng@longi.com'; }));
+  eq('pref off keeps others', r3.length, 5);
+  // preference for a different event does not skip
+  var r3b = L.assembleRecipients(Object.assign({}, base,
+    { prefsByUser: { u2: { status_changed: false } } }));
+  eq('pref other event keeps assignee', r3b.length, 6);
+
+  // actor never mails themselves
+  var r4 = L.assembleRecipients(Object.assign({}, base, { actorId: 'u1' }));
+  ok('actor excluded', !r4.some(function (r) { return r.user_id === 'u1'; }));
+  var r4b = L.assembleRecipients(Object.assign({}, base, { actorEmail: 'extra@client.it' }));
+  ok('actorEmail excluded', !r4b.some(function (r) { return r.email === 'extra@client.it'; }));
+
+  // staffOnly → only staff profiles (no customers, contacts, remote emails)
+  var r5 = L.assembleRecipients(Object.assign({}, base, { staffOnly: true }));
+  eq('staffOnly set', r5.map(function (r) { return r.email; }),
+    ['Creator@Longi.com', 'eng@longi.com', 'owner@longi.com']);
+
+  // inactive profile dropped; no group → no group recipients
+  var r6 = L.assembleRecipients({ ticket: { created_by: 'u4', assigned_to: null,
+      assigned_group_id: null, site_id: null },
+    profilesById: P, groupMembers: GM, contactsById: CT, site: null,
+    prefsByUser: {}, eventKey: 'ticket_created', customerNotifyEnabled: true });
+  eq('inactive creator dropped', r6.length, 0);
+
+  // empty/garbage input is safe
+  eq('assemble empty input', L.assembleRecipients({}), []);
+  eq('assemble null input', L.assembleRecipients(null), []);
+})();
+
+/* ------------------------------------------------------------------ */
 console.log(`\nlogic.test.js: ${pass} passed, ${fail} failed`);
 if (fail) { console.log('Failed:', failures.join(' | ')); process.exit(1); }
