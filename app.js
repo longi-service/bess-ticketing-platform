@@ -74,7 +74,7 @@
     dutyDefs: [],      // v4: duty_type_definitions rows (sort_order)
     dutyDefMap: {},    // v4: duty key -> definition row
     nameCache: {},       // profile id -> display name (best effort)
-    listFilters: { status: '', priority: '', source: '', site: '', assignee: '', q: '', tag: '', customer: '',
+    listFilters: { status: '', tracker: '', priority: '', source: '', site: '', assignee: '', q: '', tag: '', customer: '',
                  unassignedOnly: false, contractOnly: false }, // v3 U6: quick filters
     listPage: 0,           // v3 D7: pagination cursor (page index), reset on filter change
     siteSearch: ''       // v2: sites tree search text
@@ -400,6 +400,18 @@
   }
 
   /**
+   * ticketTransitions(ticket, role, ctx) — v7.8 configurable workflow:
+   * DB-driven transition map (by ticket.workflow_key) with role rules from
+   * logic.js; falls back to the legacy fixed flow when nothing is loaded.
+   */
+  function ticketTransitions(ticket, role, ctx) {
+    var map = wfTransitions(ticket && ticket.workflow_key);
+    if (map && Object.keys(map).length)
+      return L.allowedTransitionsWf(map, ticket.status, role, ctx);
+    return L.allowedTransitions(ticket.status, role, ctx);
+  }
+
+  /**
    * wfStateList(workflowKey) — DB-driven states if loaded, else template.
    */
   function wfStateList(workflowKey) {
@@ -472,6 +484,7 @@
   /** v3 D7/U6: shared filter application for fetchTickets/countTickets. */
   function applyTicketFilters(q, filters) {
     if (filters.status) q = q.eq('status', filters.status);
+    if (filters.tracker) q = q.eq('tracker', filters.tracker);
     if (filters.priority) q = q.eq('priority', filters.priority);
     if (filters.source) q = q.eq('source', filters.source);
     if (filters.site) q = q.eq('site_id', filters.site);
@@ -895,6 +908,11 @@
 
   async function viewDashboard(view) {
     var tickets = await fetchTickets({});
+    /* v7.13: active user count for the KPI row (head count only). */
+    try {
+      var uc = await sb.from('profiles').select('id', { count: 'exact', head: true }).eq('is_active', true);
+      if (!uc.error && uc.count != null) state._activeUserCount = uc.count;
+    } catch (e) {}
     await runEscalationJob(tickets);
     await resolveNames(collectIds(tickets));
     var me = state.profile.id;
@@ -1006,6 +1024,36 @@
     var attn = breached.concat(unassigned.filter(function (x) {
       return !breachedIds[x.id];
     })).slice(0, 10);
+    /* v7.13: SLA risk list — warning-state clocks, worst first, top 10. */
+    var slaRiskRows = open.filter(function (x) {
+      var sla = L.ticketSla(x);
+      return ['response', 'onsite', 'resolution'].some(function (k) { return sla[k].state === 'warning'; });
+    }).slice(0, 10).map(function (x) {
+      var ageD = Math.max(0, Math.floor((nowMs - new Date(x.created_at).getTime()) / 86400000));
+      var sla = L.ticketSla(x);
+      var worst = ['response', 'onsite', 'resolution'].filter(function (k) {
+        return sla[k].state === 'warning';
+      }).map(function (k) { return t('detail.sla.' + k); }).join(' · ');
+      return '<div class="attn-row" data-nav="#/ticket/' + x.id + '">' +
+        '<span class="tnum">' + esc(L.formatTicketNo(x.ticket_no)) + '</span>' +
+        '<span class="ttl">' + esc(x.title) + '</span>' +
+        '<span class="meta">' + esc(siteShort(x.site_id)) + ' · ' + esc(worst) + ' · ' + ageD + 'd</span>' +
+        badge('sla-warning', t('detail.sla.warning')) +
+      '</div>';
+    }).join('');
+
+    /* v7.12: this month's planned-maintenance tickets (tracker=maintenance). */
+    function maintThisMonth(allTickets) {
+      var y = new Date().getFullYear(), m = new Date().getMonth();
+      var mth = allTickets.filter(function (x) {
+        if (x.tracker !== 'maintenance' || !x.planned_date) return false;
+        var d = new Date(x.planned_date);
+        return d.getFullYear() === y && d.getMonth() === m;
+      });
+      var done = mth.filter(function (x) { return L.TERMINAL_STATUSES.indexOf(x.status) !== -1; }).length;
+      return { done: done, total: mth.length };
+    }
+
     var attnRows = attn.map(function (x) {
       var ageD = Math.max(0, Math.floor((nowMs - new Date(x.created_at).getTime()) / 86400000));
       var sla = L.ticketSla(x);
@@ -1040,6 +1088,24 @@
         counter(t('dash.avgResponse'), avgRespHrs == null ? '—' : avgRespHrs.toFixed(1) + 'h', false, '#/tickets') +
         counter(t('dash.closed30'), closed30.length, false, '#/tickets') +
         gaugeCard(t('dash.slaCompliance'), slaPct, slaPct != null && slaPct < 90, '#/tickets') +
+      '</div>' +
+      /* v7.13: TechCRM-style master data KPIs + SLA risk list. */
+      '<div class="grid-4" style="margin-top:16px">' +
+        counter(t('dash.activeProjects'),
+                state.sites.filter(function (s) { return (s.status || 'active') === 'active'; }).length,
+                false, '#/sites') +
+        counter(t('dash.activeUsers'), state._activeUserCount || '—', false, '#/users') +
+        counter(t('dash.plannedMaint'),
+                state.v7 ? maintThisMonth(tickets).done + '/' + maintThisMonth(tickets).total : '—',
+                false, '#/tickets') +
+        counter(t('dash.breachedSla') + ' / 30d',
+                open.filter(function (x) { return L.ticketSla(x).response.state === 'warning' ||
+                  L.ticketSla(x).onsite.state === 'warning' || L.ticketSla(x).resolution.state === 'warning'; }).length,
+                false, '#/tickets') +
+      '</div>' +
+      '<div class="card" style="margin-top:16px"><h2 class="section-title">' +
+        esc(t('dash.slaRiskList')) + '</h2>' +
+        (slaRiskRows || '<div class="empty">' + esc(t('dash.risk.none')) + '</div>') +
       '</div>' +
       '<div class="card" style="margin-top:16px"><h2 class="section-title">' +
         esc(t('dash.needsAttention')) + '</h2>' +
@@ -1165,6 +1231,7 @@
       return '<tr class="clickable' + (x.is_ltsa ? ' is-ltsa' : '') +
         (unassignedOpen ? ' unassigned-open' : '') + '" data-id="' + x.id + '">' +
         '<td class="tnum">' + esc(L.formatTicketNo(x.ticket_no)) + '</td>' +
+        (state.v7 ? '<td>' + trackerBadge(x.tracker) + '</td>' : '') +
         '<td>' + esc(x.title) + '</td>' +
         '<td>' + statusBadge(x.status) + '</td>' +
         '<td>' + priBadge(x.priority) + '</td>' +
@@ -1195,11 +1262,19 @@
       '</tr>';
   }
 
+  /** v7.7: tracker badge (color-coded, i18n label). */
+  function trackerBadge(tracker) {
+    var tr = L.TRACKERS[tracker] || L.TRACKERS.support;
+    return '<span class="badge" style="background:' + tr.color + '22;color:' + tr.color +
+      ';border:1px solid ' + tr.color + '55">' + esc(t('tracker.' + tr.key)) + '</span>';
+  }
+
   function ticketTable(tickets) {
     if (!tickets.length) return '<div class="empty">' + esc(t('list.noResults')) + '</div>';
     var rows = tickets.map(ticketRowHtml).join('');
     return '<div style="overflow-x:auto"><table class="tbl"><thead><tr>' +
       '<th>' + esc(t('list.columns.ticket')) + '</th>' +
+      (state.v7 ? '<th>' + esc(t('tickets.tracker')) + '</th>' : '') +
       '<th>' + esc(t('list.columns.title')) + '</th>' +
       '<th>' + esc(t('common.status')) + '</th>' +
       '<th>' + esc(t('common.priority')) + '</th>' +
@@ -1235,7 +1310,7 @@
      Ticket/user data is NEVER written to localStorage (old-demo bug). */
   var VIEWS_KEY = 'bess_views';
   function blankFilters() {
-    return { status: '', priority: '', source: '', site: '', assignee: '', q: '', tag: '', customer: '',
+    return { status: '', tracker: '', priority: '', source: '', site: '', assignee: '', q: '', tag: '', customer: '',
              unassignedOnly: false, contractOnly: false };
   }
   function loadSavedViews() {
@@ -1327,6 +1402,15 @@
           '<input type="text" id="f-q" placeholder="' + esc(t('list.searchPh')) + '" value="' + esc(f.q) + '"></div>' +
         '<div class="f"><label>' + esc(t('list.filter.status')) + '</label>' +
           '<select id="f-status">' + selectOpts(L.STATUSES, 'status.', f.status) + '</select></div>' +
+        /* v7.7: tracker filter */
+        (state.v7
+          ? '<div class="f"><label>' + esc(t('tickets.tracker')) + '</label>' +
+            '<select id="f-tracker"><option value="">' + esc(t('common.all')) + '</option>' +
+            L.TRACKER_KEYS.map(function (k) {
+              return '<option value="' + k + '"' + (f.tracker === k ? ' selected' : '') + '>' +
+                esc(t('tracker.' + k)) + '</option>';
+            }).join('') + '</select></div>'
+          : '') +
         '<div class="f"><label>' + esc(t('list.filter.priority')) + '</label>' +
           '<select id="f-priority">' + selectOpts(L.PRIORITIES, 'priority.', f.priority) + '</select></div>' +
         '<div class="f"><label>' + esc(t('list.filter.source')) + '</label>' +
@@ -1376,6 +1460,8 @@
     var deb = null;
     function refetch() {
       f.status = document.getElementById('f-status').value;
+      var trkEl = document.getElementById('f-tracker');
+      if (trkEl) f.tracker = trkEl.value;
       f.priority = document.getElementById('f-priority').value;
       f.source = document.getElementById('f-source').value;
       f.site = document.getElementById('f-site').value;
@@ -1397,8 +1483,9 @@
     document.getElementById('qf-contract').onclick = function () {
       f.contractOnly = !f.contractOnly; render();
     };
-    ['f-status', 'f-priority', 'f-source', 'f-site'].forEach(function (id) {
-      document.getElementById(id).onchange = refetch;
+    ['f-status', 'f-tracker', 'f-priority', 'f-source', 'f-site'].forEach(function (id) {
+      var el = document.getElementById(id);
+      if (el) el.onchange = refetch;
     });
     var custSel = document.getElementById('f-customer');
     if (custSel) custSel.onchange = refetch;
@@ -1552,7 +1639,7 @@
 
     var p = state.profile, role = p.role;
     var ctx = L.transitionCtx(ticket, p);
-    var transitions = L.allowedTransitions(ticket.status, role, ctx);
+    var transitions = ticketTransitions(ticket, role, ctx);
     var canAssign = L.can('ticket.assign', role);
     var canFieldReport = L.can('ticket.fieldreport', role) && (role !== 'engineer' || ctx.isAssignee);
     var canEditCore = L.can('ticket.edit.core', role) ||
@@ -1588,6 +1675,7 @@
         esc(t('detail.printReport')) + '</button>' +
       '<div class="detail-head"><span class="tnum">' + esc(L.formatTicketNo(ticket.ticket_no)) + '</span>' +
         statusBadge(ticket.status) + priBadge(ticket.priority) +
+        trackerBadge(ticket.tracker) +
         badge('status-open', t('source.' + ticket.source)) +
         (ticket.is_ltsa ? badge('escalated', t('detail.contractTicket')) : '') +
         (ticket.escalated ? badge('escalated', t('detail.escalated')) : '') +
@@ -1597,6 +1685,22 @@
       '<div>' + // left column: work area
         '<div class="card"><h2>' + esc(t('detail.sla')) + '</h2>' +
           '<div class="sla-clocks">' + clockCard('response') + clockCard('onsite') + clockCard('resolution') + '</div>' +
+          /* v7.9: contract SLA terms driving these clocks (LTSA tickets). */
+          (ticket.is_ltsa && state.contracts[ticket.site_id]
+            ? '<div class="hint" style="margin-top:8px">' + esc(t('ticket.contractReq')) + '： ' +
+              esc(t('ticket.contractReqLine', {
+                resp: state.contracts[ticket.site_id].response_hours != null
+                  ? state.contracts[ticket.site_id].response_hours : '—',
+                res: state.contracts[ticket.site_id].resolve_hours != null
+                  ? state.contracts[ticket.site_id].resolve_hours : '—'
+              })) +
+              (state.contracts[ticket.site_id].availability_pct != null
+                ? ' · ' + esc(t('contract.availability')) + ' ' +
+                  esc(String(state.contracts[ticket.site_id].availability_pct)) + '%'
+                : '') +
+              (state.contracts[ticket.site_id].support_24_7 ? ' · 24/7' : '') +
+              '</div>'
+            : '') +
         '</div>' +
         '<div class="card"><h2>' + esc(t('detail.requiredFields')) + '</h2>' +
           '<dl class="kv">' +
@@ -1619,6 +1723,21 @@
           (canFieldReport ? '<div style="margin-top:10px"><button class="btn btn-sm" id="fieldreport-btn">' +
             esc(t('common.edit')) + '</button></div>' : '') +
         '</div>' +
+        /* v7.11: service reports (mandatory before close, with signature). */
+        (!isCustomer && state.v7
+          ? '<div class="card"><h2>' + esc(t('ticket.serviceReport')) + '</h2>' +
+            '<div id="report-list"><div class="empty">' + esc(t('common.loading')) + '</div></div>' +
+            '<div style="margin-top:10px"><button class="btn btn-sm btn-primary" id="report-upload-btn">' +
+              esc(t('ticket.uploadReport')) + '</button></div></div>'
+          : '') +
+        /* v7.14: custom fields bound to this ticket's tracker. */
+        (state.v7
+          ? '<div class="card"><h2>' + esc(t('cf.title')) + '</h2>' +
+          '<div id="cf-list"><div class="empty">' + esc(t('common.loading')) + '</div></div>' +
+          (canEditCore ? '<div style="margin-top:10px"><button class="btn btn-sm" id="cf-edit-btn">' +
+            esc(t('common.edit')) + '</button></div>' : '') +
+        '</div>'
+          : '') +
         '<div class="card"><h2>' + esc(t('detail.photos')) + '</h2>' +
           '<div id="photo-gallery"></div>' +
           (canUpload
@@ -1695,13 +1814,21 @@
             '<div style="margin-top:10px"><button class="btn btn-sm" id="link-ticket-btn">+ ' +
               esc(t('detail.linkTicket')) + '</button></div></div>'
           : '') +
+        /* v7.10: master/sub-tickets (parent_ticket_id hierarchy). */
+        (!isCustomer && state.v7
+          ? '<div class="card"><h2>' + esc(t('ticket.subTickets')) + '</h2>' +
+            '<div id="sub-list"><div class="empty">' + esc(t('common.loading')) + '</div></div>' +
+            '<div style="margin-top:10px;display:flex;gap:8px">' +
+              '<button class="btn btn-sm" id="new-sub-btn">+ ' + esc(t('ticket.newSub')) + '</button>' +
+            '</div></div>'
+          : '') +
       '</div></div>';
 
     view.innerHTML = html;
     document.getElementById('back-btn').onclick = function () { nav('#/tickets'); };
     /* v3 F9: print report (staff only). */
     var prBtn = document.getElementById('print-report-btn');
-    if (prBtn) prBtn.onclick = function () { printServiceReport(ticket, comments); };
+    if (prBtn) prBtn.onclick = function () { printServiceReport(ticket, comments, photos); };
     renderPartsBlock(ticket);
 
     /* ----- edit core fields ----- */
@@ -1736,10 +1863,20 @@
       btn.onclick = async function () {
         var to = btn.getAttribute('data-transition');
         // Re-check permission at click time (never trust the rendered button).
-        var allowed = L.allowedTransitions(ticket.status, role, L.transitionCtx(ticket, state.profile));
+        var allowed = ticketTransitions(ticket, role, L.transitionCtx(ticket, state.profile));
         if (allowed.indexOf(to) === -1) { toast(t('common.noPermission'), 'error'); return; }
         btn.disabled = true;
         try {
+          /* v7.11: close gate — a service report (with customer signature)
+             must be uploaded before the ticket can be closed. */
+          if (to === 'closed' && state.v7) {
+            var gate = L.canCloseTicket(ticket, photos, ticket.custom_values);
+            if (!gate.ok) {
+              toast(t(gate.reason === 'signature_missing' ? 'ticket.signatureMissing'
+                                                          : 'ticket.reportRequired'), 'error');
+              btn.disabled = false; return;
+            }
+          }
           var patch = { status: to };
           // v2: resolved_at is set when entering resolved OR pending_customer
           // (customer confirmation); cleared when rework starts.
@@ -1851,6 +1988,247 @@
     /* ----- timeline (synthesized — no audit table in v1 contract) ----- */
     renderTimeline(ticket, comments, photos);
     if (state.v3 && !isCustomer) loadRelatedTickets(ticket.id);
+    if (!isCustomer && state.v7) loadSubTickets(ticket);
+    /* v7.11: service reports + v7.14 custom fields */
+    if (!isCustomer && state.v7) loadServiceReports(ticket);
+    if (state.v7) renderCustomFieldValues(ticket);
+    var cfBtn = document.getElementById('cf-edit-btn');
+    if (cfBtn) cfBtn.onclick = function () { openCustomFieldsModal(ticket, function () { render(); }); };
+    var ruBtn = document.getElementById('report-upload-btn');
+    if (ruBtn) ruBtn.onclick = function () {
+      openServiceReportModal(ticket, function () { render(); });
+    };
+    var nsb = document.getElementById('new-sub-btn');
+    if (nsb) nsb.onclick = function () {
+      /* v7.10: spare-part approval sub-ticket goes to HQ (dispatcher/admin). */
+      newTicketPrefill = {
+        parentTicketId: ticket.id,
+        siteId: ticket.site_id,
+        tracker: 'spare',
+        title: t('tracker.spare') + ' — ' + ticket.title
+      };
+      nav('#/new');
+    };
+  }
+
+  /* v7.11: service reports list (attachments kind='service_report'). */
+  async function loadServiceReports(ticket) {
+    var box = document.getElementById('report-list');
+    if (!box) return;
+    try {
+      var r = await sb.from('ticket_attachments').select('*')
+        .eq('ticket_id', ticket.id).eq('kind', 'service_report').order('created_at');
+      if (r.error) throw r.error;
+      var rows = r.data || [];
+      if (!rows.length) {
+        box.innerHTML = '<div class="inline-warn">' + esc(t('ticket.reportRequired')) + '</div>';
+        return;
+      }
+      box.innerHTML = rows.map(function (a) {
+        var signed = a.meta && a.meta.signed;
+        return '<div class="related-row"><span class="ttl">' + esc(a.file_name || 'report') + '</span> ' +
+          badge(signed ? 'sla-ok' : 'sla-warning',
+            esc(t(signed ? 'ticket.signed' : 'ticket.signatureMissing'))) +
+          ' <span class="muted">' + esc(fmtDate(a.created_at)) + '</span></div>';
+      }).join('');
+    } catch (e) {
+      box.innerHTML = '<div class="inline-err">' + esc(e.message || t('common.error')) + '</div>';
+    }
+  }
+
+  /**
+   * v7.11: service-report upload modal — file upload + customer signature pad.
+   * The signature is drawn on a canvas and stored (data URL) in the
+   * attachment meta; canCloseTicket() gates the close transition.
+   */
+  function openServiceReportModal(ticket, done) {
+    var body =
+      '<div class="field"><label>' + esc(t('ticket.serviceReport')) + '</label>' +
+        '<input type="file" id="sr-file" accept=".pdf,.doc,.docx,image/*"></div>' +
+      '<div class="field"><label>' + esc(t('ticket.signHere')) + '</label>' +
+        '<canvas id="sr-sig" width="520" height="160" style="border:1px solid var(--border);border-radius:6px;touch-action:none;width:100%"></canvas>' +
+        '<div style="margin-top:6px"><button class="btn btn-sm" id="sr-clear">' +
+          esc(t('ticket.clearSig')) + '</button> ' +
+          '<label style="font-weight:normal"><input type="checkbox" id="sr-signed"> ' +
+          esc(t('ticket.signed')) + '</label></div></div>';
+    var close = openModal(t('ticket.uploadReport'), body,
+      '<button class="btn" id="m-cancel">' + esc(t('common.cancel')) + '</button>' +
+      '<button class="btn btn-primary" id="m-save">' + esc(t('common.save')) + '</button>', true);
+    document.getElementById('m-cancel').onclick = close;
+    var canvas = document.getElementById('sr-sig');
+    var ctx2 = canvas.getContext('2d');
+    var drawing = false, hasInk = false;
+    function pos(e) {
+      var r = canvas.getBoundingClientRect();
+      var src = e.touches ? e.touches[0] : e;
+      return { x: (src.clientX - r.left) * (canvas.width / r.width),
+               y: (src.clientY - r.top) * (canvas.height / r.height) };
+    }
+    function down(e) { drawing = true; var p = pos(e); ctx2.beginPath(); ctx2.moveTo(p.x, p.y); e.preventDefault(); }
+    function move(e) {
+      if (!drawing) return;
+      var p = pos(e); ctx2.lineTo(p.x, p.y); ctx2.strokeStyle = '#1f2937'; ctx2.lineWidth = 2; ctx2.stroke();
+      hasInk = true;
+    }
+    function up() { drawing = false; }
+    canvas.addEventListener('mousedown', down); canvas.addEventListener('mousemove', move);
+    canvas.addEventListener('mouseup', up); canvas.addEventListener('mouseleave', up);
+    canvas.addEventListener('touchstart', down); canvas.addEventListener('touchmove', move);
+    canvas.addEventListener('touchend', up);
+    document.getElementById('sr-clear').onclick = function () {
+      ctx2.clearRect(0, 0, canvas.width, canvas.height); hasInk = false;
+    };
+    document.getElementById('m-save').onclick = async function () {
+      var btn = this; btn.disabled = true;
+      try {
+        var fileEl = document.getElementById('sr-file');
+        var file = fileEl.files && fileEl.files[0];
+        if (!file) { toast(t('new.fillRequired'), 'error'); btn.disabled = false; return; }
+        var signed = document.getElementById('sr-signed').checked && hasInk;
+        var path = L.photoPath(ticket.id, file.name, state.profile.id);
+        var up = await sb.storage.from('ticket-photos').upload(path, file, {
+          contentType: file.type || 'application/octet-stream', upsert: false
+        });
+        if (up.error) throw up.error;
+        var ins = await sb.from('ticket_attachments').insert({
+          ticket_id: ticket.id, storage_path: path, file_name: file.name,
+          content_type: file.type || null, size_bytes: file.size || null,
+          uploaded_by: state.profile.id, kind: 'service_report',
+          meta: { signed: signed, signature: signed ? canvas.toDataURL('image/png') : null }
+        });
+        if (ins.error) throw ins.error;
+        toast(t('ticket.reportSaved'), 'ok');
+        close(); done();
+      } catch (e) { apiError(e); btn.disabled = false; }
+    };
+  }
+
+  /** v7.14: render this ticket's custom-field values (read-only list). */
+  function renderCustomFieldValues(ticket) {
+    var box = document.getElementById('cf-list');
+    if (!box) return;
+    var fields = fieldsForTracker(ticket.tracker);
+    if (!fields.length) {
+      box.innerHTML = '<div class="empty muted">—</div>';
+      return;
+    }
+    var values = ticket.custom_values || {};
+    box.innerHTML = '<dl class="kv">' + fields.filter(function (f) {
+      return L.fieldVisibleIn(f, ticket.status);
+    }).map(function (f) {
+      var v = values[f.key];
+      var label = lang === 'zh' ? (f.label_zh || f.label_en) : (f.label_en || f.label_zh);
+      var disp;
+      if (f.type === 'checkbox') disp = v ? '✓' : '—';
+      else if (f.type === 'checklist') disp = Array.isArray(v) ? esc(v.join(', ')) : '—';
+      else if (f.type === 'signature') disp = v ? '✓' : '—';
+      else disp = v == null || v === '' ? '—' : esc(String(v));
+      return '<dt>' + esc(label) + (f.required ? '<span class="req">*</span>' : '') + '</dt><dd>' + disp + '</dd>';
+    }).join('') + '</dl>';
+  }
+
+  /** v7.14: edit custom-field values (per tracker), validated by logic.js. */
+  function openCustomFieldsModal(ticket, done) {
+    var fields = fieldsForTracker(ticket.tracker).filter(function (f) {
+      return L.fieldVisibleIn(f, ticket.status);
+    });
+    var values = Object.assign({}, ticket.custom_values || {});
+    function fldHtml(f) {
+      var label = lang === 'zh' ? (f.label_zh || f.label_en) : (f.label_en || f.label_zh);
+      var v = values[f.key];
+      var opts = Array.isArray(f.options) ? f.options : [];
+      var inner;
+      switch (f.type) {
+        case 'textarea':
+          inner = '<textarea id="cf-' + f.key + '" style="height:70px">' + esc(v || '') + '</textarea>';
+          break;
+        case 'number':
+          inner = '<input type="number" step="any" id="cf-' + f.key + '" value="' + esc(v == null ? '' : v) + '">';
+          break;
+        case 'date':
+          inner = '<input type="date" id="cf-' + f.key + '" value="' + esc(v || '') + '">';
+          break;
+        case 'url':
+          inner = '<input type="url" id="cf-' + f.key + '" value="' + esc(v || '') + '">';
+          break;
+        case 'dropdown':
+          inner = '<select id="cf-' + f.key + '"><option value=""></option>' + opts.map(function (o) {
+            return '<option value="' + esc(o) + '"' + (String(v) === String(o) ? ' selected' : '') + '>' +
+              esc(o) + '</option>';
+          }).join('') + '</select>';
+          break;
+        case 'checkbox':
+          inner = '<input type="checkbox" id="cf-' + f.key + '"' + (v ? ' checked' : '') + '>';
+          break;
+        case 'checklist':
+          inner = opts.map(function (o) {
+            var on = Array.isArray(v) && v.indexOf(o) !== -1;
+            return '<label style="display:block;font-weight:normal"><input type="checkbox" class="cf-cl-' +
+              f.key + '" value="' + esc(o) + '"' + (on ? ' checked' : '') + '> ' + esc(o) + '</label>';
+          }).join('');
+          break;
+        case 'signature':
+          inner = '<input type="text" id="cf-' + f.key + '" placeholder="data:…" value="' +
+            esc(v ? '✓' : '') + '" disabled>';
+          break;
+        default:
+          inner = '<input type="text" id="cf-' + f.key + '" value="' + esc(v || '') + '">';
+      }
+      return '<div class="field"><label>' + esc(label) +
+        (f.required ? '<span class="req">*</span>' : '') + '</label>' + inner + '</div>';
+    }
+    var body = fields.map(fldHtml).join('');
+    var close = openModal(t('cf.title'), body,
+      '<button class="btn" id="m-cancel">' + esc(t('common.cancel')) + '</button>' +
+      '<button class="btn btn-primary" id="m-save">' + esc(t('common.save')) + '</button>');
+    document.getElementById('m-cancel').onclick = close;
+    document.getElementById('m-save').onclick = async function () {
+      var btn = this; btn.disabled = true;
+      try {
+        var out = Object.assign({}, values);
+        fields.forEach(function (f) {
+          if (f.type === 'checkbox') out[f.key] = document.getElementById('cf-' + f.key).checked;
+          else if (f.type === 'checklist') {
+            out[f.key] = Array.prototype.map.call(
+              document.querySelectorAll('.cf-cl-' + f.key + ':checked'),
+              function (el) { return el.value; });
+          } else if (f.type === 'signature') { /* unchanged here */ }
+          else out[f.key] = document.getElementById('cf-' + f.key).value;
+        });
+        var errs = L.validateCustomValues(fields, out);
+        if (errs.length) { toast(t('cf.invalid'), 'error'); btn.disabled = false; return; }
+        var r = await sb.from('tickets').update({ custom_values: out }).eq('id', ticket.id);
+        if (r.error) throw r.error;
+        close(); done();
+      } catch (e) { apiError(e); btn.disabled = false; }
+    };
+  }
+
+  /* v7.10: load child tickets (parent_ticket_id) + show their status. */
+  async function loadSubTickets(ticket) {
+    var box = document.getElementById('sub-list');
+    if (!box) return;
+    try {
+      var r = await sb.from('tickets').select('id,ticket_no,title,status,tracker,assigned_to')
+        .eq('parent_ticket_id', ticket.id).order('created_at');
+      if (r.error) throw r.error;
+      var rows = r.data || [];
+      if (!rows.length) {
+        box.innerHTML = '<div class="empty">—</div>';
+        return;
+      }
+      await resolveNames(rows.map(function (x) { return x.assigned_to; }));
+      box.innerHTML = rows.map(function (x) {
+        return '<div class="related-row">' +
+          '<a href="#/ticket/' + x.id + '" class="tnum">' + esc(L.formatTicketNo(x.ticket_no)) + '</a> ' +
+          trackerBadge(x.tracker) + ' ' +
+          '<span class="ttl">' + esc(x.title) + '</span> ' + statusBadge(x.status) +
+          (x.assigned_to ? ' <span class="muted">' + esc(displayName(x.assigned_to)) + '</span>' : '') +
+          '</div>';
+      }).join('');
+    } catch (e) {
+      box.innerHTML = '<div class="inline-err">' + esc(e.message || t('common.error')) + '</div>';
+    }
   }
 
   async function renderAssignBox(ticket, done) {
@@ -1907,7 +2285,7 @@
       if (!window.confirm(t('detail.unassignConfirm'))) return;
       try {
         // "assigned → open" is an allowed transition for dispatcher/admin.
-        var allowed = L.allowedTransitions(ticket.status, state.profile.role,
+        var allowed = ticketTransitions(ticket, state.profile.role,
           L.transitionCtx(ticket, state.profile));
         if (allowed.indexOf('open') === -1) { toast(t('common.noPermission'), 'error'); return; }
         var r = await sb.from('tickets').update({ assigned_to: null, status: 'open' }).eq('id', ticket.id);
@@ -2063,7 +2441,8 @@
      populated on click; @media print shows ONLY that div (sidebar/topbar/
      buttons/nav hidden). Includes public comments only — internal notes
      never go on the customer-facing report. */
-  async function printServiceReport(ticket, comments) {
+  async function printServiceReport(ticket, comments, attachments) {
+    attachments = attachments || [];
     var pr = document.getElementById('print-report');
     if (!pr) {
       pr = document.createElement('div');
@@ -2108,6 +2487,21 @@
     hist.sort(function (a, b) { return new Date(a.ts) - new Date(b.ts); });
     /* public comments only */
     var pubComments = (comments || []).filter(function (c) { return !c.is_internal; });
+    /* v7.12/7.14: photos for the report (signed URLs, images only) + custom fields. */
+    var imgRows = attachments.filter(function (a) {
+      return (a.content_type || '').indexOf('image/') === 0 && a.storage_path;
+    });
+    var imgUrls = [];
+    for (var ii = 0; ii < imgRows.slice(0, 12).length; ii++) {
+      try {
+        var sg = await sb.storage.from('ticket-photos').createSignedUrl(imgRows[ii].storage_path, 3600);
+        if (!sg.error && sg.data) imgUrls.push(sg.data.signedUrl);
+      } catch (e) {}
+    }
+    var cfFields = state.v7 ? (state.customFields || []).filter(function (f) {
+      return f.trackers && f.trackers.indexOf(ticket.tracker) !== -1 && f.is_active !== false;
+    }) : [];
+    var cfVals = ticket.custom_values || {};
     function row(k, v) {
       return '<tr><th style="width:200px">' + esc(k) + '</th><td>' + esc(v) + '</td></tr>';
     }
@@ -2145,6 +2539,21 @@
       '<table><tbody>' + hist.map(function (h) {
         return '<tr><td style="width:200px">' + esc(fmtDate(h.ts)) + '</td><td>' + esc(h.label) + '</td></tr>';
       }).join('') + '</tbody></table>' +
+      (cfFields.length
+        ? '<h2>' + esc(t('cf.title')) + '</h2><table><tbody>' +
+          cfFields.map(function (f) {
+            var label = lang === 'zh' ? (f.label_zh || f.label_en) : (f.label_en || f.label_zh);
+            var v = cfVals[f.key];
+            var disp = Array.isArray(v) ? v.join(', ') : (v == null || v === '' ? '—' : String(v));
+            return row(label, disp);
+          }).join('') + '</tbody></table>'
+        : '') +
+      (imgUrls.length
+        ? '<h2>' + esc(t('detail.photos')) + '</h2>' +
+          '<div>' + imgUrls.map(function (u) {
+            return '<img src="' + esc(u) + '" style="max-width:300px;max-height:220px;margin:4px;border:1px solid #ddd">';
+          }).join('') + '</div>'
+        : '') +
       '<h2>' + esc(t('detail.comments')) + '</h2>' +
       (pubComments.length
         ? pubComments.map(function (c) {
@@ -2567,6 +2976,14 @@
             return '<option value="' + s + '">' + esc(t('source.' + s)) + '</option>';
           }).join('') + '</select>' +
           (isCustomer ? '<div class="hint">' + esc(t('new.sourceHint.customer')) + '</div>' : '') + '</div>' +
+        /* v7.7: tracker selection (hidden until migration_v7). */
+        (state.v7
+          ? '<div class="field"><label>' + esc(t('new.tracker')) + '</label>' +
+            '<select id="nt-tracker">' + L.TRACKER_KEYS.map(function (k) {
+              return '<option value="' + k + '"' + (k === 'support' ? ' selected' : '') + '>' +
+                esc(t('tracker.' + k)) + '</option>';
+            }).join('') + '</select></div>'
+          : '') +
         '<div class="field"><label>' + esc(t('new.field.site')) + star('nt-site') + '</label>' +
           '<select id="nt-site"' + reqAttr('nt-site') + '><option value="">' + esc(t('common.none')) + '</option>' +
           state.sites.map(function (s) {
@@ -2607,6 +3024,17 @@
     /* v4: apply the planning workbench prefill (site). */
     if (newTicketPrefill && newTicketPrefill.siteId) {
       siteSel.value = newTicketPrefill.siteId;
+    }
+    /* v7.10: sub-ticket prefill (parent + tracker + title). */
+    if (newTicketPrefill && newTicketPrefill.parentTicketId) {
+      if (newTicketPrefill.tracker) {
+        var tsel = document.getElementById('nt-tracker');
+        if (tsel) tsel.value = newTicketPrefill.tracker;
+      }
+      if (newTicketPrefill.title) {
+        var tti = document.getElementById('nt-title');
+        if (tti && !tti.value) tti.value = newTicketPrefill.title;
+      }
     }
     function refreshContractState() {
       var c = state.contracts[siteSel.value];
@@ -2677,6 +3105,10 @@
           slaO = dl.onsite && dl.onsite.toISOString();
           slaS = dl.resolve && dl.resolve.toISOString();
         }
+        /* v7.7/7.8: tracker + workflow key (from site segment), parent for sub-tickets. */
+        var trackerEl = document.getElementById('nt-tracker');
+        var trackerVal = trackerEl ? trackerEl.value : 'support';
+        var siteRow = siteVal ? state.sites.filter(function (s) { return s.id === siteVal; })[0] : null;
         var insData = {
           title: get('nt-title'),
           description: get('nt-desc'),
@@ -2693,6 +3125,13 @@
           sla_onsite_at: slaO,
           sla_resolve_at: slaS
         };
+        if (state.v7) {
+          insData.tracker = trackerVal;
+          insData.workflow_key = (siteRow && siteRow.segment === 'utility') ? 'utility' : 'ci';
+          if (newTicketPrefill && newTicketPrefill.parentTicketId) {
+            insData.parent_ticket_id = newTicketPrefill.parentTicketId;
+          }
+        }
         if (state.v3) {
           var tagEl = document.getElementById('nt-tags');
           insData.tags = tagEl ? parseTags(tagEl.value) : [];
@@ -3199,7 +3638,7 @@
   async function viewContacts(view) {
     if (!state.v6) {
       view.innerHTML = '<div class="page"><div class="inline-err">' +
-        esc(t('common.setupNeeded') || 'migration_v6 required') + '</div></div>';
+        esc(t('common.migrationRequired').replace('{v}', 'v6')) + '</div></div>';
       return;
     }
     var q = (viewContacts._q || '').trim().toLowerCase();
@@ -3270,6 +3709,259 @@
         await loadReferenceData(); viewContacts(view);
       };
     });
+  }
+
+  /* v7.8: workflow management — states CRUD + transition matrix per
+     template (C&I / Utility). DB rows drive ticketTransitions() at runtime. */
+  async function viewWorkflow(view) {
+    if (!state.v7) {
+      view.innerHTML = '<div class="page"><div class="inline-err">migration_v7 required</div></div>';
+      return;
+    }
+    var wfKey = viewWorkflow._wf || 'ci';
+    var states = wfStateList(wfKey);
+    var map = wfTransitions(wfKey);
+    var tpl = L.WORKFLOW_TEMPLATES[wfKey];
+    var matHtml = states.map(function (fs) {
+      return '<tr><td><b>' + esc(wfStateName(fs.key)) + '</b><div class="muted" style="font-size:11px">' +
+        esc(fs.key) + '</div></td>' + states.map(function (ts) {
+        if (fs.key === ts.key) return '<td class="muted" style="text-align:center">—</td>';
+        var on = map[fs.key] && map[fs.key].indexOf(ts.key) !== -1;
+        return '<td style="text-align:center"><input type="checkbox" class="wf-edge" data-from="' +
+          esc(fs.key) + '" data-to="' + esc(ts.key) + '"' + (on ? ' checked' : '') + '></td>';
+      }).join('') + '</tr>';
+    }).join('');
+    view.innerHTML =
+      '<div class="page-head"><h1>' + esc(t('workflow.title')) + '</h1></div>' +
+      '<p class="muted">' + esc(t('workflow.sub')) + '</p>' +
+      '<div class="tabs">' + Object.keys(L.WORKFLOW_TEMPLATES).map(function (k) {
+        return '<button data-wf="' + k + '"' + (wfKey === k ? ' class="active"' : '') + '>' +
+          esc(t('workflow.template.' + k)) + '</button>';
+      }).join('') + '</div>' +
+      '<div class="card"><div class="page-head"><h2>' + esc(t('workflow.states')) + '</h2>' +
+        '<button class="btn btn-primary btn-sm" id="wf-state-new">+ ' + esc(t('workflow.newState')) + '</button></div>' +
+      '<div style="overflow-x:auto"><table class="tbl"><thead><tr>' +
+        '<th>' + esc(t('workflow.key')) + '</th><th>' + esc(t('workflow.labelEn')) + '</th>' +
+        '<th>' + esc(t('workflow.labelZh')) + '</th><th>' + esc(t('workflow.isTerminal')) + '</th>' +
+        '<th>' + esc(t('workflow.color')) + '</th><th>' + esc(t('common.actions')) + '</th>' +
+      '</tr></thead><tbody>' + states.map(function (s) {
+        return '<tr><td><b>' + esc(s.key) + '</b></td><td>' + esc(s.label_en || '—') + '</td>' +
+          '<td>' + esc(s.label_zh || '—') + '</td>' +
+          '<td>' + (s.is_terminal ? '✓' : '—') + '</td>' +
+          '<td><span class="badge" style="background:' + (s.color || '#eef1f4') + '22">&nbsp;</span> ' +
+            esc(s.color || '—') + '</td>' +
+          '<td><button class="btn btn-sm" data-wfedit="' + esc(s.key) + '">' + esc(t('common.edit')) + '</button> ' +
+          '<button class="btn btn-sm btn-danger" data-wfdel="' + esc(s.key) + '">' + esc(t('common.delete')) + '</button></td></tr>';
+      }).join('') + '</tbody></table></div></div>' +
+      '<div class="card"><h2>' + esc(t('workflow.matrix')) + '</h2>' +
+      '<div style="overflow-x:auto"><table class="tbl"><thead><tr><th>' + esc(t('workflow.fromTo')) + '</th>' +
+        states.map(function (s) { return '<th style="text-align:center">' + esc(s.key) + '</th>'; }).join('') +
+      '</tr></thead><tbody>' + matHtml + '</tbody></table></div>' +
+      '<div style="margin-top:10px"><button class="btn btn-primary" id="wf-save">' +
+        esc(t('workflow.saveMatrix')) + '</button></div></div>';
+    view.querySelectorAll('[data-wf]').forEach(function (b) {
+      b.onclick = function () { viewWorkflow._wf = b.getAttribute('data-wf'); viewWorkflow(view); };
+    });
+    document.getElementById('wf-state-new').onclick = function () {
+      openWfStateModal(wfKey, null, function () { loadReferenceData().then(function () { viewWorkflow(view); }); });
+    };
+    view.querySelectorAll('[data-wfedit]').forEach(function (b) {
+      b.onclick = function () {
+        var s = wfStateList(wfKey).filter(function (x) { return x.key === b.getAttribute('data-wfedit'); })[0];
+        openWfStateModal(wfKey, s, function () { loadReferenceData().then(function () { viewWorkflow(view); }); });
+      };
+    });
+    view.querySelectorAll('[data-wfdel]').forEach(function (b) {
+      b.onclick = async function () {
+        if (!window.confirm(t('workflow.confirmDeleteState'))) return;
+        var r = await sb.from('workflow_states').delete().eq('workflow_key', wfKey).eq('key', b.getAttribute('data-wfdel'));
+        if (r.error) { apiError(r.error); return; }
+        toast(t('workflow.stateDeleted'), 'ok');
+        await loadReferenceData(); viewWorkflow(view);
+      };
+    });
+    document.getElementById('wf-save').onclick = async function () {
+      var btn = this; btn.disabled = true;
+      try {
+        var edges = [];
+        view.querySelectorAll('.wf-edge:checked').forEach(function (el) {
+          edges.push({ workflow_key: wfKey, from_state: el.getAttribute('data-from'), to_state: el.getAttribute('data-to') });
+        });
+        var del = await sb.from('workflow_transitions').delete().eq('workflow_key', wfKey);
+        if (del.error) throw del.error;
+        if (edges.length) {
+          var ins = await sb.from('workflow_transitions').insert(edges);
+          if (ins.error) throw ins.error;
+        }
+        toast(t('workflow.matrixSaved'), 'ok');
+        await loadReferenceData(); viewWorkflow(view);
+      } catch (e) { apiError(e); btn.disabled = false; }
+    };
+  }
+
+  function openWfStateModal(wfKey, st, done) {
+    st = st || {};
+    function fld(id, label, val) {
+      return '<div class="field"><label>' + esc(label) + '</label>' +
+        '<input type="text" id="' + id + '" value="' + esc(val || '') + '"></div>';
+    }
+    var body = fld('wfs-key', t('workflow.key'), st.key) +
+      fld('wfs-len', t('workflow.labelEn'), st.label_en) +
+      fld('wfs-lzh', t('workflow.labelZh'), st.label_zh) +
+      '<div class="field"><label>' + esc(t('workflow.color')) + '</label>' +
+        '<input type="color" id="wfs-color" value="' + esc(st.color || '#64748b') + '"></div>' +
+      '<div class="field"><label style="font-weight:normal"><input type="checkbox" id="wfs-term"' +
+        (st.is_terminal ? ' checked' : '') + '> ' + esc(t('workflow.isTerminal')) + '</label></div>' +
+      '<div class="field"><label>' + esc(t('workflow.sortOrder')) + '</label>' +
+        '<input type="number" id="wfs-sort" value="' + esc(st.sort_order != null ? st.sort_order : 0) + '"></div>';
+    var close = openModal(t('workflow.newState'), body,
+      '<button class="btn" id="m-cancel">' + esc(t('common.cancel')) + '</button>' +
+      '<button class="btn btn-primary" id="m-save">' + esc(t('common.save')) + '</button>');
+    document.getElementById('m-cancel').onclick = close;
+    if (st.key) document.getElementById('wfs-key').disabled = true;
+    document.getElementById('m-save').onclick = async function () {
+      var btn = this; btn.disabled = true;
+      try {
+        var row = {
+          workflow_key: wfKey,
+          key: document.getElementById('wfs-key').value.trim(),
+          label_en: document.getElementById('wfs-len').value.trim() || null,
+          label_zh: document.getElementById('wfs-lzh').value.trim() || null,
+          color: document.getElementById('wfs-color').value || null,
+          is_terminal: document.getElementById('wfs-term').checked,
+          sort_order: Number(document.getElementById('wfs-sort').value) || 0
+        };
+        if (!row.key) { toast(t('new.fillRequired'), 'error'); btn.disabled = false; return; }
+        var r = st.key
+          ? await sb.from('workflow_states').update(row).eq('workflow_key', wfKey).eq('key', st.key)
+          : await sb.from('workflow_states').insert(row);
+        if (r.error) throw r.error;
+        toast(t('common.saved'), 'ok'); close(); done();
+      } catch (e) { apiError(e); btn.disabled = false; }
+    };
+  }
+
+  /* v7.14: custom-field management — 9 types, bound per tracker. */
+  async function viewCustomFields(view) {
+    if (!state.v7) {
+      view.innerHTML = '<div class="page"><div class="inline-err">migration_v7 required</div></div>';
+      return;
+    }
+    var trk = viewCustomFields._trk || 'support';
+    var list = state.customFields.filter(function (f) {
+      return f.trackers && f.trackers.indexOf(trk) !== -1;
+    }).sort(function (a, b) { return (a.sort_order || 0) - (b.sort_order || 0); });
+    var typeName = function (tp) { return t('cf.type.' + tp); };
+    view.innerHTML =
+      '<div class="page-head"><h1>' + esc(t('cf.title')) + '</h1>' +
+      '<button class="btn btn-primary" id="cf-new">+ ' + esc(t('cf.new')) + '</button></div>' +
+      '<p class="muted">' + esc(t('cf.sub')) + '</p>' +
+      '<div class="tabs">' + L.TRACKER_KEYS.map(function (k) {
+        return '<button data-trk="' + k + '"' + (trk === k ? ' class="active"' : '') + '>' +
+          esc(t('tracker.' + k)) + '</button>';
+      }).join('') + '</div>' +
+      '<div class="card"><div style="overflow-x:auto"><table class="tbl"><thead><tr>' +
+        '<th>' + esc(t('cf.key')) + '</th><th>' + esc(t('cf.labelEn')) + '</th>' +
+        '<th>' + esc(t('cf.type')) + '</th><th>' + esc(t('cf.required')) + '</th>' +
+        '<th>' + esc(t('cf.visibleStatuses')) + '</th><th>' + esc(t('common.active')) + '</th>' +
+        '<th>' + esc(t('common.actions')) + '</th>' +
+      '</tr></thead><tbody>' + (list.map(function (f) {
+        var label = lang === 'zh' ? (f.label_zh || f.label_en) : (f.label_en || f.label_zh);
+        return '<tr><td><b>' + esc(f.key) + '</b></td><td>' + esc(label) + '</td>' +
+          '<td>' + esc(typeName(f.type)) + '</td>' +
+          '<td>' + (f.required ? '✓' : '—') + '</td>' +
+          '<td class="muted">' + esc((f.show_in_states || []).join(', ') || '—') + '</td>' +
+          '<td>' + (f.is_active === false ? '—' : '✓') + '</td>' +
+          '<td><button class="btn btn-sm" data-cfedit="' + f.id + '">' + esc(t('common.edit')) + '</button> ' +
+          '<button class="btn btn-sm btn-danger" data-cfdel="' + f.id + '">' + esc(t('common.delete')) + '</button></td></tr>';
+      }).join('') || '<tr><td colspan="7"><div class="empty">—</div></td></tr>') +
+      '</tbody></table></div></div>';
+    view.querySelectorAll('[data-trk]').forEach(function (b) {
+      b.onclick = function () { viewCustomFields._trk = b.getAttribute('data-trk'); viewCustomFields(view); };
+    });
+    document.getElementById('cf-new').onclick = function () {
+      openCustomFieldModal(trk, null, function () { loadReferenceData().then(function () { viewCustomFields(view); }); });
+    };
+    view.querySelectorAll('[data-cfedit]').forEach(function (b) {
+      b.onclick = function () {
+        var f = state.customFields.filter(function (x) { return x.id === b.getAttribute('data-cfedit'); })[0];
+        openCustomFieldModal(trk, f, function () { loadReferenceData().then(function () { viewCustomFields(view); }); });
+      };
+    });
+    view.querySelectorAll('[data-cfdel]').forEach(function (b) {
+      b.onclick = async function () {
+        if (!window.confirm(t('cf.confirmDelete'))) return;
+        var r = await sb.from('custom_fields').delete().eq('id', b.getAttribute('data-cfdel'));
+        if (r.error) { apiError(r.error); return; }
+        toast(t('cf.deleted'), 'ok');
+        await loadReferenceData(); viewCustomFields(view);
+      };
+    });
+  }
+
+  function openCustomFieldModal(trk, field, done) {
+    field = field || {};
+    var trks = field.trackers && field.trackers.length ? field.trackers : [trk];
+    var body =
+      '<div class="field"><label>' + esc(t('cf.key')) + '</label>' +
+        '<input type="text" id="cfi-key" value="' + esc(field.key || '') + '" placeholder="x_longi_field"' +
+        (field.key ? ' disabled' : '') + '></div>' +
+      '<div class="field"><label>' + esc(t('cf.type')) + '</label>' +
+        '<select id="cfi-type">' + L.CF_TYPES.map(function (tp) {
+          return '<option value="' + tp + '"' + (field.type === tp ? ' selected' : '') + '>' +
+            esc(t('cf.type.' + tp)) + '</option>';
+        }).join('') + '</select></div>' +
+      '<div class="field"><label>' + esc(t('cf.labelEn')) + '</label>' +
+        '<input type="text" id="cfi-len" value="' + esc(field.label_en || '') + '"></div>' +
+      '<div class="field"><label>' + esc(t('cf.labelZh')) + '</label>' +
+        '<input type="text" id="cfi-lzh" value="' + esc(field.label_zh || '') + '"></div>' +
+      '<div class="field"><label>' + esc(t('cf.options')) + '</label>' +
+        '<input type="text" id="cfi-opts" value="' +
+        esc(Array.isArray(field.options) ? field.options.join(', ') : '') + '"></div>' +
+      '<div class="field"><label>' + esc(t('cf.trackers')) + '</label>' +
+        L.TRACKER_KEYS.map(function (k) {
+          return '<label style="display:block;font-weight:normal"><input type="checkbox" class="cfi-trk" value="' +
+            k + '"' + (trks.indexOf(k) !== -1 ? ' checked' : '') + '> ' + esc(t('tracker.' + k)) + '</label>';
+        }).join('') + '</div>' +
+      '<div class="field"><label>' + esc(t('cf.visibleStatuses')) + '</label>' +
+        '<input type="text" id="cfi-states" value="' + esc((field.show_in_states || []).join(', ')) + '"></div>' +
+      '<div class="field"><label style="font-weight:normal"><input type="checkbox" id="cfi-req"' +
+        (field.required ? ' checked' : '') + '> ' + esc(t('cf.required')) + '</label> ' +
+        '<label style="font-weight:normal"><input type="checkbox" id="cfi-active"' +
+        (field.is_active !== false ? ' checked' : '') + '> ' + esc(t('common.active')) + '</label></div>';
+    var close = openModal(t('cf.new'), body,
+      '<button class="btn" id="m-cancel">' + esc(t('common.cancel')) + '</button>' +
+      '<button class="btn btn-primary" id="m-save">' + esc(t('common.save')) + '</button>');
+    document.getElementById('m-cancel').onclick = close;
+    document.getElementById('m-save').onclick = async function () {
+      var btn = this; btn.disabled = true;
+      try {
+        var selTrks = Array.prototype.map.call(document.querySelectorAll('.cfi-trk:checked'),
+          function (el) { return el.value; });
+        var row = {
+          type: document.getElementById('cfi-type').value,
+          label_en: document.getElementById('cfi-len').value.trim() || null,
+          label_zh: document.getElementById('cfi-lzh').value.trim() || null,
+          options: document.getElementById('cfi-opts').value.split(',')
+            .map(function (s) { return s.trim(); }).filter(Boolean),
+          trackers: selTrks.length ? selTrks : ['support'],
+          show_in_states: document.getElementById('cfi-states').value.split(',')
+            .map(function (s) { return s.trim(); }).filter(Boolean),
+          required: document.getElementById('cfi-req').checked,
+          is_active: document.getElementById('cfi-active').checked
+        };
+        var errs = L.validateCustomFieldDef(Object.assign({ key: field.key || 'tmp' }, row));
+        if (errs.length) { toast(errs[0].code, 'error'); btn.disabled = false; return; }
+        if (field.key) row.key = field.key;
+        else row.key = document.getElementById('cfi-key').value.trim();
+        if (!row.key) { toast(t('new.fillRequired'), 'error'); btn.disabled = false; return; }
+        var r = field.id
+          ? await sb.from('custom_fields').update(row).eq('id', field.id)
+          : await sb.from('custom_fields').insert(row);
+        if (r.error) throw r.error;
+        toast(t('common.saved'), 'ok'); close(); done();
+      } catch (e) { apiError(e); btn.disabled = false; }
+    };
   }
 
   function openContactModal(contact, done) {
@@ -4585,7 +5277,51 @@
         .eq('site_id', id).not('status', 'in', '(resolved,closed)');
       if (!cc.error) openCount = cc.count || 0;
     } catch (e) {}
+    /* v7.12: yearly planned-maintenance plan for this site — 12 tickets
+       (tracker=maintenance, planned_date per month) + progress + print. */
+    var maintYear = (new Date()).getFullYear();
+    var maintTickets = [];
+    async function loadMaintTickets() {
+      if (!state.v7) return;
+      try {
+        var r = await baseTicketQuery('id,ticket_no,title,status,planned_date')
+          .eq('site_id', id).eq('tracker', 'maintenance')
+          .gte('planned_date', maintYear + '-01-01').lt('planned_date', (maintYear + 1) + '-01-01')
+          .order('planned_date');
+        if (!r.error) maintTickets = r.data || [];
+      } catch (e) {}
+    }
+    function maintCard() {
+      if (!state.v7) return '';
+      var plan = L.monthlyPlanDates(maintYear);
+      var prog = L.maintenanceProgress(maintTickets, maintYear);
+      var rows = plan.map(function (md, i) {
+        var tk = maintTickets.filter(function (x) {
+          return x.planned_date && x.planned_date.indexOf(md) === 0;
+        })[0];
+        return '<tr><td>' + esc(md) + '</td><td>' +
+          (tk
+            ? '<a href="#/ticket/' + tk.id + '" class="tnum">' + esc(L.formatTicketNo(tk.ticket_no)) + '</a> ' +
+              statusBadge(tk.status)
+            : '<span class="muted">—</span>') +
+          '</td></tr>';
+      }).join('');
+      var pct = Math.round(100 * prog.done / 12);
+      return '<div class="card"><h2>' + esc(t('maint.planTitle')) + ' (' + maintYear + ')</h2>' +
+        '<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px"><div class="loadbar" style="flex:1">' +
+          '<div style="width:' + pct + '%"></div></div><b>' + prog.done + '/12</b></div>' +
+        '<div style="overflow-x:auto;max-height:280px;overflow-y:auto"><table class="tbl"><thead><tr>' +
+          '<th>' + esc(t('maint.month')) + '</th><th>' + esc(t('list.columns.ticket')) + '</th>' +
+        '</tr></thead><tbody>' + rows + '</tbody></table></div>' +
+        (L.can('ticket.create', state.profile.role)
+          ? '<div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">' +
+            '<button class="btn btn-sm btn-primary" id="maint-gen">' + esc(t('maint.generate')) + '</button>' +
+            '<button class="btn btn-sm" id="maint-print">' + esc(t('maint.printYear')) + '</button></div>'
+          : '') +
+      '</div>';
+    }
     await resolveNames([site.remote_owner_id].concat(collectIds(tickets)));
+    if (state.v7) await loadMaintTickets();
 
     var ident =
       '<div class="card"><h2>' + esc(t('sites.identity')) + '</h2><dl class="kv">' +
@@ -4710,9 +5446,66 @@
         contractBadgeFor(contract) +
         '<span class="badge status-open">' + openCount + ' ' + esc(t('sites.openTickets')) + '</span></div>' +
       '<h1 class="detail-title">' + esc(site.name) + '</h1>' +
-      '<div class="grid-2"><div>' + ident + ccard + '</div><div>' + whcard + tcard + chcard + '</div></div>';
+      '<div class="grid-2"><div>' + ident + ccard + '</div><div>' + whcard + tcard + maintCard() + chcard + '</div></div>';
     document.getElementById('back-btn').onclick = function () { nav('#/sites'); };
     bindTableNav(view);
+    /* v7.12: generate the yearly plan (12 maintenance tickets) + print. */
+    var mgBtn = document.getElementById('maint-gen');
+    if (mgBtn) mgBtn.onclick = async function () {
+      mgBtn.disabled = true;
+      try {
+        var plan = L.monthlyPlanDates(maintYear);
+        var existing = {};
+        maintTickets.forEach(function (x) {
+          if (x.planned_date) existing[x.planned_date.slice(0, 10)] = true;
+        });
+        var clField = (state.customFields || []).filter(function (f) {
+          return f.key === 'maint_checklist';
+        })[0];
+        var cv = clField ? { maint_checklist: [] } : {};
+        var created = 0;
+        for (var mi = 0; mi < plan.length; mi++) {
+          if (existing[plan[mi]]) continue;
+          /* Planned (scheduled) tickets carry no reactive SLA clocks. */
+          var c9 = (state.contracts || {})[site.id];
+          var ins = await sb.from('tickets').insert({
+            title: t('tracker.maintenance') + ' — ' + site.code + ' ' + plan[mi].slice(0, 7),
+            description: '', status: 'open', priority: 'medium', source: 'internal',
+            tracker: 'maintenance', workflow_key: site.segment === 'utility' ? 'utility' : 'ci',
+            site_id: site.id, planned_date: plan[mi], custom_values: cv,
+            created_by: state.profile.id, is_ltsa: !!(c9 && L.isContractActive(c9))
+          });
+          if (ins.error) throw ins.error;
+          created++;
+        }
+        toast(t('maint.generatedCount').replace('{n}', String(created)), 'ok');
+        render();
+      } catch (e) { apiError(e); mgBtn.disabled = false; }
+    };
+    var mpBtn = document.getElementById('maint-print');
+    if (mpBtn) mpBtn.onclick = function () {
+      var pr = document.getElementById('print-report');
+      if (!pr) {
+        pr = document.createElement('div'); pr.id = 'print-report';
+        document.body.appendChild(pr);
+      }
+      var plan = L.monthlyPlanDates(maintYear);
+      var prog = L.maintenanceProgress(maintTickets, maintYear);
+      pr.innerHTML = '<h1>' + esc(t('maint.planTitle')) + ' — ' +
+        esc(site.code + ' ' + site.name) + ' (' + maintYear + ')</h1>' +
+        '<div class="pr-meta">' + esc(t('maint.progress')) + ': ' + prog.done + '/12</div>' +
+        '<table><thead><tr><th>' + esc(t('maint.month')) + '</th><th>' +
+          esc(t('list.columns.ticket')) + '</th><th>' + esc(t('common.status')) + '</th></tr></thead><tbody>' +
+        plan.map(function (md) {
+          var tk = maintTickets.filter(function (x) {
+            return x.planned_date && x.planned_date.indexOf(md) === 0;
+          })[0];
+          return '<tr><td>' + esc(md) + '</td><td>' +
+            esc(tk ? L.formatTicketNo(tk.ticket_no) : '—') + '</td><td>' +
+            esc(tk ? t('status.' + tk.status) : '—') + '</td></tr>';
+        }).join('') + '</tbody></table>';
+      window.print();
+    };
     view.querySelectorAll('[data-child]').forEach(function (el) {
       el.onclick = function () { nav('#/site/' + el.getAttribute('data-child')); };
     });

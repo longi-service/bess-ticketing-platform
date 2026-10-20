@@ -240,6 +240,8 @@ table.tbl { width: 100%; border-collapse: collapse; background: var(--surface); 
 .badge.status-pending     { background: var(--warn-tint); color: var(--warn); }
 .badge.status-resolved    { background: var(--ok-tint); color: var(--ok); }
 .badge.status-closed      { background: #eef1f4; color: var(--text-muted); }
+/* v7.8: utility workflow HQ approval state (TechCRM violet). */
+.badge.status-hq_approval { background: #ede9fe; color: #6d28d9; }
 .badge.pri-low    { background: #eef1f4; color: #4b5563; }
 .badge.pri-medium { background: #e8eefb; color: #2b4acb; }
 .badge.pri-high   { background: var(--warn-tint); color: var(--warn); }
