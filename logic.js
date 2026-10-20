@@ -63,7 +63,11 @@
     'part.manage':           ['admin', 'dispatcher'],                   // catalog/warehouse CRUD
     'plan.view':             ['admin', 'dispatcher', 'pm', 'engineer'],  // v5: planning/calendar read (customers excluded — isolation audit)
     'plan.manage':           ['admin', 'dispatcher'],                   // shift write
-    'contract.manage':       ['admin', 'dispatcher']                    // LTSA contract CRUD
+    'contract.manage':       ['admin', 'dispatcher'],                   // LTSA contract CRUD
+    /* v6/v7 additions */
+    'contact.manage':        ['admin', 'dispatcher', 'pm'],             // contacts master data
+    'workflow.manage':       ['admin'],                                // workflow states/transitions
+    'field.manage':          ['admin', 'dispatcher']                    // custom fields
   };
 
   /**
@@ -594,6 +598,292 @@
   }
 
   /* ------------------------------------------------------------------ */
+  /* v6 — master data helpers                                          */
+  /* ------------------------------------------------------------------ */
+
+  /**
+   * stockStatus(qty, minQty) → 'ok' | 'low' | 'critical'.
+   * Mirrors TechCRM renderWarehouse: OK when qty >= min; low when qty is at
+   * least half of min but below min; critical otherwise. Null min → 'ok'.
+   */
+  function stockStatus(qty, minQty) {
+    var q = Number(qty), m = minQty == null || minQty === '' ? null : Number(minQty);
+    if (isNaN(q)) q = 0;
+    if (m == null || isNaN(m) || m <= 0) return 'ok';
+    if (q >= m) return 'ok';
+    if (q >= Math.floor(m * 0.5)) return 'low';
+    return 'critical';
+  }
+
+  /**
+   * buildSiteTree(sites) → nested [{...site, children: [...]}] roots-first.
+   * Pure helper for the project hierarchy (EU Service → country → site).
+   * Guards against self-parenting and missing parents.
+   */
+  function buildSiteTree(sites) {
+    var byId = {}, roots = [];
+    (sites || []).forEach(function (s) {
+      byId[s.id] = s;
+      s.children = [];
+    });
+    (sites || []).forEach(function (s) {
+      var p = s.parent_site_id;
+      if (p && byId[p] && p !== s.id) byId[p].children.push(s);
+      else roots.push(s);
+    });
+    function sortDeep(list) {
+      list.sort(function (a, b) {
+        return String(a.code || '').localeCompare(String(b.code || ''));
+      });
+      list.forEach(function (s) { sortDeep(s.children); });
+    }
+    sortDeep(roots);
+    return roots;
+  }
+
+  /**
+   * validateContact(c) → array of error keys (empty = valid).
+   * Contacts are external people, independent of auth profiles.
+   */
+  function validateContact(c) {
+    var errs = [];
+    c = c || {};
+    if (!String(c.first_name || '').trim()) errs.push('contact.firstName');
+    if (c.email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(c.email).trim())) errs.push('contact.email');
+    return errs;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* v7 — trackers, configurable workflow, custom fields                 */
+  /* ------------------------------------------------------------------ */
+
+  /**
+   * TRACKERS — the four ticket trackers (TechCRM § Tipi di ticket).
+   * prefix mirrors Massimo's prototype (SUP/MAN/RIC/QLT).
+   */
+  var TRACKERS = {
+    support:     { key: 'support',     prefix: 'SUP', color: '#4f8ef7' },
+    maintenance: { key: 'maintenance', prefix: 'MAN', color: '#22c55e' },
+    spare:       { key: 'spare',       prefix: 'RIC', color: '#f59e0b' },
+    quality:     { key: 'quality',     prefix: 'QLT', color: '#8b5cf6' }
+  };
+  var TRACKER_KEYS = ['support', 'maintenance', 'spare', 'quality'];
+
+  /**
+   * WORKFLOW_TEMPLATES — built-in C&I / Utility templates.
+   * Mirrors migration_v7.sql seeds; used as fallback when the
+   * workflow_states / workflow_transitions tables cannot be read.
+   */
+  var WORKFLOW_TEMPLATES = {
+    ci: {
+      states: [
+        { key: 'open',             kind: 'start'  },
+        { key: 'assigned',         kind: 'normal' },
+        { key: 'in_progress',      kind: 'normal' },
+        { key: 'pending',          kind: 'normal' },
+        { key: 'pending_customer', kind: 'normal' },
+        { key: 'resolved',         kind: 'normal' },
+        { key: 'closed',           kind: 'end'    }
+      ],
+      transitions: {
+        open:             ['assigned', 'closed'],
+        assigned:         ['in_progress', 'open'],
+        in_progress:      ['resolved', 'assigned'],
+        pending:          ['in_progress', 'assigned'],
+        resolved:         ['pending_customer', 'in_progress', 'closed'],
+        pending_customer: ['closed', 'in_progress'],
+        closed:           ['open']
+      }
+    },
+    utility: {
+      states: [
+        { key: 'open',             kind: 'start'  },
+        { key: 'assigned',         kind: 'normal' },
+        { key: 'in_progress',      kind: 'normal' },
+        { key: 'hq_approval',      kind: 'normal' },
+        { key: 'pending',          kind: 'normal' },
+        { key: 'pending_customer', kind: 'normal' },
+        { key: 'resolved',         kind: 'normal' },
+        { key: 'closed',           kind: 'end'    }
+      ],
+      transitions: {
+        open:             ['assigned', 'closed'],
+        assigned:         ['in_progress', 'open'],
+        in_progress:      ['resolved', 'assigned', 'hq_approval'],
+        hq_approval:      ['in_progress', 'resolved'],
+        pending:          ['in_progress', 'assigned'],
+        resolved:         ['pending_customer', 'in_progress', 'closed'],
+        pending_customer: ['closed', 'in_progress'],
+        closed:           ['open']
+      }
+    }
+  };
+
+  /**
+   * buildTransitions(rows) → { fromKey: [toKey, ...] } from
+   * workflow_transitions rows ({workflow_key, from_key, to_key}).
+   */
+  function buildTransitions(rows) {
+    var map = {};
+    (rows || []).forEach(function (r) {
+      if (!r || !r.from_key || !r.to_key) return;
+      if (!map[r.from_key]) map[r.from_key] = [];
+      if (map[r.from_key].indexOf(r.to_key) === -1) map[r.from_key].push(r.to_key);
+    });
+    return map;
+  }
+
+  /**
+   * transitionRuleAllowed(status, to, role, ctx) — the role rule for one
+   * status→target pair. Extracted from allowedTransitions so DB-driven
+   * workflows reuse the identical role gating.
+   */
+  function transitionRuleAllowed(status, to, role, ctx) {
+    ctx = ctx || {};
+    var isAssignee = !!ctx.isAssignee;
+    var isCreator = !!ctx.isCreator;
+    var inScope = !!ctx.inScope;
+    switch (status + '->' + to) {
+      case 'open->assigned':        return role === 'admin' || role === 'dispatcher';
+      case 'open->closed':          return role === 'admin' || role === 'dispatcher';
+      case 'assigned->in_progress': return role === 'admin' || role === 'dispatcher' ||
+                                           (role === 'engineer' && isAssignee);
+      case 'assigned->open':        return role === 'admin' || role === 'dispatcher';
+      case 'in_progress->resolved': return role === 'admin' || role === 'dispatcher' ||
+                                           (role === 'engineer' && isAssignee);
+      case 'in_progress->assigned': return role === 'admin' || role === 'dispatcher';
+      case 'in_progress->hq_approval': return role === 'admin' || role === 'dispatcher' ||
+                                           (role === 'engineer' && isAssignee);
+      case 'hq_approval->in_progress': return role === 'admin' || role === 'dispatcher';
+      case 'hq_approval->resolved':  return role === 'admin' || role === 'dispatcher';
+      case 'resolved->pending_customer': return role === 'admin' || role === 'dispatcher' ||
+                                           (role === 'engineer' && isAssignee);
+      case 'resolved->in_progress': return role === 'admin' || role === 'dispatcher';
+      case 'resolved->closed': return (role === 'admin' || role === 'dispatcher' ||
+                                         (role === 'pm' && inScope)) &&
+                                         (ctx.source || 'customer_feedback') !== 'customer_feedback';
+      case 'pending_customer->closed': return role === 'admin' || role === 'dispatcher' ||
+                                         (role === 'pm' && inScope) ||
+                                         (role === 'customer' && isCreator);
+      case 'pending_customer->in_progress': return role === 'admin' || role === 'dispatcher' ||
+                                         (role === 'engineer' && isAssignee);
+      case 'closed->open': return role === 'admin' || role === 'dispatcher' || role === 'pm';
+      default: return false;
+    }
+  }
+
+  /**
+   * allowedTransitionsWf(transMap, status, role, ctx) — allowedTransitions
+   * against a DB-driven transition map (v7 configurable workflow).
+   */
+  function allowedTransitionsWf(transMap, status, role, ctx) {
+    var targets = (transMap && transMap[status]) || [];
+    return targets.filter(function (to) {
+      return transitionRuleAllowed(status, to, role, ctx);
+    });
+  }
+
+  /* Custom field types (TechCRM § Campi personalizzati) */
+  var CF_TYPES = ['text', 'number', 'date', 'url', 'dropdown', 'checkbox',
+                  'checklist', 'signature', 'textarea'];
+
+  /**
+   * fieldVisibleIn(field, status) — simplified field/status permission:
+   * empty visible_statuses → visible in every status.
+   */
+  function fieldVisibleIn(field, status) {
+    if (!field) return false;
+    var vs = field.visible_statuses || [];
+    if (!vs.length) return true;
+    return vs.indexOf(status) !== -1;
+  }
+
+  /**
+   * validateCustomValues(fields, values) → array of error strings
+   * ("<key>:required" / "<key>:invalid"). Pure; UI maps to i18n.
+   */
+  function validateCustomValues(fields, values) {
+    var errs = [];
+    values = values || {};
+    (fields || []).forEach(function (f) {
+      if (!f || f.is_active === false) return;
+      var v = values[f.key];
+      var empty = v === undefined || v === null || v === '' ||
+                  (Array.isArray(v) && v.length === 0);
+      if (f.required && empty) { errs.push(f.key + ':required'); return; }
+      if (empty) return;
+      switch (f.type) {
+        case 'number':
+          if (isNaN(Number(v))) errs.push(f.key + ':invalid');
+          break;
+        case 'date':
+          if (isNaN(new Date(v).getTime())) errs.push(f.key + ':invalid');
+          break;
+        case 'url':
+          if (!/^https?:\/\//i.test(String(v))) errs.push(f.key + ':invalid');
+          break;
+        case 'dropdown': {
+          var opts = (f.options || []).map(function (o) { return String(o); });
+          if (opts.length && opts.indexOf(String(v)) === -1) errs.push(f.key + ':invalid');
+          break;
+        }
+        case 'checklist':
+          if (!Array.isArray(v)) errs.push(f.key + ':invalid');
+          break;
+        default: break;
+      }
+    });
+    return errs;
+  }
+
+  /**
+   * canCloseTicket(ticket, attachments) → { ok, reason }.
+   * v7.11: closing requires an uploaded service report (kind
+   * 'service_report'); the report should carry a customer signature
+   * (meta.signed or a signature custom value).
+   */
+  function canCloseTicket(ticket, attachments, customValues) {
+    var reports = (attachments || []).filter(function (a) {
+      return a && a.kind === 'service_report';
+    });
+    if (!reports.length) return { ok: false, reason: 'service_report_missing' };
+    var signed = reports.some(function (a) { return a.meta && a.meta.signed; }) ||
+      !!(customValues && customValues.svc_signature);
+    if (!signed) return { ok: false, reason: 'signature_missing' };
+    return { ok: true, reason: null };
+  }
+
+  /**
+   * monthlyPlanDates(year) → 12 ISO date strings (1st of each month).
+   * v7.12: one planned-maintenance ticket per month per project.
+   */
+  function monthlyPlanDates(year) {
+    var y = Number(year);
+    if (!y || y < 2000 || y > 2100) return [];
+    var out = [];
+    for (var m = 0; m < 12; m++) {
+      out.push(y + '-' + String(m + 1).padStart(2, '0') + '-01');
+    }
+    return out;
+  }
+
+  /**
+   * maintenanceProgress(tickets) → { total, done, pct } where done counts
+   * terminal statuses (resolved/closed).
+   */
+  function maintenanceProgress(tickets) {
+    var total = (tickets || []).length, done = 0;
+    (tickets || []).forEach(function (t) {
+      if (TERMINAL_STATUSES.indexOf(t.status) !== -1) done++;
+    });
+    return { total: total, done: done, pct: total ? Math.round(done / total * 100) : 0 };
+  }
+
+  /**
+   * validateContact — (also listed here for discoverability; defined above)
+   */
+
+  /* ------------------------------------------------------------------ */
   return {
     ROLES: ROLES,
     STATUSES: STATUSES,
@@ -633,6 +923,21 @@
     requiredNewTicketFields: requiredNewTicketFields,
     checkMediaLimits: checkMediaLimits,
     computeTargetSize: computeTargetSize,
+    stockStatus: stockStatus,
+    buildSiteTree: buildSiteTree,
+    validateContact: validateContact,
+    TRACKERS: TRACKERS,
+    TRACKER_KEYS: TRACKER_KEYS,
+    WORKFLOW_TEMPLATES: WORKFLOW_TEMPLATES,
+    buildTransitions: buildTransitions,
+    transitionRuleAllowed: transitionRuleAllowed,
+    allowedTransitionsWf: allowedTransitionsWf,
+    CF_TYPES: CF_TYPES,
+    fieldVisibleIn: fieldVisibleIn,
+    validateCustomValues: validateCustomValues,
+    canCloseTicket: canCloseTicket,
+    monthlyPlanDates: monthlyPlanDates,
+    maintenanceProgress: maintenanceProgress,
     MAX_VIDEO_BYTES: MAX_VIDEO_BYTES,
     MAX_VIDEOS_PER_TICKET: MAX_VIDEOS_PER_TICKET,
     MAX_FILES_PER_TICKET: MAX_FILES_PER_TICKET,

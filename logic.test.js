@@ -509,5 +509,103 @@ eq('dayState Date object works', L.dayState(null, new Date(2026, 9, 10)), 'weeke
 })();
 
 /* ------------------------------------------------------------------ */
+/* 8. v6/v7 — stockStatus, buildSiteTree, validateContact, trackers,     */
+/*    workflow-from-DB, custom fields, close-gate, monthly plans         */
+/* ------------------------------------------------------------------ */
+(function v6v7() {
+  // stockStatus (TechCRM thresholds)
+  eq('stockStatus ok', L.stockStatus(10, 5), 'ok');
+  eq('stockStatus ok at min', L.stockStatus(5, 5), 'ok');
+  eq('stockStatus low', L.stockStatus(3, 5), 'low');
+  eq('stockStatus critical', L.stockStatus(1, 5), 'critical');
+  eq('stockStatus zero', L.stockStatus(0, 5), 'critical');
+  eq('stockStatus no min', L.stockStatus(0, null), 'ok');
+  eq('stockStatus min 0', L.stockStatus(0, 0), 'ok');
+
+  // buildSiteTree
+  const sites = [
+    { id: 's1', code: 'EU', parent_site_id: null },
+    { id: 's2', code: 'IT', parent_site_id: 's1' },
+    { id: 's3', code: 'MDC', parent_site_id: 's2' },
+    { id: 's4', code: 'ORPH', parent_site_id: 'nope' },
+    { id: 's5', code: 'SELF', parent_site_id: 's5' }
+  ];
+  const tree = L.buildSiteTree(sites);
+  eq('buildSiteTree roots', tree.map(s => s.code), ['EU', 'ORPH', 'SELF']);
+  eq('buildSiteTree nested', tree[0].children[0].children[0].code, 'MDC');
+
+  // validateContact
+  eq('validateContact ok', L.validateContact({ first_name: 'Mario', email: 'm@x.it' }), []);
+  ok('validateContact missing name', L.validateContact({ email: 'm@x.it' }).length === 1);
+  ok('validateContact bad email', L.validateContact({ first_name: 'A', email: 'nope' }).length === 1);
+
+  // TRACKERS
+  eq('TRACKER_KEYS', L.TRACKER_KEYS, ['support', 'maintenance', 'spare', 'quality']);
+  ok('TRACKERS prefixes', L.TRACKERS.support.prefix === 'SUP' && L.TRACKERS.maintenance.prefix === 'MAN');
+
+  // WORKFLOW_TEMPLATES + buildTransitions
+  ok('ci template has no hq_approval',
+    !L.WORKFLOW_TEMPLATES.ci.states.some(s => s.key === 'hq_approval'));
+  ok('utility template has hq_approval',
+    L.WORKFLOW_TEMPLATES.utility.states.some(s => s.key === 'hq_approval'));
+  const rows = [
+    { workflow_key: 'ci', from_key: 'open', to_key: 'assigned' },
+    { workflow_key: 'ci', from_key: 'open', to_key: 'closed' }
+  ];
+  eq('buildTransitions', L.buildTransitions(rows), { open: ['assigned', 'closed'] });
+
+  // transitionRuleAllowed mirrors old allowedTransitions behavior
+  const ctx = { isAssignee: true, source: 'internal_discovery' };
+  eq('rule open->assigned dispatcher', L.transitionRuleAllowed('open', 'assigned', 'dispatcher', {}), true);
+  eq('rule open->assigned engineer', L.transitionRuleAllowed('open', 'assigned', 'engineer', {}), false);
+  eq('rule in_progress->hq_approval engineer assignee',
+    L.transitionRuleAllowed('in_progress', 'hq_approval', 'engineer', ctx), true);
+  // parity: every legacy TRANSITIONS edge passes the same rule
+  const legacy = { open: ['assigned', 'closed'], assigned: ['in_progress', 'open'],
+    in_progress: ['resolved', 'assigned'], resolved: ['pending_customer', 'in_progress', 'closed'],
+    pending_customer: ['closed', 'in_progress'], closed: ['open'] };
+  let parityOk = true;
+  ['admin', 'dispatcher', 'pm', 'engineer', 'customer'].forEach(role => {
+    Object.keys(legacy).forEach(st => {
+      const a = L.allowedTransitions(st, role, ctx).sort();
+      const b = L.allowedTransitionsWf(legacy, st, role, ctx).sort();
+      if (JSON.stringify(a) !== JSON.stringify(b)) parityOk = false;
+    });
+  });
+  ok('allowedTransitionsWf parity with legacy', parityOk);
+
+  // custom fields
+  const fields = [
+    { key: 'f1', type: 'text', required: true, is_active: true },
+    { key: 'f2', type: 'number', required: false, is_active: true },
+    { key: 'f3', type: 'dropdown', options: ['a', 'b'], is_active: true },
+    { key: 'f4', type: 'checklist', is_active: true },
+    { key: 'f5', type: 'text', is_active: false }
+  ];
+  eq('validateCustomValues required', L.validateCustomValues(fields, {}), ['f1:required']);
+  eq('validateCustomValues ok', L.validateCustomValues(fields, { f1: 'x', f2: '3', f3: 'a', f4: ['x'] }), []);
+  eq('validateCustomValues invalid', L.validateCustomValues(fields, { f1: 'x', f2: 'NaN!', f3: 'z', f4: 'no' }),
+    ['f2:invalid', 'f3:invalid', 'f4:invalid']);
+  ok('fieldVisibleIn empty=all', L.fieldVisibleIn({ visible_statuses: [] }, 'open'));
+  ok('fieldVisibleIn restricted', L.fieldVisibleIn({ visible_statuses: ['open'] }, 'open')
+    && !L.fieldVisibleIn({ visible_statuses: ['open'] }, 'closed'));
+
+  // canCloseTicket
+  eq('canCloseTicket no report', L.canCloseTicket({}, [], {}).reason, 'service_report_missing');
+  eq('canCloseTicket unsigned', L.canCloseTicket({}, [{ kind: 'service_report', meta: {} }], {}).reason, 'signature_missing');
+  eq('canCloseTicket signed meta', L.canCloseTicket({}, [{ kind: 'service_report', meta: { signed: true } }], {}).ok, true);
+  eq('canCloseTicket signed cf', L.canCloseTicket({}, [{ kind: 'service_report', meta: {} }], { svc_signature: 'data:,' }).ok, true);
+
+  // monthly plans
+  const dates = L.monthlyPlanDates(2026);
+  eq('monthlyPlanDates count', dates.length, 12);
+  eq('monthlyPlanDates first/last', [dates[0], dates[11]], ['2026-01-01', '2026-12-01']);
+  eq('monthlyPlanDates bad year', L.monthlyPlanDates('xx'), []);
+  eq('maintenanceProgress', L.maintenanceProgress(
+    [{ status: 'closed' }, { status: 'open' }, { status: 'resolved' }, { status: 'in_progress' }]),
+    { total: 4, done: 2, pct: 50 });
+})();
+
+/* ------------------------------------------------------------------ */
 console.log(`\nlogic.test.js: ${pass} passed, ${fail} failed`);
 if (fail) { console.log('Failed:', failures.join(' | ')); process.exit(1); }

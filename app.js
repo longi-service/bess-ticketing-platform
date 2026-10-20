@@ -342,6 +342,100 @@
         }
       } catch (e) { /* defs stay empty → helpers fall back to hardcoded */ }
     }
+    // v6: feature probe — contacts exists only after migration_v6.
+    state.v6 = false; state.contacts = []; state.contactProjects = [];
+    try {
+      var v6p = await sb.from('contacts').select('id', { count: 'exact', head: true });
+      state.v6 = !v6p.error;
+    } catch (e) { state.v6 = false; }
+    if (state.v6) {
+      try {
+        var cor = await sb.from('contacts').select('*').order('first_name').order('last_name');
+        if (!cor.error) state.contacts = cor.data || [];
+        var cpr = await sb.from('contact_projects').select('*');
+        if (!cpr.error) state.contactProjects = cpr.data || [];
+        var lcc = await sb.from('ltsa_contract_contacts').select('*');
+        state.contractContacts = {};
+        (lcc.data || []).forEach(function (r) {
+          if (!state.contractContacts[r.contract_id]) state.contractContacts[r.contract_id] = [];
+          state.contractContacts[r.contract_id].push(r.contact_id);
+        });
+      } catch (e) { /* contacts stay empty */ }
+    }
+    // v7: feature probe — custom_fields exists only after migration_v7.
+    state.v7 = false; state.customFields = []; state.wfStates = []; state.wfTrans = {};
+    try {
+      var v7p = await sb.from('custom_fields').select('id', { count: 'exact', head: true });
+      state.v7 = !v7p.error;
+    } catch (e) { state.v7 = false; }
+    if (state.v7) {
+      try {
+        var cfr = await sb.from('custom_fields').select('*').order('sort');
+        if (!cfr.error) state.customFields = (cfr.data || []).filter(function (f) { return f.is_active !== false; });
+        var wsr = await sb.from('workflow_states').select('*').order('workflow_key').order('sort');
+        if (!wsr.error) state.wfStates = wsr.data || [];
+        var wtr = await sb.from('workflow_transitions').select('*');
+        if (!wtr.error) {
+          (wtr.data || []).forEach(function (r) {
+            var k = r.workflow_key || 'ci';
+            if (!state.wfTrans[k]) state.wfTrans[k] = {};
+            if (!state.wfTrans[k][r.from_key]) state.wfTrans[k][r.from_key] = [];
+            if (state.wfTrans[k][r.from_key].indexOf(r.to_key) === -1)
+              state.wfTrans[k][r.from_key].push(r.to_key);
+          });
+        }
+      } catch (e) { /* v7 features fall back to logic.js templates */ }
+    }
+  }
+
+  /**
+   * wfTransitions(workflowKey) — DB-driven transition map if loaded,
+   * otherwise the logic.js built-in template. Never throws.
+   */
+  function wfTransitions(workflowKey) {
+    var k = workflowKey === 'utility' ? 'utility' : 'ci';
+    if (state.v7 && state.wfTrans[k] && Object.keys(state.wfTrans[k]).length)
+      return state.wfTrans[k];
+    return L.WORKFLOW_TEMPLATES[k].transitions;
+  }
+
+  /**
+   * wfStateList(workflowKey) — DB-driven states if loaded, else template.
+   */
+  function wfStateList(workflowKey) {
+    var k = workflowKey === 'utility' ? 'utility' : 'ci';
+    if (state.v7 && state.wfStates.length) {
+      var list = state.wfStates.filter(function (s) { return s.workflow_key === k; });
+      if (list.length) return list;
+    }
+    return L.WORKFLOW_TEMPLATES[k].states.map(function (s, i) {
+      return { workflow_key: k, key: s.key, kind: s.kind, sort: (i + 1) * 10,
+               name_en: s.key, name_zh: s.key,
+               color_bg: '#f1f5f9', color_fg: '#475569' };
+    });
+  }
+
+  /** wfStateName(s) — localized workflow state name. */
+  function wfStateName(s) {
+    if (!s) return '';
+    return lang === 'zh' ? (s.name_zh || s.name_en || s.key) : (s.name_en || s.name_zh || s.key);
+  }
+
+  /** wfStateMap(workflowKey) — key → state row. */
+  function wfStateMap(workflowKey) {
+    var m = {};
+    wfStateList(workflowKey).forEach(function (s) { m[s.key] = s; });
+    return m;
+  }
+
+  /**
+   * fieldsForTracker(tracker) — active custom fields bound to a tracker.
+   */
+  function fieldsForTracker(tracker) {
+    if (!state.v7) return [];
+    return state.customFields.filter(function (f) {
+      return (f.trackers || []).indexOf(tracker) !== -1;
+    });
   }
 
   /** Role-aware base ticket query (RLS is the real filter; this trims noise).
@@ -445,7 +539,7 @@
     var ms = h.match(/^#\/site\/([0-9a-f-]{36})$/i);
     if (ms) return { name: 'site', id: ms[1] };
     var name = h.replace(/^#\//, '').split('?')[0];
-    if (['login', 'dashboard', 'tickets', 'new', 'parts', 'planning', 'calendar', 'users', 'sites', 'sla-alerts'].indexOf(name) === -1) name = 'dashboard';
+    if (['login', 'dashboard', 'tickets', 'new', 'parts', 'planning', 'calendar', 'users', 'sites', 'sla-alerts', 'contacts', 'workflow', 'fields'].indexOf(name) === -1) name = 'dashboard';
     return { name: name };
   }
 
@@ -493,6 +587,9 @@
       else if (route.name === 'site') { if (guard('site.manage')) await viewSiteDetail(view, route.id); }
       else if (route.name === 'users') { if (guard('user.manage')) await viewUsers(view); }
       else if (route.name === 'sites') { if (guard('site.manage')) await viewSites(view); }
+      else if (route.name === 'contacts') { if (guard('contact.manage')) await viewContacts(view); }
+      else if (route.name === 'workflow') { if (guard('workflow.manage')) await viewWorkflow(view); }
+      else if (route.name === 'fields') { if (guard('field.manage')) await viewCustomFields(view); }
       else if (route.name === 'sla-alerts') {
         /* v3 F8: dashboard-linked only (no nav item); dispatcher/admin/pm only. */
         if (['admin', 'dispatcher', 'pm'].indexOf(state.profile.role) === -1) {
@@ -523,6 +620,9 @@
       ] },
       { title: t('nav.group.manage'), links: [
         { id: 'sites',     href: '#/sites',     label: t('nav.sites'),     perm: 'site.manage' },
+        { id: 'contacts',  href: '#/contacts',  label: t('nav.contacts'),  perm: 'contact.manage' },
+        { id: 'workflow',  href: '#/workflow',  label: t('nav.workflow'),  perm: 'workflow.manage' },
+        { id: 'fields',    href: '#/fields',    label: t('nav.fields'),    perm: 'field.manage' },
         { id: 'users',     href: '#/users',     label: t('nav.users'),     perm: 'user.manage' }
       ] }
     ];
@@ -3006,11 +3106,14 @@
 
     function nodeHtml(s, depth) {
       var contract = (state.contracts || {})[s.id];
+      var statusBadge = (s.status && s.status !== 'active')
+        ? '<span class="badge status-closed">' + esc(t('sites.status.' + s.status)) + '</span> '
+        : '';
       return '<div class="tree-node clickable" data-site="' + s.id + '"' +
         ' style="padding-left:' + (12 + depth * 26) + 'px">' +
         '<span class="tcode">' + esc(s.code) + '</span>' +
         '<span class="tname">' + esc(s.name) + '</span>' +
-        '<span class="grow"></span>' +
+        '<span class="grow"></span>' + statusBadge +
         contractBadgeFor(contract) +
         '<span class="badge status-open">' + (counts[s.id] || 0) + ' ' + esc(t('sites.openTickets')) + '</span>' +
         '<span class="muted" style="font-size:12px">' + esc(displayName(s.remote_owner_id)) + '</span>' +
@@ -3092,6 +3195,173 @@
       };
     });
   }
+  /* ================= v6.2: contacts (external, independent of profiles) ==== */
+  async function viewContacts(view) {
+    if (!state.v6) {
+      view.innerHTML = '<div class="page"><div class="inline-err">' +
+        esc(t('common.setupNeeded') || 'migration_v6 required') + '</div></div>';
+      return;
+    }
+    var q = (viewContacts._q || '').trim().toLowerCase();
+    var list = state.contacts.filter(function (c) {
+      if (!q) return true;
+      return ((c.first_name || '') + ' ' + (c.last_name || '') + ' ' +
+              (c.company || '') + ' ' + (c.email || '')).toLowerCase().indexOf(q) !== -1;
+    });
+    var siteMap = {};
+    state.sites.forEach(function (s) { siteMap[s.id] = s; });
+    var projByContact = {};
+    state.contactProjects.forEach(function (r) {
+      (projByContact[r.contact_id] = projByContact[r.contact_id] || []).push(r.site_id);
+    });
+    var rows = list.map(function (c) {
+      var projs = (projByContact[c.id] || []).map(function (sid) {
+        var s = siteMap[sid]; return s ? esc(s.code) : null;
+      }).filter(Boolean).join(', ') || '<span class="muted">—</span>';
+      return '<tr><td><b>' + esc(((c.first_name || '') + ' ' + (c.last_name || '')).trim() || '—') + '</b></td>' +
+        '<td class="muted">' + esc(c.company || '—') + '</td>' +
+        '<td class="muted">' + esc(c.role || '—') + '</td>' +
+        '<td class="muted">' + esc(c.phone || '—') + '</td>' +
+        '<td class="muted">' + esc(c.email || '—') + '</td>' +
+        '<td>' + badge(c.is_active === false ? 'status-closed' : 'sla-ok',
+            t(c.is_active === false ? 'contacts.inactive' : 'contacts.active')) + '</td>' +
+        '<td class="muted">' + projs + '</td>' +
+        '<td><button class="btn btn-sm" data-cedit="' + c.id + '">' + esc(t('common.edit')) + '</button> ' +
+        '<button class="btn btn-sm btn-danger" data-cdel="' + c.id + '">' + esc(t('common.delete')) + '</button></td></tr>';
+    }).join('');
+    view.innerHTML =
+      '<div class="page-head"><h1>' + esc(t('contacts.title')) + '</h1>' +
+      '<button class="btn btn-primary" id="contact-new">+ ' + esc(t('contacts.new')) + '</button></div>' +
+      '<p class="muted">' + esc(t('contacts.sub')) + '</p>' +
+      '<div class="card"><div style="margin-bottom:10px">' +
+      '<input type="text" id="contact-q" class="input" style="max-width:320px" placeholder="' +
+        esc(t('contacts.searchPh')) + '" value="' + esc(viewContacts._q || '') + '"></div>' +
+      '<div style="overflow-x:auto"><table class="tbl"><thead><tr>' +
+      '<th>' + esc(t('contacts.firstName')) + '</th><th>' + esc(t('contacts.company')) + '</th>' +
+      '<th>' + esc(t('contacts.role')) + '</th><th>' + esc(t('contacts.phone')) + '</th>' +
+      '<th>' + esc(t('contacts.email')) + '</th><th>' + esc(t('contacts.active')) + '</th>' +
+      '<th>' + esc(t('contacts.projects')) + '</th><th>' + esc(t('common.actions')) + '</th>' +
+      '</tr></thead><tbody>' +
+      (rows || '<tr><td colspan="8"><div class="empty">' + esc(t('contacts.none')) + '</div></td></tr>') +
+      '</tbody></table></div></div>';
+    document.getElementById('contact-q').oninput = function (e) {
+      viewContacts._q = e.target.value;
+      var pos = e.target.selectionStart;
+      viewContacts(view);
+      var el = document.getElementById('contact-q');
+      if (el) { el.focus(); el.setSelectionRange(pos, pos); }
+    };
+    document.getElementById('contact-new').onclick = function () {
+      openContactModal(null, function () { loadReferenceData().then(function () { viewContacts(view); }); });
+    };
+    view.querySelectorAll('[data-cedit]').forEach(function (b) {
+      b.onclick = function () {
+        var c = state.contacts.filter(function (x) { return x.id === b.getAttribute('data-cedit'); })[0];
+        openContactModal(c, function () { loadReferenceData().then(function () { viewContacts(view); }); });
+      };
+    });
+    view.querySelectorAll('[data-cdel]').forEach(function (b) {
+      b.onclick = async function () {
+        var c = state.contacts.filter(function (x) { return x.id === b.getAttribute('data-cdel'); })[0];
+        if (!c || !window.confirm(t('contacts.confirmDelete'))) return;
+        var r = await sb.from('contacts').delete().eq('id', c.id);
+        if (r.error) { apiError(r.error); return; }
+        toast(t('contacts.deleted'), 'ok');
+        await loadReferenceData(); viewContacts(view);
+      };
+    });
+  }
+
+  function openContactModal(contact, done) {
+    contact = contact || {};
+    function fld(id, label, val, ph) {
+      return '<div class="field"><label>' + esc(label) + '</label>' +
+        '<input type="text" id="' + id + '" value="' + esc(val || '') + '"' +
+        (ph ? ' placeholder="' + esc(ph) + '"' : '') + '></div>';
+    }
+    var linked = {};
+    state.contactProjects.forEach(function (r) {
+      if (r.contact_id === contact.id) linked[r.site_id] = true;
+    });
+    var tree = L.buildSiteTree(state.sites.slice());
+    function projChecks(list, depth) {
+      var h = '';
+      list.forEach(function (s) {
+        h += '<label style="display:block;padding:3px 0 3px ' + (depth * 22) + 'px;font-weight:normal">' +
+          '<input type="checkbox" class="cp-proj" value="' + s.id + '"' +
+          (linked[s.id] ? ' checked' : '') + '> ' + esc(s.code + ' — ' + s.name) + '</label>';
+        h += projChecks(s.children, depth + 1);
+      });
+      return h;
+    }
+    var body =
+      '<div class="form-row">' +
+        '<div class="field"><label>' + esc(t('contacts.firstName')) + '<span class="req">*</span></label>' +
+          '<input type="text" id="ct-first" value="' + esc(contact.first_name || '') + '"></div>' +
+        '<div class="field"><label>' + esc(t('contacts.lastName')) + '</label>' +
+          '<input type="text" id="ct-last" value="' + esc(contact.last_name || '') + '"></div>' +
+      '</div>' +
+      '<div class="form-row">' +
+        fld('ct-company', t('contacts.company'), contact.company) +
+        fld('ct-role', t('contacts.role'), contact.role) +
+      '</div>' +
+      '<div class="form-row">' +
+        fld('ct-phone', t('contacts.phone'), contact.phone) +
+        fld('ct-email', t('contacts.email'), contact.email) +
+      '</div>' +
+      '<div class="field"><label><input type="checkbox" id="ct-active"' +
+        (contact.is_active !== false ? ' checked' : '') + '> ' + esc(t('contacts.active')) + '</label></div>' +
+      '<div class="field"><label>' + esc(t('contacts.notes')) + '</label>' +
+        '<textarea id="ct-notes" style="height:52px">' + esc(contact.notes || '') + '</textarea></div>' +
+      '<div class="field"><label>' + esc(t('contacts.projects')) + '</label>' +
+        '<div style="max-height:180px;overflow:auto;border:1px solid var(--border);border-radius:6px;padding:8px 10px">' +
+        (projChecks(tree, 0) || '<span class="muted">—</span>') + '</div></div>';
+    var close = openModal(contact.id ? t('contacts.edit') : t('contacts.new'), body,
+      '<button class="btn" id="m-cancel">' + esc(t('common.cancel')) + '</button>' +
+      '<button class="btn btn-primary" id="m-save">' + esc(t('common.save')) + '</button>');
+    document.getElementById('m-cancel').onclick = close;
+    document.getElementById('m-save').onclick = async function () {
+      var btn = this; btn.disabled = true;
+      try {
+        var row = {
+          first_name: document.getElementById('ct-first').value.trim(),
+          last_name: document.getElementById('ct-last').value.trim() || null,
+          company: document.getElementById('ct-company').value.trim() || null,
+          role: document.getElementById('ct-role').value.trim() || null,
+          phone: document.getElementById('ct-phone').value.trim() || null,
+          email: document.getElementById('ct-email').value.trim() || null,
+          is_active: document.getElementById('ct-active').checked,
+          notes: document.getElementById('ct-notes').value.trim() || null
+        };
+        var errs = L.validateContact(row);
+        if (errs.length) {
+          toast(t(errs[0] === 'contact.email' ? 'contacts.badEmail' : 'new.fillRequired'), 'error');
+          btn.disabled = false; return;
+        }
+        var saved;
+        if (contact.id) {
+          var ur = await sb.from('contacts').update(row).eq('id', contact.id).select('id').single();
+          if (ur.error) throw ur.error;
+          saved = ur.data;
+        } else {
+          var ir = await sb.from('contacts').insert(row).select('id').single();
+          if (ir.error) throw ir.error;
+          saved = ir.data;
+        }
+        var sel = Array.prototype.map.call(
+          document.querySelectorAll('.cp-proj:checked'), function (el) { return el.value; });
+        await sb.from('contact_projects').delete().eq('contact_id', saved.id);
+        if (sel.length) {
+          var pr = await sb.from('contact_projects').insert(
+            sel.map(function (sid) { return { contact_id: saved.id, site_id: sid }; }));
+          if (pr.error) throw pr.error;
+        }
+        toast(t('contacts.saved'), 'ok');
+        close(); done();
+      } catch (e) { apiError(e); btn.disabled = false; }
+    };
+  }
+
   function openCustomerModal(customer, done) {
     customer = customer || {};
     function fld(id, label, val, ph) {
@@ -3177,6 +3447,34 @@
       '</div>' +
       '<div class="field"><label>' + esc(t('sites.address')) + '</label>' +
         '<input type="text" id="s-addr" value="' + esc(site.address || '') + '"></div>' +
+      '<div class="field"><label>' + esc(t('sites.description')) + '</label>' +
+        '<textarea id="s-desc" style="height:52px">' + esc(site.description || '') + '</textarea></div>' +
+      '<div class="form-row">' +
+        '<div class="field"><label>' + esc(t('sites.latitude')) + '</label>' +
+          '<input type="number" step="any" id="s-lat" value="' + esc(site.latitude == null ? '' : site.latitude) + '"></div>' +
+        '<div class="field"><label>' + esc(t('sites.longitude')) + '</label>' +
+          '<input type="number" step="any" id="s-lng" value="' + esc(site.longitude == null ? '' : site.longitude) + '"></div>' +
+      '</div>' +
+      '<div class="form-row">' +
+        '<div class="field"><label>' + esc(t('sites.status')) + '</label>' +
+          '<select id="s-status">' +
+          ['active', 'paused', 'closed'].map(function (k) {
+            return '<option value="' + k + '"' + ((site.status || 'active') === k ? ' selected' : '') + '>' +
+              esc(t('sites.status.' + k)) + '</option>';
+          }).join('') + '</select></div>' +
+        '<div class="field"><label>' + esc(t('sites.segment')) + '</label>' +
+          '<select id="s-segment">' +
+          ['ci', 'utility'].map(function (k) {
+            return '<option value="' + k + '"' + ((site.segment || 'ci') === k ? ' selected' : '') + '>' +
+              esc(t('sites.segment.' + k)) + '</option>';
+          }).join('') + '</select></div>' +
+      '</div>' +
+      '<div class="field"><label>' + esc(t('sites.workflowMode')) + '</label>' +
+        '<select id="s-wfmode">' +
+        '<option value="default"' + ((site.workflow_mode || 'default') === 'default' ? ' selected' : '') + '>' +
+          esc(t('sites.workflowDefault')) + '</option>' +
+        '<option value="inherit"' + (site.workflow_mode === 'inherit' ? ' selected' : '') + '>' +
+          esc(t('sites.workflowInherit')) + '</option></select></div>' +
       '<div class="field"><label>' + esc(t('sites.parentSite')) + '</label>' +
         '<select id="s-parent"><option value="">' + esc(t('sites.noParent')) + '</option>' +
         state.sites.filter(function (x) { return !forbiddenParent[x.id]; }).map(function (x) {
@@ -3220,6 +3518,10 @@
         var code = document.getElementById('s-code').value.trim();
         var name = document.getElementById('s-name').value.trim();
         if (!code || !name) { toast(t('new.fillRequired'), 'error'); btn.disabled = false; return; }
+        function numOrNull(id) {
+          var v = document.getElementById(id).value.trim();
+          return v === '' || isNaN(Number(v)) ? null : Number(v);
+        }
         var fields = {
           code: code,
           name: name,
@@ -3227,7 +3529,13 @@
           city: document.getElementById('s-city').value.trim() || null,
           address: document.getElementById('s-addr').value.trim() || null,
           parent_site_id: document.getElementById('s-parent').value || null,
-          remote_owner_id: document.getElementById('s-owner').value || null
+          remote_owner_id: document.getElementById('s-owner').value || null,
+          description: document.getElementById('s-desc').value.trim() || null,
+          status: document.getElementById('s-status').value,
+          latitude: numOrNull('s-lat'),
+          longitude: numOrNull('s-lng'),
+          workflow_mode: document.getElementById('s-wfmode').value,
+          segment: document.getElementById('s-segment').value
         };
         if (state.v3) {
           var custSel = document.getElementById('s-customer');
@@ -3312,6 +3620,8 @@
         '<td><b>' + esc(p.name) + '</b></td>' +
         '<td class="muted">' + esc(p.category || '—') + '</td>' +
         '<td class="muted">' + esc(p.unit || '—') + '</td>' +
+        '<td>' + badge((p.owner || 'longi') === 'customer' ? 'contract' : 'sla-ok',
+            t('parts.owner.' + (p.owner || 'longi'))) + '</td>' +
         '<td>' + (canManage
             ? '<button class="btn btn-sm" data-partedit="' + p.id + '">' + esc(t('common.edit')) + '</button> ' +
               '<button class="btn btn-sm btn-danger" data-partdel="' + p.id + '">' + esc(t('common.delete')) + '</button>'
@@ -3328,15 +3638,15 @@
       return stock.filter(function (s) { return s.warehouse_id === whId; }).map(function (s) {
         var p = partMap[s.part_id] || {};
         var qty = Number(s.qty), min = s.min_qty == null ? null : Number(s.min_qty);
-        var low = min != null && qty < min;
-        var out = min != null && qty <= 0;
-        var cls = low ? (out ? 'low-stock-red' : 'low-stock-amber') : '';
+        /* v6.4: TechCRM 3-state stock badge (OK/low/critical). */
+        var st = L.stockStatus(qty, min);
+        var stCls = st === 'critical' ? 'sla-breached' : st === 'low' ? 'sla-warning' : 'sla-ok';
+        var cls = st === 'ok' ? '' : (st === 'critical' ? 'low-stock-red' : 'low-stock-amber');
         return '<tr class="' + cls + '"><td></td>' +
           '<td><b>' + esc(p.code || '—') + '</b> ' + esc(p.name || '') + '</td>' +
           '<td class="tnum">' + esc(String(s.qty)) + ' ' + esc(p.unit || '') + '</td>' +
           '<td class="muted">' + esc(min == null ? '—' : String(s.min_qty)) + '</td>' +
-          '<td>' + (low ? badge(out ? 'sla-breached' : 'sla-warning',
-              t(out ? 'parts.outOfStock' : 'parts.lowStock')) : '<span class="muted">—</span>') + '</td>' +
+          '<td>' + badge(stCls, t('parts.stock.' + st)) + '</td>' +
           '<td></td></tr>';
       }).join('');
     }
@@ -3384,10 +3694,20 @@
           '<button class="btn btn-primary" id="part-new">+ ' + esc(t('parts.newPart')) + '</button></div>'
         : '') +
       '</div>' +
+      '<div class="card"><h2>' + esc(t('parts.stockStatus')) + '</h2>' +
+        '<input type="text" id="part-xsearch" class="input" style="max-width:420px;margin-bottom:10px" placeholder="' +
+        esc(t('parts.searchAllPh')) + '">' +
+        '<div style="overflow-x:auto"><table class="tbl"><thead><tr>' +
+        '<th>' + esc(t('parts.name')) + '</th><th>' + esc(t('parts.warehouse')) + '</th>' +
+        '<th>' + esc(t('parts.qty')) + '</th><th>' + esc(t('parts.stock')) + '</th>' +
+        '<th>' + esc(t('parts.owner')) + '</th></tr></thead>' +
+        '<tbody id="part-xresults"><tr><td colspan="5"><div class="empty muted">' +
+        esc(t('parts.searchAllPh')) + '</div></td></tr></tbody></table></div></div>' +
       '<div class="card"><h2>' + esc(t('parts.catalog')) + '</h2>' +
         '<div style="overflow-x:auto"><table class="tbl"><thead><tr>' +
         '<th>' + esc(t('parts.code')) + '</th><th>' + esc(t('parts.name')) + '</th>' +
         '<th>' + esc(t('parts.category')) + '</th><th>' + esc(t('parts.unit')) + '</th>' +
+        '<th>' + esc(t('parts.owner')) + '</th>' +
         '<th>' + esc(t('common.actions')) + '</th></tr></thead><tbody>' + catRows + '</tbody></table></div></div>' +
       '<div class="card"><h2>' + esc(t('parts.warehouses')) + '</h2>' +
         '<div style="overflow-x:auto"><table class="tbl"><thead><tr>' +
@@ -3404,6 +3724,37 @@
         '<th>' + esc(t('parts.tx.actor')) + '</th><th>' + esc(t('parts.tx.note')) + '</th>' +
         '</tr></thead><tbody>' + (ledgerRows || '<tr><td colspan="8"><div class="empty">—</div></td></tr>') +
         '</tbody></table></div></div>';
+
+    /* v6.4: cross-warehouse part search — which warehouse holds this part. */
+    (function () {
+      var inp = document.getElementById('part-xsearch');
+      var out = document.getElementById('part-xresults');
+      if (!inp || !out) return;
+      inp.oninput = function () {
+        var q = inp.value.trim().toLowerCase();
+        if (q.length < 2) {
+          out.innerHTML = '<tr><td colspan="5"><div class="empty muted">' +
+            esc(t('parts.searchAllPh')) + '</div></td></tr>';
+          return;
+        }
+        var rows = [];
+        stock.forEach(function (s) {
+          var p = partMap[s.part_id] || {};
+          var w = whMap[s.warehouse_id] || {};
+          var hay = ((p.code || '') + ' ' + (p.name || '')).toLowerCase();
+          if (hay.indexOf(q) === -1) return;
+          var st = L.stockStatus(s.qty, s.min_qty);
+          rows.push('<tr><td><b>' + esc(p.code || '—') + '</b> ' + esc(p.name || '') + '</td>' +
+            '<td class="muted">' + esc(w.code ? w.code + ' — ' + w.name : '—') + '</td>' +
+            '<td class="tnum">' + esc(String(s.qty)) + ' ' + esc(p.unit || '') + '</td>' +
+            '<td>' + badge(st === 'critical' ? 'sla-breached' : st === 'low' ? 'sla-warning' : 'sla-ok',
+              t('parts.stock.' + st)) + '</td>' +
+            '<td>' + esc(t('parts.owner.' + (p.owner || 'longi'))) + '</td></tr>');
+        });
+        out.innerHTML = rows.length ? rows.join('')
+          : '<tr><td colspan="5"><div class="empty">' + esc(t('common.noResults')) + '</div></td></tr>';
+      };
+    })();
 
     if (canManage) {
       document.getElementById('part-new').onclick = function () {
@@ -3453,7 +3804,13 @@
           '<input type="text" id="p-cat" value="' + esc(part.category || '') + '"></div>' +
         '<div class="field"><label>' + esc(t('parts.unit')) + '</label>' +
           '<input type="text" id="p-unit" value="' + esc(part.unit || '') + '"></div>' +
-      '</div>';
+      '</div>' +
+      '<div class="field"><label>' + esc(t('parts.owner')) + '</label>' +
+        '<select id="p-owner">' +
+        ['longi', 'customer'].map(function (k) {
+          return '<option value="' + k + '"' + ((part.owner || 'longi') === k ? ' selected' : '') + '>' +
+            esc(t('parts.owner.' + k)) + '</option>';
+        }).join('') + '</select></div>';
     var close = openModal(part.id ? t('parts.editPart') : t('parts.newPart'), body,
       '<button class="btn" id="m-cancel">' + esc(t('common.cancel')) + '</button>' +
       '<button class="btn btn-primary" id="m-save">' + esc(t('common.save')) + '</button>');
@@ -3466,7 +3823,8 @@
         if (!code || !name) { toast(t('new.fillRequired'), 'error'); btn.disabled = false; return; }
         var fields = { code: code, name: name,
                        category: document.getElementById('p-cat').value.trim() || null,
-                       unit: document.getElementById('p-unit').value.trim() || null };
+                       unit: document.getElementById('p-unit').value.trim() || null,
+                       owner: document.getElementById('p-owner').value };
         var r = part.id
           ? await sb.from('spare_parts').update(fields).eq('id', part.id)
           : await sb.from('spare_parts').insert(fields);
@@ -3502,6 +3860,89 @@
     { key: 'warehouse_code', req: true }, { key: 'qty', req: true },
     { key: 'category', req: false }, { key: 'unit', req: false }, { key: 'min_qty', req: false }
   ];
+  /* v6.5: multi-entity import. Each entity: fields (key/req/label/aliases),
+     template row, and a run(rec) writer. 'parts' keeps the legacy flow. */
+  var IMPORT_ENTITIES = {
+    parts: { fields: IMPORT_FIELDS, aliases: {
+      code: ['code', 'partcode', 'partno', 'sku', 'itemcode'],
+      name: ['name', 'partname', 'description', 'desc', 'itemname'],
+      warehouse_code: ['warehousecode', 'warehouse', 'whcode', 'wh', 'location'],
+      qty: ['qty', 'quantity', 'stock', 'amount', 'count'],
+      category: ['category', 'cat', 'type', 'group'], unit: ['unit', 'uom'],
+      min_qty: ['minqty', 'min', 'minimum', 'safetystock', 'reorder'],
+      owner: ['owner', 'ownership'] },
+      template: 'code,name,warehouse_code,qty,category,unit,min_qty,owner\nBAT-001,Battery module,WH-EU-01,10, ESS,pcs,2,longi' },
+    sites: { fields: [
+      { key: 'code', req: true, label: 'Site code' }, { key: 'name', req: true, label: 'Site name' },
+      { key: 'country', req: false, label: 'Country (2-letter)' }, { key: 'city', req: false, label: 'City' },
+      { key: 'address', req: false, label: 'Address' },
+      { key: 'latitude', req: false, label: 'Latitude' }, { key: 'longitude', req: false, label: 'Longitude' },
+      { key: 'parent_code', req: false, label: 'Parent site code' },
+      { key: 'remote_owner_email', req: false, label: 'Remote owner email' },
+      { key: 'description', req: false, label: 'Description' } ], aliases: {
+      code: ['code', 'sitecode'], name: ['name', 'sitename'],
+      country: ['country'], city: ['city'], address: ['address'],
+      latitude: ['latitude', 'lat'], longitude: ['longitude', 'lng', 'lon'],
+      parent_code: ['parentcode', 'parentsitecode', 'parent'],
+      remote_owner_email: ['remoteowneremail', 'owneremail', 'owner'],
+      description: ['description', 'desc'] },
+      template: 'code,name,country,city,latitude,longitude,parent_code,remote_owner_email\nIT-MDC-01,Montalto di Castro,IT,Montalto di Castro,42.35,11.61,IT,,massimo@longi.com' },
+    warehouses: { fields: [
+      { key: 'code', req: true, label: 'Warehouse code' }, { key: 'name', req: true, label: 'Warehouse name' },
+      { key: 'parent_code', req: false, label: 'Parent warehouse code' },
+      { key: 'type', req: false, label: 'Type (on_site/off_site)' },
+      { key: 'address', req: false, label: 'Address' },
+      { key: 'contact_name', req: false, label: 'Contact name' },
+      { key: 'contact_phone', req: false, label: 'Contact phone' },
+      { key: 'contact_email', req: false, label: 'Contact email' },
+      { key: 'delivery_notes', req: false, label: 'Delivery notes' } ], aliases: {
+      code: ['code', 'warehousecode'], name: ['name', 'warehousename'],
+      parent_code: ['parentcode', 'parentwarehousecode', 'parent'],
+      type: ['type', 'warehousetype'], address: ['address'],
+      contact_name: ['contactname'], contact_phone: ['contactphone'],
+      contact_email: ['contactemail'], delivery_notes: ['deliverynotes', 'notes'] },
+      template: 'code,name,parent_code,type,address,contact_name,contact_phone\nWH-EU-01,EU central warehouse,,off_site, Rotterdam NL,Jan Jansen,+31101234567' },
+    contacts: { fields: [
+      { key: 'first_name', req: true, label: 'First name' }, { key: 'last_name', req: false, label: 'Last name' },
+      { key: 'company', req: false, label: 'Company' }, { key: 'role', req: false, label: 'Role' },
+      { key: 'phone', req: false, label: 'Phone' }, { key: 'email', req: false, label: 'Email' } ], aliases: {
+      first_name: ['firstname', 'name', 'givenname'], last_name: ['lastname', 'surname', 'familyname'],
+      company: ['company', 'organisation', 'organization'], role: ['role', 'title', 'position'],
+      phone: ['phone', 'mobile', 'tel'], email: ['email', 'mail'] },
+      template: 'first_name,last_name,company,role,phone,email\nMario,Rossi,Rapsody,Field technician,+393331234567,mario.rossi@rapsody.it' },
+    contracts: { fields: [
+      { key: 'site_code', req: true, label: 'Site code' },
+      { key: 'response_hours', req: false, label: 'Response hours' },
+      { key: 'onsite_hours', req: false, label: 'On-site hours' },
+      { key: 'resolve_hours', req: false, label: 'Resolve hours' },
+      { key: 'availability_pct', req: false, label: 'Availability %' },
+      { key: 'valid_from', req: false, label: 'Valid from (YYYY-MM-DD)' },
+      { key: 'valid_to', req: false, label: 'Valid to (YYYY-MM-DD)' },
+      { key: 'coverage', req: false, label: 'Coverage' },
+      { key: 'phone_enabled', req: false, label: 'Phone enabled (true/false)' },
+      { key: 'onsite_enabled', req: false, label: 'On-site enabled (true/false)' },
+      { key: 'support_24_7', req: false, label: '24/7 (true/false)' },
+      { key: 'penalty_response', req: false, label: 'Penalty response' },
+      { key: 'penalty_onsite', req: false, label: 'Penalty on-site' },
+      { key: 'penalty_resolve', req: false, label: 'Penalty resolve' } ], aliases: {
+      site_code: ['sitecode', 'site', 'code'],
+      response_hours: ['responsehours', 'response'], onsite_hours: ['onsitehours', 'onsite'],
+      resolve_hours: ['resolvehours', 'resolve'], availability_pct: ['availabilitypct', 'availability'],
+      valid_from: ['validfrom', 'from'], valid_to: ['validto', 'to'],
+      coverage: ['coverage'], phone_enabled: ['phoneenabled', 'phone'],
+      onsite_enabled: ['onsiteenabled', 'onsite'], support_24_7: ['support247', '247'],
+      penalty_response: ['penaltyresponse'], penalty_onsite: ['penaltyonsite'],
+      penalty_resolve: ['penaltyresolve'] },
+      template: 'site_code,response_hours,resolve_hours,availability_pct,valid_from,valid_to,onsite_enabled,support_24_7\nIT-MDC-01,3,5,98,2026-01-01,2028-12-31,true,true' },
+    engineers: { fields: [
+      { key: 'first_name', req: true, label: 'First name' }, { key: 'last_name', req: false, label: 'Last name' },
+      { key: 'company', req: false, label: 'Company' }, { key: 'role', req: false, label: 'Role' },
+      { key: 'phone', req: false, label: 'Phone' }, { key: 'email', req: false, label: 'Email' } ], aliases: {
+      first_name: ['firstname', 'name', 'givenname'], last_name: ['lastname', 'surname', 'familyname'],
+      company: ['company', 'organisation', 'organization'], role: ['role', 'title', 'position'],
+      phone: ['phone', 'mobile', 'tel'], email: ['email', 'mail'] },
+      template: 'first_name,last_name,company,role,phone,email\nHassan,Benali,LONGi EU,Field technician,+393331234567,hassan.benali@longi.com' }
+  };
   function parseDelimited(text) {
     var lines = String(text || '').replace(/\r\n?/g, '\n').split('\n')
       .filter(function (l) { return l.trim() !== ''; });
@@ -3530,19 +3971,11 @@
     var rows = lines.slice(1).map(splitLine);
     return { headers: headers, rows: rows };
   }
-  function guessMapping(headers) {
+  function guessMapping(headers, fields, aliases) {
     var map = {};
     var norm = headers.map(function (h) { return h.toLowerCase().replace(/[^a-z0-9]/g, ''); });
-    IMPORT_FIELDS.forEach(function (f) {
-      var keys = {
-        code: ['code', 'partcode', 'partno', 'sku', 'itemcode'],
-        name: ['name', 'partname', 'description', 'desc', 'itemname'],
-        warehouse_code: ['warehousecode', 'warehouse', 'whcode', 'wh', 'location'],
-        qty: ['qty', 'quantity', 'stock', 'amount', 'count'],
-        category: ['category', 'cat', 'type', 'group'],
-        unit: ['unit', 'uom'],
-        min_qty: ['minqty', 'min', 'minimum', 'safetystock', 'reorder']
-      }[f.key];
+    (fields || IMPORT_FIELDS).forEach(function (f) {
+      var keys = ((aliases || {})[f.key]) || [f.key];
       for (var i = 0; i < norm.length; i++) {
         if (keys.indexOf(norm[i]) !== -1) { map[f.key] = headers[i]; break; }
       }
@@ -3554,8 +3987,22 @@
     var whByCode = {};
     warehouses.forEach(function (w) { whByCode[(w.code || '').toUpperCase()] = w; });
     var parsed = null, mapping = {};
+    var impEntity = 'parts';
+    function impFields() { return IMPORT_ENTITIES[impEntity].fields; }
+    function impLabel(f) {
+      return f.label || t('parts.imp.f.' + f.key);
+    }
     var body =
       '<div id="pi-step1">' +
+        '<div class="field"><label>' + esc(t('parts.imp.entity')) + '</label>' +
+          '<select id="pi-entity">' +
+          ['parts', 'sites', 'warehouses', 'contacts', 'contracts', 'engineers'].map(function (k) {
+            return '<option value="' + k + '">' + esc(t('parts.imp.entity.' + k)) + '</option>';
+          }).join('') + '</select></div>' +
+        '<div class="field"><button class="btn btn-sm" id="pi-template">⇩ ' +
+          esc(t('parts.imp.template')) + '</button> ' +
+          '<span class="muted" id="pi-engnote" style="display:none">' +
+          esc(t('parts.imp.engineerNote')) + '</span></div>' +
         '<div class="field"><label>' + esc(t('parts.imp.paste')) + '</label>' +
           '<textarea id="pi-text" rows="6" placeholder="' +
             esc(t('parts.imp.pastePh')) + '"></textarea></div>' +
@@ -3578,9 +4025,7 @@
       '<div id="pi-step3" style="display:none">' +
         '<div id="pi-summary" style="margin-bottom:10px"></div>' +
         '<div style="overflow-x:auto;max-height:320px;overflow-y:auto"><table class="tbl"><thead><tr>' +
-          '<th>#</th>' + IMPORT_FIELDS.map(function (f) {
-            return '<th>' + esc(t('parts.imp.f.' + f.key)) + (f.req ? '<span class="req">*</span>' : '') + '</th>';
-          }).join('') + '<th>' + esc(t('parts.imp.status')) + '</th></tr></thead>' +
+          '<th>#</th><th>' + esc(t('parts.imp.status')) + '</th></tr></thead>' +
           '<tbody id="pi-rows"></tbody></table></div>' +
         '<div style="display:flex;gap:8px;margin-top:12px">' +
           '<button class="btn" id="pi-back2">← ' + esc(t('common.back')) + '</button>' +
@@ -3595,19 +4040,41 @@
     }
     function validateRows() {
       var rows = [];
+      var fields = impFields();
       parsed.rows.forEach(function (cells, idx) {
         var rec = {};
-        IMPORT_FIELDS.forEach(function (f) {
+        fields.forEach(function (f) {
           var hi = parsed.headers.indexOf(mapping[f.key]);
           rec[f.key] = hi === -1 ? '' : (cells[hi] || '').trim();
         });
         var errs = [];
-        if (!rec.code) errs.push(t('parts.imp.f.code'));
-        if (!rec.name) errs.push(t('parts.imp.f.name'));
-        if (!rec.warehouse_code) errs.push(t('parts.imp.f.warehouse_code'));
-        else if (!whByCode[rec.warehouse_code.toUpperCase()]) errs.push(t('parts.imp.badWh'));
-        if (rec.qty === '' || isNaN(Number(rec.qty))) errs.push(t('parts.imp.f.qty'));
-        if (rec.min_qty && isNaN(Number(rec.min_qty))) errs.push(t('parts.imp.f.min_qty'));
+        fields.forEach(function (f) {
+          if (f.req && !rec[f.key]) errs.push(impLabel(f));
+        });
+        /* entity-specific checks */
+        if (impEntity === 'parts') {
+          if (rec.warehouse_code && !whByCode[rec.warehouse_code.toUpperCase()])
+            errs.push(t('parts.imp.badWh'));
+          if (rec.qty === '' || isNaN(Number(rec.qty))) errs.push(impLabel({ key: 'qty', label: 'qty' }));
+          if (rec.min_qty && isNaN(Number(rec.min_qty))) errs.push(impLabel({ key: 'min_qty', label: 'min_qty' }));
+          if (rec.owner && ['longi', 'customer'].indexOf(rec.owner.toLowerCase()) === -1)
+            errs.push('owner');
+        } else if (impEntity === 'sites') {
+          if (rec.latitude && isNaN(Number(rec.latitude))) errs.push('latitude');
+          if (rec.longitude && isNaN(Number(rec.longitude))) errs.push('longitude');
+          if (rec.country && rec.country.length !== 2) errs.push('country');
+        } else if (impEntity === 'warehouses') {
+          if (rec.type && ['on_site', 'off_site'].indexOf(rec.type.toLowerCase()) === -1) errs.push('type');
+        } else if (impEntity === 'contacts' || impEntity === 'engineers') {
+          if (rec.email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(rec.email)) errs.push('email');
+        } else if (impEntity === 'contracts') {
+          ['response_hours', 'onsite_hours', 'resolve_hours', 'availability_pct'].forEach(function (k) {
+            if (rec[k] && isNaN(Number(rec[k]))) errs.push(k);
+          });
+          ['phone_enabled', 'onsite_enabled', 'support_24_7'].forEach(function (k) {
+            if (rec[k] && ['true', 'false', '1', '0', 'yes', 'no'].indexOf(rec[k].toLowerCase()) === -1) errs.push(k);
+          });
+        }
         rows.push({ rec: rec, errs: errs, line: idx + 2 });
       });
       return rows;
@@ -3619,13 +4086,30 @@
       rd.onload = function () { document.getElementById('pi-text').value = rd.result; };
       rd.readAsText(f);
     };
+    function currentEntity() { return IMPORT_ENTITIES[impEntity]; }
+    document.getElementById('pi-entity').onchange = function () {
+      impEntity = this.value;
+      document.getElementById('pi-engnote').style.display =
+        impEntity === 'engineers' ? 'inline' : 'none';
+      /* v6.5: qty set/add mode only makes sense for spare parts. */
+      var qm = document.querySelector('input[name="pi-mode"]');
+      if (qm) qm.closest('.field').style.display = impEntity === 'parts' ? 'block' : 'none';
+    };
+    document.getElementById('pi-template').onclick = function () {
+      var blob = new Blob([currentEntity().template], { type: 'text/csv;charset=utf-8' });
+      var a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'import-template-' + impEntity + '.csv';
+      document.body.appendChild(a); a.click();
+      setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 500);
+    };
     document.getElementById('pi-parse').onclick = function () {
       parsed = parseDelimited(document.getElementById('pi-text').value);
       if (!parsed.headers.length) { toast(t('parts.imp.empty'), 'error'); return; }
-      mapping = guessMapping(parsed.headers);
-      document.getElementById('pi-map').innerHTML = IMPORT_FIELDS.map(function (f) {
+      mapping = guessMapping(parsed.headers, impFields(), currentEntity().aliases);
+      document.getElementById('pi-map').innerHTML = impFields().map(function (f) {
         return '<div class="form-row" style="margin-bottom:6px;align-items:center">' +
-          '<div style="width:150px;font-weight:600">' + esc(t('parts.imp.f.' + f.key)) +
+          '<div style="width:150px;font-weight:600">' + esc(impLabel(f)) +
             (f.req ? '<span class="req">*</span>' : '') + '</div>' +
           '<select id="pi-map-' + f.key + '" style="flex:1">' +
             '<option value="">' + esc(t('common.none')) + '</option>' +
@@ -3639,12 +4123,12 @@
     document.getElementById('pi-back1').onclick = function () { show(1); };
     document.getElementById('pi-back2').onclick = function () { show(2); };
     document.getElementById('pi-preview').onclick = function () {
-      IMPORT_FIELDS.forEach(function (f) {
+      impFields().forEach(function (f) {
         mapping[f.key] = document.getElementById('pi-map-' + f.key).value;
       });
-      var missing = IMPORT_FIELDS.filter(function (f) { return f.req && !mapping[f.key]; });
+      var missing = impFields().filter(function (f) { return f.req && !mapping[f.key]; });
       if (missing.length) {
-        toast(t('parts.imp.mapMissing', { f: missing.map(function (x) { return t('parts.imp.f.' + x.key); }).join(', ') }), 'error');
+        toast(t('parts.imp.mapMissing', { f: missing.map(function (x) { return impLabel(x); }).join(', ') }), 'error');
         return;
       }
       var rows = validateRows();
@@ -3652,9 +4136,15 @@
       document.getElementById('pi-summary').innerHTML =
         '<div class="muted">' + esc(t('parts.imp.summary')
           .replace('{ok}', String(ok)).replace('{bad}', String(rows.length - ok))) + '</div>';
+      /* rebuild the header for the selected entity */
+      var tbl = document.getElementById('pi-rows').closest('table');
+      tbl.querySelector('thead').innerHTML = '<tr><th>#</th>' +
+        impFields().map(function (f) {
+          return '<th>' + esc(impLabel(f)) + (f.req ? '<span class="req">*</span>' : '') + '</th>';
+        }).join('') + '<th>' + esc(t('parts.imp.status')) + '</th></tr>';
       document.getElementById('pi-rows').innerHTML = rows.map(function (r, i) {
         return '<tr class="' + (r.errs.length ? 'low-stock-red' : '') + '"><td class="muted">' + r.line + '</td>' +
-          IMPORT_FIELDS.map(function (f) {
+          impFields().map(function (f) {
             return '<td>' + esc(r.rec[f.key]) + '</td>';
           }).join('') +
           '<td>' + (r.errs.length
@@ -3667,35 +4157,128 @@
     document.getElementById('pi-run').onclick = async function () {
       var btn = this; btn.disabled = true;
       var rows = validateRows().filter(function (r) { return !r.errs.length; });
-      var mode = document.querySelector('input[name="pi-mode"]:checked').value;
+      var modeEl = document.querySelector('input[name="pi-mode"]:checked');
+      var mode = modeEl ? modeEl.value : 'set';
       var prog = document.getElementById('pi-progress');
       var okN = 0, failN = 0, fails = [];
+      function toBool(v) {
+        if (v === '' || v == null) return null;
+        return ['true', '1', 'yes'].indexOf(String(v).toLowerCase()) !== -1;
+      }
+      /* pre-resolve lookups for non-parts entities */
+      var siteByCode = {}, profByEmail = {};
+      if (impEntity === 'sites' || impEntity === 'contracts') {
+        state.sites.forEach(function (s) { siteByCode[(s.code || '').toUpperCase()] = s; });
+      }
+      if (impEntity === 'sites') {
+        try {
+          var pr = await sb.from('profiles').select('id,email');
+          (pr.data || []).forEach(function (u) { if (u.email) profByEmail[u.email.toLowerCase()] = u.id; });
+        } catch (e) {}
+      }
       for (var i = 0; i < rows.length; i++) {
         var rec = rows[i].rec;
         prog.innerHTML = '<div class="muted">' + esc(t('parts.imp.progress')
           .replace('{i}', String(i + 1)).replace('{n}', String(rows.length))) + '</div>';
         try {
-          var up = await sb.from('spare_parts').upsert({
-            code: rec.code, name: rec.name,
-            category: rec.category || null, unit: rec.unit || null
-          }, { onConflict: 'code' }).select('id').single();
-          if (up.error) throw up.error;
-          var wh = whByCode[rec.warehouse_code.toUpperCase()];
-          var cur = await sb.from('stock_levels').select('id,qty')
-            .eq('warehouse_id', wh.id).eq('part_id', up.data.id).maybeSingle();
-          if (cur.error) throw cur.error;
-          var qty = mode === 'add'
-            ? Number((cur.data && cur.data.qty) || 0) + Number(rec.qty)
-            : Number(rec.qty);
-          var srow = { warehouse_id: wh.id, part_id: up.data.id, qty: qty };
-          if (rec.min_qty !== '') srow.min_qty = Number(rec.min_qty);
-          var su = await sb.from('stock_levels').upsert(srow, { onConflict: 'warehouse_id,part_id' });
-          if (su.error) throw su.error;
-          await sb.from('part_transactions').insert({
-            warehouse_id: wh.id, part_id: up.data.id,
-            qty_delta: mode === 'add' ? Number(rec.qty) : (qty - Number((cur.data && cur.data.qty) || 0)),
-            actor_id: state.profile.id, note: 'bulk import'
-          });
+          if (impEntity === 'parts') {
+            var up = await sb.from('spare_parts').upsert({
+              code: rec.code, name: rec.name,
+              category: rec.category || null, unit: rec.unit || null,
+              owner: (rec.owner || 'longi').toLowerCase()
+            }, { onConflict: 'code' }).select('id').single();
+            if (up.error) throw up.error;
+            var wh = whByCode[rec.warehouse_code.toUpperCase()];
+            var cur = await sb.from('stock_levels').select('id,qty')
+              .eq('warehouse_id', wh.id).eq('part_id', up.data.id).maybeSingle();
+            if (cur.error) throw cur.error;
+            var qty = mode === 'add'
+              ? Number((cur.data && cur.data.qty) || 0) + Number(rec.qty)
+              : Number(rec.qty);
+            var srow = { warehouse_id: wh.id, part_id: up.data.id, qty: qty };
+            if (rec.min_qty !== '') srow.min_qty = Number(rec.min_qty);
+            var su = await sb.from('stock_levels').upsert(srow, { onConflict: 'warehouse_id,part_id' });
+            if (su.error) throw su.error;
+            await sb.from('part_transactions').insert({
+              warehouse_id: wh.id, part_id: up.data.id,
+              qty_delta: mode === 'add' ? Number(rec.qty) : (qty - Number((cur.data && cur.data.qty) || 0)),
+              tx_type: mode === 'add' ? 'in' : 'adjust',
+              actor_id: state.profile.id, note: 'bulk import'
+            });
+          } else if (impEntity === 'sites') {
+            var sfields = {
+              code: rec.code, name: rec.name,
+              country: (rec.country || '').toUpperCase() || null,
+              city: rec.city || null, address: rec.address || null,
+              latitude: rec.latitude === '' ? null : Number(rec.latitude),
+              longitude: rec.longitude === '' ? null : Number(rec.longitude),
+              description: rec.description || null
+            };
+            if (rec.parent_code) {
+              var ps = siteByCode[rec.parent_code.toUpperCase()];
+              if (!ps) throw new Error('parent site not found: ' + rec.parent_code);
+              sfields.parent_site_id = ps.id;
+            }
+            if (rec.remote_owner_email) {
+              var oid = profByEmail[rec.remote_owner_email.toLowerCase()];
+              if (oid) sfields.remote_owner_id = oid;
+            }
+            var sr2 = await sb.from('sites').upsert(sfields, { onConflict: 'code' }).select('id,code');
+            if (sr2.error) throw sr2.error;
+            siteByCode[sr2.data.code.toUpperCase()] = sr2.data;
+          } else if (impEntity === 'warehouses') {
+            var wfields = {
+              code: rec.code, name: rec.name,
+              type: (rec.type || '').toLowerCase() || null,
+              address: rec.address || null,
+              contact_name: rec.contact_name || null,
+              contact_phone: rec.contact_phone || null,
+              contact_email: rec.contact_email || null,
+              delivery_notes: rec.delivery_notes || null
+            };
+            if (rec.parent_code) {
+              var pw = whByCode[rec.parent_code.toUpperCase()];
+              if (!pw) throw new Error('parent warehouse not found: ' + rec.parent_code);
+              wfields.parent_warehouse_id = pw.id;
+            }
+            var wr2 = await sb.from('warehouses').upsert(wfields, { onConflict: 'code' }).select('id,code');
+            if (wr2.error) throw wr2.error;
+            whByCode[wr2.data.code.toUpperCase()] = wr2.data;
+          } else if (impEntity === 'contacts' || impEntity === 'engineers') {
+            var cfields = {
+              first_name: rec.first_name, last_name: rec.last_name || null,
+              company: rec.company || null,
+              role: rec.role || (impEntity === 'engineers' ? 'engineer' : null),
+              phone: rec.phone || null, email: rec.email || null
+            };
+            if (cfields.email) {
+              var ex = await sb.from('contacts').select('id').eq('email', cfields.email).maybeSingle();
+              if (ex.error) throw ex.error;
+              if (ex.data) { okN++; continue; } // skip duplicates by email
+            }
+            var cr2 = await sb.from('contacts').insert(cfields);
+            if (cr2.error) throw cr2.error;
+          } else if (impEntity === 'contracts') {
+            var st = siteByCode[(rec.site_code || '').toUpperCase()];
+            if (!st) throw new Error('site not found: ' + rec.site_code);
+            var cfr = {
+              site_id: st.id,
+              response_hours: rec.response_hours === '' ? null : Number(rec.response_hours),
+              onsite_hours: rec.onsite_hours === '' ? null : Number(rec.onsite_hours),
+              resolve_hours: rec.resolve_hours === '' ? null : Number(rec.resolve_hours),
+              availability_pct: rec.availability_pct === '' ? null : Number(rec.availability_pct),
+              valid_from: rec.valid_from || null, valid_to: rec.valid_to || null,
+              coverage: rec.coverage || null,
+              phone_enabled: toBool(rec.phone_enabled),
+              onsite_enabled: toBool(rec.onsite_enabled),
+              support_24_7: toBool(rec.support_24_7),
+              penalty_response: rec.penalty_response || null,
+              penalty_onsite: rec.penalty_onsite || null,
+              penalty_resolve: rec.penalty_resolve || null
+            };
+            var ur2 = await sb.from('ltsa_contracts').upsert(cfr, { onConflict: 'site_id' });
+            if (ur2.error) throw ur2.error;
+          }
           okN++;
         } catch (e) { failN++; fails.push('L' + rows[i].line + ': ' + (e.message || 'error')); }
       }
@@ -3725,7 +4308,27 @@
         allWarehouses.filter(function (w) { return w.id !== warehouse.id; }).map(function (w) {
           return '<option value="' + w.id + '"' + (warehouse.parent_warehouse_id === w.id ? ' selected' : '') + '>' +
             esc(w.code + ' — ' + w.name) + '</option>';
-        }).join('') + '</select></div>';
+        }).join('') + '</select></div>' +
+      '<div class="form-row">' +
+        '<div class="field"><label>' + esc(t('parts.whType')) + '</label>' +
+          '<select id="w-type"><option value="">' + esc(t('common.none')) + '</option>' +
+          ['on_site', 'off_site'].map(function (k) {
+            return '<option value="' + k + '"' + (warehouse.type === k ? ' selected' : '') + '>' +
+              esc(t('parts.whType.' + k)) + '</option>';
+          }).join('') + '</select></div>' +
+      '</div>' +
+      '<div class="field"><label>' + esc(t('parts.whAddress')) + '</label>' +
+        '<input type="text" id="w-addr" value="' + esc(warehouse.address || '') + '"></div>' +
+      '<div class="form-row">' +
+        '<div class="field"><label>' + esc(t('parts.contactName')) + '</label>' +
+          '<input type="text" id="w-cname" value="' + esc(warehouse.contact_name || '') + '"></div>' +
+        '<div class="field"><label>' + esc(t('parts.contactPhone')) + '</label>' +
+          '<input type="text" id="w-cphone" value="' + esc(warehouse.contact_phone || '') + '"></div>' +
+      '</div>' +
+      '<div class="field"><label>' + esc(t('parts.contactEmail')) + '</label>' +
+        '<input type="text" id="w-cemail" value="' + esc(warehouse.contact_email || '') + '"></div>' +
+      '<div class="field"><label>' + esc(t('parts.deliveryNotes')) + '</label>' +
+        '<textarea id="w-dnotes" style="height:52px">' + esc(warehouse.delivery_notes || '') + '</textarea></div>';
     var close = openModal(warehouse.id ? t('parts.editWarehouse') : t('parts.newWarehouse'), body,
       '<button class="btn" id="m-cancel">' + esc(t('common.cancel')) + '</button>' +
       '<button class="btn btn-primary" id="m-save">' + esc(t('common.save')) + '</button>');
@@ -3737,7 +4340,13 @@
         var name = document.getElementById('w-name').value.trim();
         if (!code || !name) { toast(t('new.fillRequired'), 'error'); btn.disabled = false; return; }
         var fields = { code: code, name: name,
-                       parent_warehouse_id: document.getElementById('w-parent').value || null };
+                       parent_warehouse_id: document.getElementById('w-parent').value || null,
+                       type: document.getElementById('w-type').value || null,
+                       address: document.getElementById('w-addr').value.trim() || null,
+                       contact_name: document.getElementById('w-cname').value.trim() || null,
+                       contact_phone: document.getElementById('w-cphone').value.trim() || null,
+                       contact_email: document.getElementById('w-cemail').value.trim() || null,
+                       delivery_notes: document.getElementById('w-dnotes').value.trim() || null };
         if (site) fields.site_id = site.id;
         var r = warehouse.id
           ? await sb.from('warehouses').update(fields).eq('id', warehouse.id)
@@ -4187,7 +4796,22 @@
         '<div class="field"><label><input type="checkbox" id="c-onsite"' +
           (contract.onsite_enabled ? ' checked' : '') + ' style="width:auto;margin-right:6px">' +
           esc(t('contract.onsiteEnabled')) + '</label></div>' +
+        '<div class="field"><label><input type="checkbox" id="c-247"' +
+          (contract.support_24_7 ? ' checked' : '') + ' style="width:auto;margin-right:6px">' +
+          esc(t('contract.support247')) + '</label></div>' +
       '</div>' +
+      (state.v6
+        ? '<div class="field"><label>' + esc(t('contract.contacts')) + '</label>' +
+          '<div style="max-height:150px;overflow:auto;border:1px solid var(--border);border-radius:6px;padding:8px 10px">' +
+          state.contacts.map(function (c) {
+            var nm = ((c.first_name || '') + ' ' + (c.last_name || '')).trim() || c.email || c.id;
+            var linked = state.contractContacts[contract.id] || [];
+            return '<label style="display:block;padding:2px 0;font-weight:normal">' +
+              '<input type="checkbox" class="cc-contact" value="' + c.id + '"' +
+              (linked.indexOf(c.id) !== -1 ? ' checked' : '') + '> ' +
+              esc(nm + (c.company ? ' (' + c.company + ')' : '')) + '</label>';
+          }).join('') + '</div></div>'
+        : '') +
       '<div class="form-row">' +
         num('c-resp', contract.response_hours, t('contract.responseHours')) +
         num('c-onsite-h', contract.onsite_hours, t('contract.onsiteHours')) +
@@ -4223,6 +4847,7 @@
           site_id: site.id,
           phone_enabled: document.getElementById('c-phone').checked,
           onsite_enabled: document.getElementById('c-onsite').checked,
+          support_24_7: document.getElementById('c-247').checked,
           response_hours: nv('c-resp'),
           onsite_hours: nv('c-onsite-h'),
           resolve_hours: nv('c-resolve'),
@@ -4240,6 +4865,18 @@
         var saved = re.error ? row : re.data;
         state.contracts[site.id] = saved;
         await recomputeContractTickets(site.id, saved);
+        /* v6: sync contract <-> contact links (multi contacts per contract). */
+        if (state.v6 && saved.id) {
+          var selC = Array.prototype.map.call(
+            document.querySelectorAll('.cc-contact:checked'), function (el) { return el.value; });
+          await sb.from('ltsa_contract_contacts').delete().eq('contract_id', saved.id);
+          if (selC.length) {
+            var lr = await sb.from('ltsa_contract_contacts').insert(
+              selC.map(function (cid) { return { contract_id: saved.id, contact_id: cid }; }));
+            if (lr.error) throw lr.error;
+          }
+          state.contractContacts[saved.id] = selC;
+        }
         close(); toast(t('sites.contractSaved'), 'ok'); done();
       } catch (e) { apiError(e); btn.disabled = false; }
     };
