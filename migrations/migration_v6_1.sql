@@ -19,16 +19,39 @@
  * ========================================================================== */
 
 -- --------------------------------------------------------------------------
--- 1. spare_parts — extra inventory columns
+-- 0. prerequisites — self-contained (added 2026-10-20; this file must not
+--    depend on migration_v6 having run: it defines what it uses).
 -- --------------------------------------------------------------------------
-ALTER TABLE spare_parts ADD COLUMN IF NOT EXISTS location     TEXT;
-ALTER TABLE spare_parts ADD COLUMN IF NOT EXISTS target_stock NUMERIC;
-ALTER TABLE spare_parts ADD COLUMN IF NOT EXISTS part_number  TEXT;
-ALTER TABLE spare_parts ADD COLUMN IF NOT EXISTS criticality  TEXT;
-ALTER TABLE spare_parts ADD COLUMN IF NOT EXISTS supplier     TEXT;
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
-CREATE INDEX IF NOT EXISTS idx_spare_parts_part_number
-  ON spare_parts (part_number);
+CREATE OR REPLACE FUNCTION set_updated_at() RETURNS TRIGGER AS $$
+BEGIN
+  NEW.updated_at = now();
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- --------------------------------------------------------------------------
+-- 1. spare_parts — extra inventory columns
+-- (guarded: the table may not exist in this production DB)
+-- --------------------------------------------------------------------------
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.tables
+    WHERE table_schema = 'public' AND table_name = 'spare_parts'
+  ) THEN
+    ALTER TABLE spare_parts ADD COLUMN IF NOT EXISTS location     TEXT;
+    ALTER TABLE spare_parts ADD COLUMN IF NOT EXISTS target_stock NUMERIC;
+    ALTER TABLE spare_parts ADD COLUMN IF NOT EXISTS part_number  TEXT;
+    ALTER TABLE spare_parts ADD COLUMN IF NOT EXISTS criticality  TEXT;
+    ALTER TABLE spare_parts ADD COLUMN IF NOT EXISTS supplier     TEXT;
+    CREATE INDEX IF NOT EXISTS idx_spare_parts_part_number
+      ON spare_parts (part_number);
+  ELSE
+    RAISE NOTICE 'v6.1: spare_parts table not found — section 1 skipped';
+  END IF;
+END $$;
 
 -- --------------------------------------------------------------------------
 -- 2. contacts.group_name — free-form group label from Key People sheet

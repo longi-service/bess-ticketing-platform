@@ -7,7 +7,14 @@
  * All statements are idempotent.
  *
  * Covers requirement v7.7–v7.14 (email + mobile explicitly OUT of scope).
+ *
+ * ROBUSTNESS (2026-10-20 fix): self-contained — CREATE EXTENSION pgcrypto
+ * is included; the tickets self-FK (parent_ticket_id) is added adaptively
+ * after probing the real PK; ALTERs on ticket_links / ticket_attachments
+ * are guarded by table-existence checks. Prints "v7 probe → ..." NOTICEs.
  * ========================================================================== */
+
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
 -- --------------------------------------------------------------------------
 -- 7/10. tickets — tracker, workflow key, parent (master/sub), custom values,
@@ -15,10 +22,42 @@
 -- --------------------------------------------------------------------------
 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS tracker TEXT NOT NULL DEFAULT 'support';
 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS workflow_key TEXT NOT NULL DEFAULT 'ci';
-ALTER TABLE tickets ADD COLUMN IF NOT EXISTS parent_ticket_id UUID
-  REFERENCES tickets(id) ON DELETE SET NULL;
+ALTER TABLE tickets ADD COLUMN IF NOT EXISTS parent_ticket_id UUID;
 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS custom_values JSONB NOT NULL DEFAULT '{}';
 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS planned_date DATE;
+
+-- adaptive self-FK: probe the real tickets PK first (never hard-code id)
+DO $$
+DECLARE
+  t_col TEXT; t_typ TEXT;
+BEGIN
+  SELECT kcu.column_name, c.data_type INTO t_col, t_typ
+  FROM information_schema.table_constraints tc
+  JOIN information_schema.key_column_usage kcu
+    ON tc.constraint_name = kcu.constraint_name
+   AND tc.table_schema   = kcu.table_schema
+  JOIN information_schema.columns c
+    ON c.table_schema = kcu.table_schema
+   AND c.table_name   = kcu.table_name
+   AND c.column_name  = kcu.column_name
+  WHERE tc.table_schema = 'public' AND tc.table_name = 'tickets'
+    AND tc.constraint_type = 'PRIMARY KEY'
+  ORDER BY kcu.ordinal_position LIMIT 1;
+  RAISE NOTICE 'v7 probe → tickets PK: %.%', COALESCE(t_col, '?'), COALESCE(t_typ, '?');
+  IF t_col IS NOT NULL AND t_typ = 'uuid'
+     AND NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_tickets_parent') THEN
+    BEGIN
+      EXECUTE format(
+        'ALTER TABLE tickets ADD CONSTRAINT fk_tickets_parent FOREIGN KEY (parent_ticket_id) REFERENCES tickets(%I) ON DELETE SET NULL',
+        t_col);
+      RAISE NOTICE 'v7: fk_tickets_parent → tickets(%) created', t_col;
+    EXCEPTION WHEN OTHERS THEN
+      RAISE NOTICE 'v7: fk_tickets_parent skipped: %', SQLERRM;
+    END;
+  ELSE
+    RAISE NOTICE 'v7: fk_tickets_parent skipped (tickets PK % not uuid-referenceable)', COALESCE(t_col, 'missing');
+  END IF;
+END $$;
 
 DO $$
 BEGIN
@@ -35,12 +74,20 @@ CREATE INDEX IF NOT EXISTS idx_tickets_tracker ON tickets (tracker);
 CREATE INDEX IF NOT EXISTS idx_tickets_parent  ON tickets (parent_ticket_id);
 
 -- ticket_links — link type (related / subtask / approval)
-ALTER TABLE ticket_links ADD COLUMN IF NOT EXISTS link_type TEXT NOT NULL DEFAULT 'related';
+-- (guarded: the table may not exist in this production DB)
 DO $$
 BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ticket_links_type_chk') THEN
-    ALTER TABLE ticket_links ADD CONSTRAINT ticket_links_type_chk
-      CHECK (link_type IN ('related', 'subtask', 'approval'));
+  IF EXISTS (
+    SELECT 1 FROM information_schema.tables
+    WHERE table_schema = 'public' AND table_name = 'ticket_links'
+  ) THEN
+    ALTER TABLE ticket_links ADD COLUMN IF NOT EXISTS link_type TEXT NOT NULL DEFAULT 'related';
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ticket_links_type_chk') THEN
+      ALTER TABLE ticket_links ADD CONSTRAINT ticket_links_type_chk
+        CHECK (link_type IN ('related', 'subtask', 'approval'));
+    END IF;
+  ELSE
+    RAISE NOTICE 'v7: ticket_links table not found — link_type skipped';
   END IF;
 END $$;
 
@@ -133,18 +180,26 @@ ON CONFLICT DO NOTHING;
 
 -- --------------------------------------------------------------------------
 -- 11. ticket_attachments — kind + meta (service report w/ signature)
+-- (guarded: the table may not exist in this production DB)
 -- --------------------------------------------------------------------------
-ALTER TABLE ticket_attachments ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'photo';
-ALTER TABLE ticket_attachments ADD COLUMN IF NOT EXISTS meta JSONB NOT NULL DEFAULT '{}';
 DO $$
 BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ticket_attachments_kind_chk') THEN
-    ALTER TABLE ticket_attachments ADD CONSTRAINT ticket_attachments_kind_chk
-      CHECK (kind IN ('photo', 'service_report', 'other'));
+  IF EXISTS (
+    SELECT 1 FROM information_schema.tables
+    WHERE table_schema = 'public' AND table_name = 'ticket_attachments'
+  ) THEN
+    ALTER TABLE ticket_attachments ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'photo';
+    ALTER TABLE ticket_attachments ADD COLUMN IF NOT EXISTS meta JSONB NOT NULL DEFAULT '{}';
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ticket_attachments_kind_chk') THEN
+      ALTER TABLE ticket_attachments ADD CONSTRAINT ticket_attachments_kind_chk
+        CHECK (kind IN ('photo', 'service_report', 'other'));
+    END IF;
+    CREATE INDEX IF NOT EXISTS idx_attachments_ticket_kind
+      ON ticket_attachments (ticket_id, kind);
+  ELSE
+    RAISE NOTICE 'v7: ticket_attachments table not found — kind/meta skipped';
   END IF;
 END $$;
-CREATE INDEX IF NOT EXISTS idx_attachments_ticket_kind
-  ON ticket_attachments (ticket_id, kind);
 
 -- --------------------------------------------------------------------------
 -- 14. custom_fields — 9 types, bound to trackers, simplified visibility

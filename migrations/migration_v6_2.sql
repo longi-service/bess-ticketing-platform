@@ -18,6 +18,19 @@
  * ========================================================================== */
 
 -- --------------------------------------------------------------------------
+-- 0. prerequisites — self-contained (added 2026-10-20; this file must not
+--    depend on any other migration having run: it defines what it uses).
+-- --------------------------------------------------------------------------
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+CREATE OR REPLACE FUNCTION set_updated_at() RETURNS TRIGGER AS $$
+BEGIN
+  NEW.updated_at = now();
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- --------------------------------------------------------------------------
 -- 1. app_settings — tiny key/value store
 -- --------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS app_settings (
