@@ -2277,26 +2277,35 @@
     document.getElementById('m-cancel').onclick = close;
     var canvas = document.getElementById('sr-sig');
     var ctx2 = canvas.getContext('2d');
-    var drawing = false, hasInk = false;
+    var drawing = false, hasDrawn = false;
     function pos(e) {
       var r = canvas.getBoundingClientRect();
       var src = e.touches ? e.touches[0] : e;
       return { x: (src.clientX - r.left) * (canvas.width / r.width),
                y: (src.clientY - r.top) * (canvas.height / r.height) };
     }
-    function down(e) { drawing = true; var p = pos(e); ctx2.beginPath(); ctx2.moveTo(p.x, p.y); e.preventDefault(); }
+    /* v7.2: ANY stroke start (pointer/mouse/touch) marks the pad as drawn.
+       Previously hasInk was only set inside move() after a mouse/touch
+       down, so pointer-driven input (and a simple tap) never registered
+       and the saved report kept reporting "signature missing". */
+    function down(e) {
+      drawing = true; hasDrawn = true;
+      var p = pos(e); ctx2.beginPath(); ctx2.moveTo(p.x, p.y); e.preventDefault();
+    }
     function move(e) {
       if (!drawing) return;
       var p = pos(e); ctx2.lineTo(p.x, p.y); ctx2.strokeStyle = '#1f2937'; ctx2.lineWidth = 2; ctx2.stroke();
-      hasInk = true;
+      hasDrawn = true;
     }
     function up() { drawing = false; }
+    canvas.addEventListener('pointerdown', down); canvas.addEventListener('pointermove', move);
+    canvas.addEventListener('pointerup', up); canvas.addEventListener('pointercancel', up);
     canvas.addEventListener('mousedown', down); canvas.addEventListener('mousemove', move);
     canvas.addEventListener('mouseup', up); canvas.addEventListener('mouseleave', up);
     canvas.addEventListener('touchstart', down); canvas.addEventListener('touchmove', move);
     canvas.addEventListener('touchend', up);
     document.getElementById('sr-clear').onclick = function () {
-      ctx2.clearRect(0, 0, canvas.width, canvas.height); hasInk = false;
+      ctx2.clearRect(0, 0, canvas.width, canvas.height); hasDrawn = false;
     };
     document.getElementById('m-save').onclick = async function () {
       var btn = this; btn.disabled = true;
@@ -2304,17 +2313,23 @@
         var fileEl = document.getElementById('sr-file');
         var file = fileEl.files && fileEl.files[0];
         if (!file) { toast(t('new.fillRequired'), 'error'); btn.disabled = false; return; }
-        var signed = document.getElementById('sr-signed').checked && hasInk;
+        /* v7.2: ink on the pad alone attests the signature (previously
+           signed required the checkbox AND ink, so a drawn signature was
+           still saved as unsigned). The checkbox remains as a manual
+           attestation for reports the customer signed on paper. */
+        var signed = hasDrawn || document.getElementById('sr-signed').checked;
         var path = L.photoPath(ticket.id, file.name, state.profile.id);
+        /* v7.2: upsert — the report path is deterministic (ticket/user/
+           filename), so re-saving the same file must overwrite, not 409. */
         var up = await sb.storage.from('ticket-photos').upload(path, file, {
-          contentType: file.type || 'application/octet-stream', upsert: false
+          contentType: file.type || 'application/octet-stream', upsert: true
         });
         if (up.error) throw up.error;
         var ins = await sb.from('ticket_attachments').insert({
           ticket_id: ticket.id, storage_path: path, file_name: file.name,
           content_type: file.type || null, size_bytes: file.size || null,
           uploaded_by: state.profile.id, kind: 'service_report',
-          meta: { signed: signed, signature: signed ? canvas.toDataURL('image/png') : null }
+          meta: { signed: signed, signature: hasDrawn ? canvas.toDataURL('image/png') : null }
         });
         if (ins.error) throw ins.error;
         toast(t('ticket.reportSaved'), 'ok');
@@ -2581,7 +2596,7 @@
   async function uploadPhoto(ticket, file) {
     var path = L.photoPath(ticket.id, file.name);
     var up = await sb.storage.from('ticket-photos').upload(path, file, {
-      contentType: file.type || 'application/octet-stream', upsert: false
+      contentType: file.type || 'application/octet-stream', upsert: true
     });
     if (up.error) throw up.error;
     var ins = await sb.from('ticket_attachments').insert({
@@ -2626,18 +2641,29 @@
           : '') +
       '</div>';
     }).join('') + '</div>';
-    el.querySelectorAll('[data-del]').forEach(function (b) {
-      b.onclick = async function () {
+    /* v7.2: ONE delegated handler on the gallery container. The old
+       per-button onclick bindings were attached to nodes built after
+       several awaits and were stranded whenever the gallery HTML was
+       rebuilt, leaving the ✕ visible but inert. The container node
+       itself survives innerHTML rebuilds, and onclick assignment keeps
+       repeat renders idempotent. Steps unchanged: confirm → delete the
+       ticket_attachments row → remove the storage object → re-render. */
+    el.onclick = function (e) {
+      var b = e.target;
+      while (b && b !== el && !(b.getAttribute && b.getAttribute('data-del'))) b = b.parentNode;
+      if (!b || b === el) return;
+      var delId = b.getAttribute('data-del'), delPath = b.getAttribute('data-path');
+      (async function () {
         if (!window.confirm(t('detail.deletePhotoConfirm'))) return;
         try {
-          var dr = await sb.from('ticket_attachments').delete().eq('id', b.getAttribute('data-del'));
+          var dr = await sb.from('ticket_attachments').delete().eq('id', delId);
           if (dr.error) throw dr.error;
-          try { await sb.storage.from('ticket-photos').remove([b.getAttribute('data-path')]); } catch (e) {}
+          try { await sb.storage.from('ticket-photos').remove([delPath]); } catch (e2) {}
           toast(t('common.deleted'), 'ok');
           render();
-        } catch (e) { apiError(e); }
-      };
-    });
+        } catch (e3) { apiError(e3); }
+      })();
+    };
   }
 
   /* v3 U7: icon timeline — each event kind gets its own icon dot + color,
@@ -5447,7 +5473,7 @@
         /* v6.1: Massimo writes "TBD" for unknown emails (3 of 10
            engineers) — a placeholder is "no email", not a row error. */
         if ((impEntity === 'contacts' || impEntity === 'engineers') && rec.email &&
-            (L.isNaLike(rec.email) || rec.email.toUpperCase() === 'TBD')) rec.email = '';
+            (L.isNaLike(rec.email) || (rec.email || '').toUpperCase() === 'TBD')) rec.email = '';
         var errs = [];
         fields.forEach(function (f) {
           if (f.req && !rec[f.key]) errs.push(impLabel(f));
@@ -5654,7 +5680,7 @@
               description: rec.description || null
             };
             if (rec.parent_code && !L.isNaLike(rec.parent_code)) {
-              var ps = siteByCode[rec.parent_code.toUpperCase()];
+              var ps = siteByCode[(rec.parent_code || '').toUpperCase()];
               if (!ps) throw new Error('parent site not found: ' + rec.parent_code);
               sfields.parent_site_id = ps.id;
             }
@@ -5670,7 +5696,11 @@
                 if (oid) sfields.remote_owner_id = oid;
               }
             }
-            var sr2 = await sb.from('sites').upsert(sfields, { onConflict: 'code' }).select('id,code');
+            /* v7.2: .single() — without it data is an ARRAY and the
+               siteByCode registration below read .code off it (undefined
+               → toUpperCase crash AFTER the row was already upserted,
+               so imported sites were reported as failed). */
+            var sr2 = await sb.from('sites').upsert(sfields, { onConflict: 'code' }).select('id,code').single();
             if (sr2.error) throw sr2.error;
             siteByCode[sr2.data.code.toUpperCase()] = sr2.data;
           } else if (impEntity === 'warehouses') {
@@ -5685,11 +5715,12 @@
               delivery_notes: rec.delivery_notes || null
             };
             if (rec.parent_code) {
-              var pw = whByCode[rec.parent_code.toUpperCase()];
+              var pw = whByCode[(rec.parent_code || '').toUpperCase()];
               if (!pw) throw new Error('parent warehouse not found: ' + rec.parent_code);
               wfields.parent_warehouse_id = pw.id;
             }
-            var wr2 = await sb.from('warehouses').upsert(wfields, { onConflict: 'code' }).select('id,code');
+            /* v7.2: .single() — same array-data crash as the sites branch. */
+            var wr2 = await sb.from('warehouses').upsert(wfields, { onConflict: 'code' }).select('id,code').single();
             if (wr2.error) throw wr2.error;
             whByCode[wr2.data.code.toUpperCase()] = wr2.data;
           } else if (impEntity === 'contacts' || impEntity === 'engineers') {
