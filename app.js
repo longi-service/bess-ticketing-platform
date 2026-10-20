@@ -2318,9 +2318,12 @@
            still saved as unsigned). The checkbox remains as a manual
            attestation for reports the customer signed on paper. */
         var signed = hasDrawn || document.getElementById('sr-signed').checked;
-        var path = L.photoPath(ticket.id, file.name, state.profile.id);
-        /* v7.2: upsert — the report path is deterministic (ticket/user/
-           filename), so re-saving the same file must overwrite, not 409. */
+        var path = L.photoPath(ticket.id, file.name);
+        /* v7.3: no uid segment — with uid the path is deterministic
+           (ticket/user/filename), so re-saving the same file hits the SAME
+           storage object and upsert's UPDATE leg is RLS-denied (the bucket
+           has no UPDATE policy). A random unique path keeps every save a
+           pure INSERT, exactly like uploadPhoto. */
         var up = await sb.storage.from('ticket-photos').upload(path, file, {
           contentType: file.type || 'application/octet-stream', upsert: true
         });
@@ -4598,6 +4601,12 @@
         };
         var errs = L.validateCustomFieldDef(Object.assign({ key: field.key || 'tmp' }, row));
         if (errs.length) { toast(t(errs[0].code), 'error'); btn.disabled = false; return; }
+        /* v7.3: custom_fields.label_en/label_zh are both NOT NULL in the
+           DB, while the form/validator only require at least one — mirror
+           the filled side into the empty one so the write cannot trip the
+           not-null constraint. Both-empty was already rejected above. */
+        if (!row.label_en) row.label_en = row.label_zh;
+        if (!row.label_zh) row.label_zh = row.label_en;
         if (field.key) row.key = field.key;
         else row.key = document.getElementById('cfi-key').value.trim();
         if (!row.key) { toast(t('new.fillRequired'), 'error'); btn.disabled = false; return; }
