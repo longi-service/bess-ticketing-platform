@@ -592,6 +592,39 @@ eq('dayState Date object works', L.dayState(null, new Date(2026, 9, 10)), 'weeke
   ok('fieldVisibleIn restricted', L.fieldVisibleIn({ visible_statuses: ['open'] }, 'open')
     && !L.fieldVisibleIn({ visible_statuses: ['open'] }, 'closed'));
 
+  // validateCustomFieldDef (v7.1 fix — the function was missing entirely)
+  const cfCodes = (d) => L.validateCustomFieldDef(d).map((e) => e.code);
+  eq('validateCustomFieldDef valid text',
+    cfCodes({ key: 'x_note', type: 'text', label_en: 'Note', label_zh: '', options: [], trackers: ['support'] }), []);
+  eq('validateCustomFieldDef valid dropdown',
+    cfCodes({ key: 'severity2', type: 'dropdown', label_zh: '等级', options: ['a', 'b'], trackers: ['support', 'quality'] }), []);
+  eq('validateCustomFieldDef no trackers key ok',
+    cfCodes({ key: 'f_x', type: 'number', label_en: 'N' }), []);
+  ok('validateCustomFieldDef err shape', (() => {
+    const e = L.validateCustomFieldDef({});
+    return Array.isArray(e) && e.length > 0 && typeof e[0].code === 'string';
+  })());
+  ok('validateCustomFieldDef key required',
+    cfCodes({ type: 'text', label_en: 'X' }).includes('cf.err.keyRequired'));
+  ok('validateCustomFieldDef key format',
+    cfCodes({ key: 'Bad Key', type: 'text', label_en: 'X' }).includes('cf.err.keyFormat'));
+  ok('validateCustomFieldDef key format digit start',
+    cfCodes({ key: '9lives', type: 'text', label_en: 'X' }).includes('cf.err.keyFormat'));
+  ok('validateCustomFieldDef bad type',
+    cfCodes({ key: 'ok_key', type: 'magic', label_en: 'X' }).includes('cf.err.type'));
+  ok('validateCustomFieldDef label missing',
+    cfCodes({ key: 'ok_key', type: 'text', label_en: ' ', label_zh: null }).includes('cf.err.label'));
+  ok('validateCustomFieldDef dropdown needs options',
+    cfCodes({ key: 'ok_key', type: 'dropdown', label_en: 'X', options: [] }).includes('cf.err.options'));
+  ok('validateCustomFieldDef checklist needs options',
+    cfCodes({ key: 'ok_key', type: 'checklist', label_en: 'X', options: [' ', ''] }).includes('cf.err.options'));
+  ok('validateCustomFieldDef text ignores options',
+    !cfCodes({ key: 'ok_key', type: 'text', label_en: 'X', options: [] }).includes('cf.err.options'));
+  ok('validateCustomFieldDef bad tracker',
+    cfCodes({ key: 'ok_key', type: 'text', label_en: 'X', trackers: ['nope'] }).includes('cf.err.trackers'));
+  ok('validateCustomFieldDef empty trackers',
+    cfCodes({ key: 'ok_key', type: 'text', label_en: 'X', trackers: [] }).includes('cf.err.trackers'));
+
   // canCloseTicket
   eq('canCloseTicket no report', L.canCloseTicket({}, [], {}).reason, 'service_report_missing');
   eq('canCloseTicket unsigned', L.canCloseTicket({}, [{ kind: 'service_report', meta: {} }], {}).reason, 'signature_missing');

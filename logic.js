@@ -1007,6 +1007,39 @@
   }
 
   /**
+   * validateCustomFieldDef(def) → array of { code } error entries
+   * (empty = valid). `code` is an i18n key; the UI toasts t(errs[0].code).
+   * def mirrors the custom_fields row built by the field editor:
+   * { key, type, label_en, label_zh, options, trackers, show_in_states,
+   *   required, is_active }.
+   */
+  function validateCustomFieldDef(def) {
+    var errs = [];
+    def = def || {};
+    var key = String(def.key == null ? '' : def.key).trim();
+    if (!key) errs.push({ code: 'cf.err.keyRequired' });
+    else if (!/^[a-z][a-z0-9_]*$/.test(key)) errs.push({ code: 'cf.err.keyFormat' });
+    if (CF_TYPES.indexOf(def.type) === -1) errs.push({ code: 'cf.err.type' });
+    var hasLabel = !!String(def.label_en || '').trim() ||
+                   !!String(def.label_zh || '').trim();
+    if (!hasLabel) errs.push({ code: 'cf.err.label' });
+    if (def.type === 'dropdown' || def.type === 'checklist') {
+      var opts = (Array.isArray(def.options) ? def.options : [])
+        .map(function (o) { return String(o == null ? '' : o).trim(); })
+        .filter(Boolean);
+      if (!opts.length) errs.push({ code: 'cf.err.options' });
+    }
+    if (def.trackers !== undefined && def.trackers !== null) {
+      var trks = Array.isArray(def.trackers) ? def.trackers : [];
+      if (!trks.length ||
+          trks.some(function (k) { return TRACKER_KEYS.indexOf(k) === -1; })) {
+        errs.push({ code: 'cf.err.trackers' });
+      }
+    }
+    return errs;
+  }
+
+  /**
    * canCloseTicket(ticket, attachments) → { ok, reason }.
    * v7.11: closing requires an uploaded service report (kind
    * 'service_report'); the report should carry a customer signature
@@ -1235,6 +1268,7 @@
     allowedTransitionsWf: allowedTransitionsWf,
     CF_TYPES: CF_TYPES,
     fieldVisibleIn: fieldVisibleIn,
+    validateCustomFieldDef: validateCustomFieldDef,
     validateCustomValues: validateCustomValues,
     canCloseTicket: canCloseTicket,
     monthlyPlanDates: monthlyPlanDates,
