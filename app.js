@@ -1098,7 +1098,7 @@
         counter(t('dash.plannedMaint'),
                 state.v7 ? maintThisMonth(tickets).done + '/' + maintThisMonth(tickets).total : '—',
                 false, '#/tickets') +
-        counter(t('dash.breachedSla') + ' / 30d',
+        counter(t('dash.slaRisk'),
                 open.filter(function (x) { return L.ticketSla(x).response.state === 'warning' ||
                   L.ticketSla(x).onsite.state === 'warning' || L.ticketSla(x).resolution.state === 'warning'; }).length,
                 false, '#/tickets') +
