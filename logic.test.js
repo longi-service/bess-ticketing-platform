@@ -47,6 +47,8 @@ const EXPECT_CAN = {
   'plan.view':             { admin:1, dispatcher:1, pm:1, engineer:1, customer:0 }, /* v5: customers excluded */
   'plan.manage':           { admin:1, dispatcher:1, pm:0, engineer:0, customer:0 },
   'contract.manage':       { admin:1, dispatcher:1, pm:0, engineer:0, customer:0 },
+  /* v6.1 additions */
+  'group.manage':          { admin:1, dispatcher:1, pm:1, engineer:0, customer:0 },
 };
 Object.keys(EXPECT_CAN).forEach(perm => {
   ROLES.forEach(role => {
@@ -604,6 +606,79 @@ eq('dayState Date object works', L.dayState(null, new Date(2026, 9, 10)), 'weeke
   eq('maintenanceProgress', L.maintenanceProgress(
     [{ status: 'closed' }, { status: 'open' }, { status: 'resolved' }, { status: 'in_progress' }]),
     { total: 4, done: 2, pct: 50 });
+})();
+
+/* ------------------------------------------------------------------ */
+/* 9. v6.1 — Massimo Excel import compatibility helpers               */
+/* ------------------------------------------------------------------ */
+(function v61() {
+  // parseCoordinate
+  eq('parseCoordinate decimal', L.parseCoordinate('42.35'), 42.35);
+  eq('parseCoordinate negative', L.parseCoordinate('-11.61'), -11.61);
+  eq('parseCoordinate comma', L.parseCoordinate('42,35'), 42.35);
+  ok('parseCoordinate DMS N', Math.abs(L.parseCoordinate('42°22\'47.8"N') - 42.37994) < 0.0001);
+  ok('parseCoordinate DMS E', Math.abs(L.parseCoordinate('11°33\'09.2"E') - 11.55256) < 0.0001);
+  ok('parseCoordinate DMS S negative', L.parseCoordinate('10°30\'00"S') < 0);
+  ok('parseCoordinate DMS W negative', L.parseCoordinate('10°30\'00"W') < 0);
+  ok('parseCoordinate deg+min', Math.abs(L.parseCoordinate('42°22.79\'N') - (42 + 22.79 / 60)) < 0.0001);
+  ok('parseCoordinate bad min>=60', L.parseCoordinate('42°75\'00"N') === null);
+  ok('parseCoordinate junk', L.parseCoordinate('hello') === null);
+  ok('parseCoordinate empty', L.parseCoordinate('') === null && L.parseCoordinate(null) === null);
+
+  // extractEmails
+  eq('extractEmails two+prose', L.extractEmails('massimomarchetti@longi.com\nbenalihassan@longi.com\n\nIMPORTANT: CREATE ANOTHER EMAIL'),
+    ['massimomarchetti@longi.com', 'benalihassan@longi.com']);
+  eq('extractEmails comma', L.extractEmails('a@x.com, b@y.org'), ['a@x.com', 'b@y.org']);
+  eq('extractEmails dedupe+lower', L.extractEmails('A@x.com a@X.com'), ['a@x.com']);
+  eq('extractEmails none', L.extractEmails('no emails here'), []);
+
+  // isNaLike
+  ok('isNaLike NA', L.isNaLike('NA') && L.isNaLike('n/a') && L.isNaLike('NA (what do you mean?)'));
+  ok('isNaLike dash', L.isNaLike('-'));
+  ok('isNaLike false for real', !L.isNaLike('IT-MONT-01') && !L.isNaLike('') && !L.isNaLike('Nadia'));
+
+  // splitFullName
+  eq('splitFullName two', L.splitFullName('Massimo Marchetti'), { first: 'Massimo', last: 'Marchetti' });
+  eq('splitFullName three', L.splitFullName('Jan van Dam'), { first: 'Jan', last: 'van Dam' });
+  eq('splitFullName single', L.splitFullName('Madonna'), { first: 'Madonna', last: '' });
+  eq('splitFullName empty', L.splitFullName(''), { first: '', last: '' });
+
+  // normalizeWarehouseType
+  eq('normalizeWarehouseType variants', [L.normalizeWarehouseType('On-site'), L.normalizeWarehouseType('OFF_SITE'),
+    L.normalizeWarehouseType('off-site'), L.normalizeWarehouseType('junk')],
+    ['on_site', 'off_site', 'off_site', null]);
+
+  // normalizeOwner
+  eq('normalizeOwner', [L.normalizeOwner('CUSTOMER'), L.normalizeOwner('longi'), L.normalizeOwner('x')],
+    ['customer', 'longi', null]);
+
+  // normalizeAvailability
+  eq('normalizeAvailability fraction', L.normalizeAvailability('0.98'), 98);
+  eq('normalizeAvailability pct', L.normalizeAvailability('98'), 98);
+  eq('normalizeAvailability empty', L.normalizeAvailability(''), null);
+  ok('normalizeAvailability bad', L.normalizeAvailability('abc') === null);
+
+  // coverageIs247
+  ok('coverageIs247', L.coverageIs247('24/7') && L.coverageIs247(' 24 / 7 ') && !L.coverageIs247('8x5'));
+
+  // resolveSiteScope — name first, then code
+  const sites = [{ id: 's1', code: 'IT-MONT-01', name: 'Montalto di Castro' }, { id: 's2', code: 'PL-WAW-01', name: 'Warsaw' }];
+  eq('resolveSiteScope by name', L.resolveSiteScope('Montalto di Castro', sites), ['s1']);
+  eq('resolveSiteScope by code', L.resolveSiteScope('pl-waw-01', sites), ['s2']);
+  eq('resolveSiteScope multi+dedupe', L.resolveSiteScope('Montalto di Castro, IT-MONT-01', sites), ['s1']);
+  eq('resolveSiteScope unknown', L.resolveSiteScope('Nowhere', sites), []);
+  /* city fallback: Massimo writes "Montalto di Castro" while the site is
+     named 'Montalto " La Viola"' */
+  eq('resolveSiteScope by city', L.resolveSiteScope('montalto di castro',
+    [{ id: 's9', code: 'IT-MONT-01', name: 'Montalto " La Viola"', city: 'Montalto di Castro' }]), ['s9']);
+
+  // normKey + findWarehouse
+  eq('normKey dash unify', L.normKey('Montalto – REPSIT warehouse'), 'montalto - repsit warehouse');
+  const whs = [{ id: 'w1', code: 'MTL-WH01', name: 'Montalto – REPSIT warehouse' }, { id: 'w2', code: 'WH-EU-01', name: 'EU central' }];
+  eq('findWarehouse by code', L.findWarehouse('mtl-wh01', whs).id, 'w1');
+  eq('findWarehouse by name', L.findWarehouse('Montalto – REPSIT warehouse', whs).id, 'w1');
+  ok('findWarehouse miss', L.findWarehouse('nope', whs) === null);
+  ok('findWarehouse empty', L.findWarehouse('', whs) === null);
 })();
 
 /* ------------------------------------------------------------------ */

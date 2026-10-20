@@ -386,6 +386,23 @@
         }
       } catch (e) { /* v7 features fall back to logic.js templates */ }
     }
+    /* v6.1: feature probe — groups exists only after migration_v6_1.
+       New-column writes (contacts.group_name, contact_projects.role,
+       sites.default_group_id, tickets.assigned_group_id, spare_parts
+       extra columns) are gated on this flag so old backends keep working. */
+    state.v61 = false; state.groups = []; state.groupMembers = [];
+    try {
+      var v61p = await sb.from('groups').select('id', { count: 'exact', head: true });
+      state.v61 = !v61p.error;
+    } catch (e) { state.v61 = false; }
+    if (state.v61) {
+      try {
+        var gr = await sb.from('groups').select('*').order('name');
+        if (!gr.error) state.groups = gr.data || [];
+        var gmr = await sb.from('group_members').select('*');
+        if (!gmr.error) state.groupMembers = gmr.data || [];
+      } catch (e) { /* groups stay empty */ }
+    }
   }
 
   /**
@@ -489,6 +506,8 @@
     if (filters.source) q = q.eq('source', filters.source);
     if (filters.site) q = q.eq('site_id', filters.site);
     if (filters.assignee) q = q.eq('assigned_to', filters.assignee);
+    /* v6.1: support group filter (column only exists after migration_v6_1). */
+    if (filters.group) q = q.eq('assigned_group_id', filters.group);
     if (filters.tag) q = q.contains('tags', [filters.tag]);
     // v3 F6: customer filter resolves to that customer's site ids.
     if (filters.customer) {
@@ -552,7 +571,7 @@
     var ms = h.match(/^#\/site\/([0-9a-f-]{36})$/i);
     if (ms) return { name: 'site', id: ms[1] };
     var name = h.replace(/^#\//, '').split('?')[0];
-    if (['login', 'dashboard', 'tickets', 'new', 'parts', 'planning', 'calendar', 'users', 'sites', 'sla-alerts', 'contacts', 'workflow', 'fields'].indexOf(name) === -1) name = 'dashboard';
+    if (['login', 'dashboard', 'tickets', 'new', 'parts', 'planning', 'calendar', 'users', 'sites', 'sla-alerts', 'contacts', 'workflow', 'fields', 'groups'].indexOf(name) === -1) name = 'dashboard';
     return { name: name };
   }
 
@@ -601,6 +620,8 @@
       else if (route.name === 'users') { if (guard('user.manage')) await viewUsers(view); }
       else if (route.name === 'sites') { if (guard('site.manage')) await viewSites(view); }
       else if (route.name === 'contacts') { if (guard('contact.manage')) await viewContacts(view); }
+      /* v6.1: support groups management */
+      else if (route.name === 'groups') { if (guard('group.manage')) await viewGroups(view); }
       else if (route.name === 'workflow') { if (guard('workflow.manage')) await viewWorkflow(view); }
       else if (route.name === 'fields') { if (guard('field.manage')) await viewCustomFields(view); }
       else if (route.name === 'sla-alerts') {
@@ -634,6 +655,8 @@
       { title: t('nav.group.manage'), links: [
         { id: 'sites',     href: '#/sites',     label: t('nav.sites'),     perm: 'site.manage' },
         { id: 'contacts',  href: '#/contacts',  label: t('nav.contacts'),  perm: 'contact.manage' },
+        /* v6.1: support groups (dispatch rules per Massimo) */
+        { id: 'groups',    href: '#/groups',    label: t('nav.groups'),    perm: 'group.manage' },
         { id: 'workflow',  href: '#/workflow',  label: t('nav.workflow'),  perm: 'workflow.manage' },
         { id: 'fields',    href: '#/fields',    label: t('nav.fields'),    perm: 'field.manage' },
         { id: 'users',     href: '#/users',     label: t('nav.users'),     perm: 'user.manage' }
@@ -1237,7 +1260,11 @@
         '<td>' + priBadge(x.priority) + '</td>' +
         '<td class="muted">' + esc(siteShort(x.site_id)) + '</td>' +
         '<td>' + (x.assigned_to ? esc(displayName(x.assigned_to))
-                                : '<span class="pill-unassigned">' + esc(t('list.unassigned')) + '</span>') + '</td>' +
+                                : '<span class="pill-unassigned">' + esc(t('list.unassigned')) + '</span>') +
+          /* v6.1: routed support group badge */
+          (state.v61 && x.assigned_group_id
+            ? ' <span class="badge status-assigned">' + esc(groupName(x.assigned_group_id)) + '</span>' : '') +
+        '</td>' +
         '<td>' + badge(bCls, bLbl) +
              (x.escalated ? ' ' + badge('escalated', t('detail.escalated')) : '') + '</td>' +
         '<td class="muted">' + esc(fmtDate(x.updated_at)) + '</td>' +
@@ -1255,7 +1282,11 @@
         '<td>' + priBadge(x.priority) + '</td>' +
         '<td class="muted">' + esc(siteShort(x.site_id)) + '</td>' +
         '<td>' + (x.assigned_to ? esc(displayName(x.assigned_to))
-                                : '<span class="pill-unassigned">' + esc(t('list.unassigned')) + '</span>') + '</td>' +
+                                : '<span class="pill-unassigned">' + esc(t('list.unassigned')) + '</span>') +
+          /* v6.1: routed support group badge */
+          (state.v61 && x.assigned_group_id
+            ? ' <span class="badge status-assigned">' + esc(groupName(x.assigned_group_id)) + '</span>' : '') +
+        '</td>' +
         '<td>' + badge(bCls, bLbl) +
              (x.escalated ? ' ' + badge('escalated', t('detail.escalated')) : '') + '</td>' +
         '<td class="muted">' + esc(fmtDate(x.updated_at)) + '</td>' +
@@ -1311,7 +1342,7 @@
   var VIEWS_KEY = 'bess_views';
   function blankFilters() {
     return { status: '', tracker: '', priority: '', source: '', site: '', assignee: '', q: '', tag: '', customer: '',
-             unassignedOnly: false, contractOnly: false };
+             unassignedOnly: false, contractOnly: false, group: '' /* v6.1 */ };
   }
   function loadSavedViews() {
     try {
@@ -1352,7 +1383,7 @@
 
     var role = state.profile.role;
     var filtersActive = !!(f.status || f.priority || f.source || f.site || f.q || f.tag || f.customer ||
-                           f.unassignedOnly || f.contractOnly); // v3 U6 quick filters count too
+                           f.unassignedOnly || f.contractOnly || f.group); // v3 U6 quick filters count too
     var scopeLimited = role === 'engineer' || role === 'customer' ||
       (role === 'pm' && (state.profile.project_scope || []).length > 0);
     /* v3 D7: "Showing X of Y" = loaded rows vs. filter matches (all pages). */
@@ -1417,6 +1448,15 @@
           '<select id="f-source">' + selectOpts(L.SOURCES, 'source.', f.source) + '</select></div>' +
         '<div class="f"><label>' + esc(t('list.filter.site')) + '</label>' +
           '<select id="f-site">' + siteOpts + '</select></div>' +
+        /* v6.1: support group filter */
+        (state.v61
+          ? '<div class="f"><label>' + esc(t('list.filter.group')) + '</label>' +
+            '<select id="f-group"><option value="">' + esc(t('common.all')) + '</option>' +
+            state.groups.map(function (g) {
+              return '<option value="' + g.id + '"' + (f.group === g.id ? ' selected' : '') + '>' +
+                esc(g.name) + '</option>';
+            }).join('') + '</select></div>'
+          : '') +
         (state.v3
           ? '<div class="f"><label>' + esc(t('list.filter.tag')) + '</label>' +
             '<input type="text" id="f-tag" placeholder="' + esc(t('list.filter.tagPh')) +
@@ -1466,6 +1506,8 @@
       f.source = document.getElementById('f-source').value;
       f.site = document.getElementById('f-site').value;
       f.q = document.getElementById('f-q').value;
+      var grpEl = document.getElementById('f-group');
+      if (grpEl) f.group = grpEl.value;
       var tagEl = document.getElementById('f-tag');
       if (tagEl) f.tag = tagEl.value.trim();
       var custEl = document.getElementById('f-customer');
@@ -1483,7 +1525,7 @@
     document.getElementById('qf-contract').onclick = function () {
       f.contractOnly = !f.contractOnly; render();
     };
-    ['f-status', 'f-tracker', 'f-priority', 'f-source', 'f-site'].forEach(function (id) {
+    ['f-status', 'f-tracker', 'f-priority', 'f-source', 'f-site', 'f-group'].forEach(function (id) {
       var el = document.getElementById(id);
       if (el) el.onchange = refetch;
     });
@@ -2253,7 +2295,20 @@
       '<dl class="kv" style="margin-bottom:12px">' +
         '<dt>' + esc(t('detail.assignee')) + '</dt><dd>' + esc(displayName(ticket.assigned_to)) + '</dd>' +
         '<dt>' + esc(t('detail.plannedCheckAt')) + '</dt><dd>' + esc(fmtDate(ticket.planned_check_at)) + '</dd>' +
+        /* v6.1: routed support group on the assignee card. */
+        (state.v61
+          ? '<dt>' + esc(t('detail.assignedGroup')) + '</dt><dd>' +
+            esc(ticket.assigned_group_id ? groupName(ticket.assigned_group_id) : '—') + '</dd>'
+          : '') +
       '</dl>' +
+      (state.v61
+        ? '<div class="field"><label>' + esc(t('detail.assignedGroup')) + '</label>' +
+          '<select id="assign-group"><option value="">' + esc(t('common.none')) + '</option>' +
+          state.groups.filter(function (g) { return g.is_active !== false; }).map(function (g) {
+            return '<option value="' + g.id + '"' +
+              (ticket.assigned_group_id === g.id ? ' selected' : '') + '>' + esc(g.name) + '</option>';
+          }).join('') + '</select></div>'
+        : '') +
       '<div class="field"><label>' + esc(t('assign.ranked')) +
         (siteRegion ? ' <span class="muted">· ' + esc(t('assign.siteRegion')) + ': ' +
           esc(regionName(siteRegion)) + '</span>' : '') + '</label>' +
@@ -2267,11 +2322,17 @@
       '</div>';
     document.getElementById('assign-btn').onclick = async function () {
       var engId = candidateValue('assign-eng');
-      if (!engId) { toast(t('users.pickEngineer'), 'error'); return; }
+      /* v6.1: the ticket can be routed to a support group even without
+         picking an individual engineer. */
+      var gsel = document.getElementById('assign-group');
+      var gid = gsel ? (gsel.value || null) : null;
+      if (!engId && !(state.v61 && gid)) { toast(t('users.pickEngineer'), 'error'); return; }
       var planned = document.getElementById('assign-planned').value;
       var btn = this; btn.disabled = true;
       try {
-        var patch = { assigned_to: engId, planned_check_at: planned ? new Date(planned).toISOString() : null };
+        var patch = { planned_check_at: planned ? new Date(planned).toISOString() : null };
+        if (engId) patch.assigned_to = engId;
+        if (state.v61) patch.assigned_group_id = gid;
         // Assigning from "open" also moves the ticket to "assigned" (contract §5).
         if (ticket.status === 'open') patch.status = 'assigned';
         var r = await sb.from('tickets').update(patch).eq('id', ticket.id);
@@ -2991,6 +3052,15 @@
           }).join('') + '</select>' +
           '<div class="inline-err" id="nt-contract-notice" style="display:none;margin-top:8px;margin-bottom:0">' +
             esc(t('new.contractNotice')) + '</div></div>' +
+        /* v6.1: support group assignment — defaults to the site's
+           default group (Massimo's dispatch rule). */
+        (state.v61
+          ? '<div class="field"><label>' + esc(t('new.field.group')) + '</label>' +
+            '<select id="nt-group"><option value="">' + esc(t('common.none')) + '</option>' +
+            state.groups.filter(function (g) { return g.is_active !== false; }).map(function (g) {
+              return '<option value="' + g.id + '">' + esc(g.name) + '</option>';
+            }).join('') + '</select></div>'
+          : '') +
         '<div class="field"><label>' + esc(t('detail.serialNumber')) + star('nt-serial') + '</label>' +
           '<input type="text" id="nt-serial"' + reqAttr('nt-serial') + '>' + ifKnown + '</div>' +
         '<div class="field"><label>' + esc(t('detail.firmwareVersion')) + star('nt-fw') + '</label>' +
@@ -3045,6 +3115,12 @@
         notice.style.display = 'block';
       } else {
         priSel.disabled = false; notice.style.display = 'none';
+      }
+      /* v6.1: route to the site's default support group. */
+      var gsel = document.getElementById('nt-group');
+      if (gsel) {
+        var st = state.sites.filter(function (x) { return x.id === siteSel.value; })[0];
+        gsel.value = (st && st.default_group_id) || '';
       }
     }
     siteSel.onchange = refreshContractState;
@@ -3135,6 +3211,12 @@
         if (state.v3) {
           var tagEl = document.getElementById('nt-tags');
           insData.tags = tagEl ? parseTags(tagEl.value) : [];
+        }
+        /* v6.1: support group routing (manual pick or site default). */
+        if (state.v61) {
+          var gEl = document.getElementById('nt-group');
+          insData.assigned_group_id = gEl ? (gEl.value || null)
+            : ((siteRow && siteRow.default_group_id) || null);
         }
         var ins = await sb.from('tickets').insert(insData).select('id,ticket_no').single();
         if (ins.error) throw ins.error;
@@ -3711,6 +3793,200 @@
     });
   }
 
+  /* v6.1: support groups — people (login profiles and/or external
+     contacts) grouped for ticket dispatch (Massimo's dispatch rules).
+     Gated on state.v61 (migration_v6_1). */
+  function groupMemberName(m) {
+    if (m.member_type === 'contact') {
+      var c = state.contacts.filter(function (x) { return x.id === m.member_id; })[0];
+      if (!c) return m.member_id;
+      var nm = ((c.first_name || '') + ' ' + (c.last_name || '')).trim() || c.email || m.member_id;
+      return nm + (c.company ? ' · ' + c.company : '');
+    }
+    return displayName(m.member_id);
+  }
+
+  function groupName(id) {
+    var g = state.groups.filter(function (x) { return x.id === id; })[0];
+    return g ? g.name : (id ? id.slice(0, 8) + '…' : t('common.unassigned'));
+  }
+
+  async function viewGroups(view) {
+    if (!state.v61) {
+      view.innerHTML = '<div class="page"><div class="inline-err">' +
+        esc(t('common.migrationRequired').replace('{v}', 'v6.1')) + '</div></div>';
+      return;
+    }
+    var needIds = [];
+    state.groupMembers.forEach(function (m) {
+      if (m.member_type === 'profile' && !state.nameCache[m.member_id]) needIds.push(m.member_id);
+    });
+    if (needIds.length) await resolveNames(needIds);
+    var memByGroup = {};
+    state.groupMembers.forEach(function (m) {
+      (memByGroup[m.group_id] = memByGroup[m.group_id] || []).push(m);
+    });
+    var rows = state.groups.map(function (g) {
+      return '<tr><td><b>' + esc(g.name) + '</b></td>' +
+        '<td class="muted">' + esc(g.description || '—') + '</td>' +
+        '<td>' + (memByGroup[g.id] || []).length + '</td>' +
+        '<td>' + badge(g.is_active === false ? 'status-closed' : 'sla-ok',
+            t(g.is_active === false ? 'groups.inactive' : 'groups.active')) + '</td>' +
+        '<td><button class="btn btn-sm" data-gmem="' + g.id + '">' + esc(t('groups.members')) + '</button> ' +
+        '<button class="btn btn-sm" data-gedit="' + g.id + '">' + esc(t('common.edit')) + '</button> ' +
+        '<button class="btn btn-sm btn-danger" data-gdel="' + g.id + '">' + esc(t('common.delete')) + '</button></td></tr>';
+    }).join('');
+    view.innerHTML =
+      '<div class="page-head"><h1>' + esc(t('groups.title')) + '</h1>' +
+      '<button class="btn btn-primary" id="group-new">+ ' + esc(t('groups.new')) + '</button></div>' +
+      '<p class="muted">' + esc(t('groups.sub')) + '</p>' +
+      '<div class="card"><div style="overflow-x:auto"><table class="tbl"><thead><tr>' +
+      '<th>' + esc(t('groups.name')) + '</th><th>' + esc(t('groups.description')) + '</th>' +
+      '<th>' + esc(t('groups.members')) + '</th><th>' + esc(t('groups.active')) + '</th>' +
+      '<th>' + esc(t('common.actions')) + '</th>' +
+      '</tr></thead><tbody>' +
+      (rows || '<tr><td colspan="5"><div class="empty">' + esc(t('groups.none')) + '</div></td></tr>') +
+      '</tbody></table></div></div>';
+    function refresh() { loadReferenceData().then(function () { viewGroups(view); }); }
+    document.getElementById('group-new').onclick = function () {
+      openGroupModal(null, refresh);
+    };
+    view.querySelectorAll('[data-gedit]').forEach(function (b) {
+      b.onclick = function () {
+        var g = state.groups.filter(function (x) { return x.id === b.getAttribute('data-gedit'); })[0];
+        openGroupModal(g, refresh);
+      };
+    });
+    view.querySelectorAll('[data-gmem]').forEach(function (b) {
+      b.onclick = function () {
+        var g = state.groups.filter(function (x) { return x.id === b.getAttribute('data-gmem'); })[0];
+        openGroupMembersModal(g, refresh);
+      };
+    });
+    view.querySelectorAll('[data-gdel]').forEach(function (b) {
+      b.onclick = async function () {
+        var g = state.groups.filter(function (x) { return x.id === b.getAttribute('data-gdel'); })[0];
+        if (!g || !window.confirm(t('groups.confirmDelete'))) return;
+        var r = await sb.from('groups').delete().eq('id', g.id);
+        if (r.error) { apiError(r.error); return; }
+        toast(t('groups.deleted'), 'ok');
+        refresh();
+      };
+    });
+  }
+
+  function openGroupModal(group, done) {
+    group = group || {};
+    var body =
+      '<div class="field"><label>' + esc(t('groups.name')) + '<span class="req">*</span></label>' +
+        '<input type="text" id="g-name" value="' + esc(group.name || '') + '"></div>' +
+      '<div class="field"><label>' + esc(t('groups.description')) + '</label>' +
+        '<textarea id="g-desc" style="height:52px">' + esc(group.description || '') + '</textarea></div>' +
+      '<div class="field"><label><input type="checkbox" id="g-active"' +
+        (group.is_active !== false ? ' checked' : '') + '> ' + esc(t('groups.active')) + '</label></div>';
+    var close = openModal(group.id ? t('groups.edit') : t('groups.new'), body,
+      '<button class="btn" id="m-cancel">' + esc(t('common.cancel')) + '</button>' +
+      '<button class="btn btn-primary" id="m-save">' + esc(t('common.save')) + '</button>');
+    document.getElementById('m-cancel').onclick = close;
+    document.getElementById('m-save').onclick = async function () {
+      var btn = this; btn.disabled = true;
+      try {
+        var row = {
+          name: document.getElementById('g-name').value.trim(),
+          description: document.getElementById('g-desc').value.trim() || null,
+          is_active: document.getElementById('g-active').checked
+        };
+        if (!row.name) { toast(t('new.fillRequired'), 'error'); btn.disabled = false; return; }
+        var r = group.id
+          ? await sb.from('groups').update(row).eq('id', group.id)
+          : await sb.from('groups').insert(row);
+        if (r.error) throw r.error;
+        toast(t('groups.saved'), 'ok');
+        close(); done();
+      } catch (e) { apiError(e); btn.disabled = false; }
+    };
+  }
+
+  async function openGroupMembersModal(group, done) {
+    var pr = await sb.from('profiles').select('id,display_name,email,role')
+      .eq('is_active', true).order('display_name');
+    var profiles = pr.error ? [] : (pr.data || []).filter(function (u) { return u.role !== 'customer'; });
+    profiles.forEach(function (u) { state.nameCache[u.id] = u.display_name || u.email; });
+    function memberRow(m) {
+      return '<div class="li" style="display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--border)">' +
+        '<div style="flex:1"><b>' + esc(groupMemberName(m)) + '</b>' +
+        '<div class="muted" style="font-size:12px">' + esc(t('groups.type.' + m.member_type)) +
+        (m.role ? ' · ' + esc(m.role) : '') + '</div></div>' +
+        '<button class="btn btn-sm btn-danger" data-mdel="' + m.member_type + ':' + m.member_id + '">' +
+        esc(t('groups.remove')) + '</button></div>';
+    }
+    var mems = state.groupMembers.filter(function (m) { return m.group_id === group.id; });
+    var body =
+      '<div id="gm-list">' +
+      (mems.map(memberRow).join('') || '<div class="empty">' + esc(t('groups.noMembers')) + '</div>') + '</div>' +
+      '<div class="form-row" style="margin-top:14px">' +
+        '<div class="field"><label>' + esc(t('groups.memberType')) + '</label>' +
+          '<select id="gm-type"><option value="profile">' + esc(t('groups.type.profile')) + '</option>' +
+          '<option value="contact">' + esc(t('groups.type.contact')) + '</option></select></div>' +
+        '<div class="field"><label>' + esc(t('groups.member')) + '</label>' +
+          '<select id="gm-member"></select></div>' +
+      '</div>' +
+      '<div class="field"><label>' + esc(t('groups.role')) + '</label>' +
+        '<input type="text" id="gm-role" placeholder="' + esc(t('groups.rolePh')) + '"></div>';
+    var close = openModal(t('groups.members') + ' — ' + group.name, body,
+      '<button class="btn" id="m-cancel">' + esc(t('common.cancel')) + '</button>' +
+      '<button class="btn btn-primary" id="gm-add">' + esc(t('groups.addMember')) + '</button>');
+    function fillMembers() {
+      var type = document.getElementById('gm-type').value;
+      var sel = document.getElementById('gm-member');
+      var taken = {};
+      state.groupMembers.forEach(function (m) {
+        if (m.group_id === group.id && m.member_type === type) taken[m.member_id] = true;
+      });
+      var opts = '';
+      if (type === 'profile') {
+        opts = profiles.filter(function (u) { return !taken[u.id]; }).map(function (u) {
+          return '<option value="' + u.id + '">' + esc((u.display_name || u.email) + ' (' + t('role.' + u.role) + ')') + '</option>';
+        }).join('');
+      } else {
+        opts = state.contacts.filter(function (c) { return !taken[c.id]; }).map(function (c) {
+          return '<option value="' + c.id + '">' +
+            esc(((c.first_name || '') + ' ' + (c.last_name || '')).trim() || c.email || c.id) + '</option>';
+        }).join('');
+      }
+      sel.innerHTML = opts || '<option value="">' + esc(t('common.none')) + '</option>';
+    }
+    document.getElementById('gm-type').onchange = fillMembers;
+    fillMembers();
+    document.getElementById('m-cancel').onclick = close;
+    document.getElementById('gm-add').onclick = async function () {
+      var btn = this; btn.disabled = true;
+      try {
+        var mid = document.getElementById('gm-member').value;
+        if (!mid) { toast(t('groups.pickMember'), 'error'); btn.disabled = false; return; }
+        var r = await sb.from('group_members').insert({
+          group_id: group.id,
+          member_type: document.getElementById('gm-type').value,
+          member_id: mid,
+          role: document.getElementById('gm-role').value.trim() || null
+        });
+        if (r.error) throw r.error;
+        toast(t('groups.saved'), 'ok');
+        close(); done();
+      } catch (e) { apiError(e); btn.disabled = false; }
+    };
+    document.getElementById('gm-list').querySelectorAll('[data-mdel]').forEach(function (b) {
+      b.onclick = async function () {
+        var parts = b.getAttribute('data-mdel').split(':');
+        var r = await sb.from('group_members').delete()
+          .eq('group_id', group.id).eq('member_type', parts[0]).eq('member_id', parts[1]);
+        if (r.error) { apiError(r.error); return; }
+        toast(t('groups.saved'), 'ok');
+        close(); done();
+      };
+    });
+  }
+
   /* v7.8: workflow management — states CRUD + transition matrix per
      template (C&I / Utility). DB rows drive ticketTransitions() at runtime. */
   async function viewWorkflow(view) {
@@ -3973,15 +4249,23 @@
     }
     var linked = {};
     state.contactProjects.forEach(function (r) {
-      if (r.contact_id === contact.id) linked[r.site_id] = true;
+      if (r.contact_id === contact.id) linked[r.site_id] = r;
     });
     var tree = L.buildSiteTree(state.sites.slice());
     function projChecks(list, depth) {
       var h = '';
       list.forEach(function (s) {
+        var lk = linked[s.id];
         h += '<label style="display:block;padding:3px 0 3px ' + (depth * 22) + 'px;font-weight:normal">' +
           '<input type="checkbox" class="cp-proj" value="' + s.id + '"' +
-          (linked[s.id] ? ' checked' : '') + '> ' + esc(s.code + ' — ' + s.name) + '</label>';
+          (lk ? ' checked' : '') + '> ' + esc(s.code + ' — ' + s.name) +
+          /* v6.1: per-project role (Field Service Technician, …) */
+          (state.v61
+            ? ' <input type="text" class="cp-role" data-site="' + s.id + '"' +
+              ' placeholder="' + esc(t('contacts.siteRole')) + '"' +
+              ' value="' + esc((lk && lk.role) || '') + '"' +
+              ' style="width:170px;margin-left:8px">'
+            : '') + '</label>';
         h += projChecks(s.children, depth + 1);
       });
       return h;
@@ -4044,8 +4328,17 @@
           document.querySelectorAll('.cp-proj:checked'), function (el) { return el.value; });
         await sb.from('contact_projects').delete().eq('contact_id', saved.id);
         if (sel.length) {
-          var pr = await sb.from('contact_projects').insert(
-            sel.map(function (sid) { return { contact_id: saved.id, site_id: sid }; }));
+          var prow = sel.map(function (sid) {
+            var link = { contact_id: saved.id, site_id: sid };
+            /* v6.1: per-project role (gated — column only exists after migration_v6_1). */
+            if (state.v61) {
+              var ri = document.querySelector('.cp-role[data-site="' + sid + '"]');
+              var rv = ri ? ri.value.trim() : '';
+              if (rv) link.role = rv;
+            }
+            return link;
+          });
+          var pr = await sb.from('contact_projects').insert(prow);
           if (pr.error) throw pr.error;
         }
         toast(t('contacts.saved'), 'ok');
@@ -4167,6 +4460,16 @@
           esc(t('sites.workflowDefault')) + '</option>' +
         '<option value="inherit"' + (site.workflow_mode === 'inherit' ? ' selected' : '') + '>' +
           esc(t('sites.workflowInherit')) + '</option></select></div>' +
+      /* v6.1: default support group — new tickets for this site are
+         auto-routed to it (Massimo's dispatch rule). */
+      (state.v61
+        ? '<div class="field"><label>' + esc(t('sites.defaultGroup')) + '</label>' +
+          '<select id="s-group"><option value="">' + esc(t('common.none')) + '</option>' +
+          state.groups.filter(function (g) { return g.is_active !== false; }).map(function (g) {
+            return '<option value="' + g.id + '"' + (site.default_group_id === g.id ? ' selected' : '') + '>' +
+              esc(g.name) + '</option>';
+          }).join('') + '</select></div>'
+        : '') +
       '<div class="field"><label>' + esc(t('sites.parentSite')) + '</label>' +
         '<select id="s-parent"><option value="">' + esc(t('sites.noParent')) + '</option>' +
         state.sites.filter(function (x) { return !forbiddenParent[x.id]; }).map(function (x) {
@@ -4232,6 +4535,11 @@
         if (state.v3) {
           var custSel = document.getElementById('s-customer');
           fields.customer_id = custSel ? (custSel.value || null) : (site.customer_id || null);
+        }
+        /* v6.1: default support group (gated — column only exists after migration_v6_1). */
+        if (state.v61) {
+          var grpSel = document.getElementById('s-group');
+          fields.default_group_id = grpSel ? (grpSel.value || null) : (site.default_group_id || null);
         }
         if (fields.country) fields.country = fields.country.toUpperCase();
         var r = site.id
@@ -4550,19 +4858,31 @@
   var IMPORT_FIELDS = [
     { key: 'code', req: true }, { key: 'name', req: true },
     { key: 'warehouse_code', req: true }, { key: 'qty', req: true },
-    { key: 'category', req: false }, { key: 'unit', req: false }, { key: 'min_qty', req: false }
+    { key: 'category', req: false }, { key: 'unit', req: false }, { key: 'min_qty', req: false },
+    /* v6.1: Massimo inventory columns */
+    { key: 'owner', req: false }, { key: 'location', req: false },
+    { key: 'target_stock', req: false }, { key: 'part_number', req: false },
+    { key: 'criticality', req: false }, { key: 'supplier', req: false }
   ];
   /* v6.5: multi-entity import. Each entity: fields (key/req/label/aliases),
      template row, and a run(rec) writer. 'parts' keeps the legacy flow. */
   var IMPORT_ENTITIES = {
     parts: { fields: IMPORT_FIELDS, aliases: {
-      code: ['code', 'partcode', 'partno', 'sku', 'itemcode'],
-      name: ['name', 'partname', 'description', 'desc', 'itemname'],
+      /* v6.1: 'id' / 'descriptionen' / 'stockonhand' / 'minstock' match
+         Massimo's sheet (ID, Description EN, Stock on hand, Min. stock). */
+      code: ['code', 'partcode', 'partno', 'sku', 'itemcode', 'id'],
+      name: ['name', 'partname', 'description', 'desc', 'itemname', 'descriptionen'],
       warehouse_code: ['warehousecode', 'warehouse', 'whcode', 'wh', 'location'],
-      qty: ['qty', 'quantity', 'stock', 'amount', 'count'],
-      category: ['category', 'cat', 'type', 'group'], unit: ['unit', 'uom'],
-      min_qty: ['minqty', 'min', 'minimum', 'safetystock', 'reorder'],
-      owner: ['owner', 'ownership'] },
+      qty: ['qty', 'quantity', 'stock', 'amount', 'count', 'stockonhand'],
+      category: ['category', 'cat', 'type', 'group', 'component'],
+      unit: ['unit', 'uom'],
+      min_qty: ['minqty', 'min', 'minimum', 'safetystock', 'reorder', 'minstock'],
+      owner: ['owner', 'ownership'],
+      location: ['locationpalletshelfbin', 'bin', 'shelf', 'pallet'],
+      target_stock: ['targetstock'],
+      part_number: ['partnumber', 'pn', 'longipn', 'longipotispn', 'potispn'],
+      criticality: ['criticality'],
+      supplier: ['supplier', 'primarysupplier'] },
       template: 'code,name,warehouse_code,qty,category,unit,min_qty,owner\nBAT-001,Battery module,WH-EU-01,10, ESS,pcs,2,longi' },
     sites: { fields: [
       { key: 'code', req: true, label: 'Site code' }, { key: 'name', req: true, label: 'Site name' },
@@ -4573,7 +4893,8 @@
       { key: 'remote_owner_email', req: false, label: 'Remote owner email' },
       { key: 'description', req: false, label: 'Description' } ], aliases: {
       code: ['code', 'sitecode'], name: ['name', 'sitename'],
-      country: ['country'], city: ['city'], address: ['address'],
+      /* v6.1: Massimo's bilingual header normalizes to 'countryiso'. */
+      country: ['country', 'countryiso'], city: ['city'], address: ['address'],
       latitude: ['latitude', 'lat'], longitude: ['longitude', 'lng', 'lon'],
       parent_code: ['parentcode', 'parentsitecode', 'parent'],
       remote_owner_email: ['remoteowneremail', 'owneremail', 'owner'],
@@ -4587,20 +4908,29 @@
       { key: 'contact_name', req: false, label: 'Contact name' },
       { key: 'contact_phone', req: false, label: 'Contact phone' },
       { key: 'contact_email', req: false, label: 'Contact email' },
-      { key: 'delivery_notes', req: false, label: 'Delivery notes' } ], aliases: {
+      /* v6.1: prefix match — Massimo's header is the long
+         "Delivery notes (opening hours, delivery instructions…)". */
+      { key: 'delivery_notes', req: false, label: 'Delivery notes', prefix: true } ], aliases: {
       code: ['code', 'warehousecode'], name: ['name', 'warehousename'],
       parent_code: ['parentcode', 'parentwarehousecode', 'parent'],
       type: ['type', 'warehousetype'], address: ['address'],
-      contact_name: ['contactname'], contact_phone: ['contactphone'],
-      contact_email: ['contactemail'], delivery_notes: ['deliverynotes', 'notes'] },
+      /* v6.1: 'contactperson' / 'mobilephone' / 'email' match Massimo's
+         sheet (Contact person, Mobile phone, E-mail). */
+      contact_name: ['contactname', 'contactperson'],
+      contact_phone: ['contactphone', 'mobilephone', 'mobile'],
+      contact_email: ['contactemail', 'email', 'mail'],
+      delivery_notes: ['deliverynotes', 'delivery'] },
       template: 'code,name,parent_code,type,address,contact_name,contact_phone\nWH-EU-01,EU central warehouse,,off_site, Rotterdam NL,Jan Jansen,+31101234567' },
     contacts: { fields: [
       { key: 'first_name', req: true, label: 'First name' }, { key: 'last_name', req: false, label: 'Last name' },
       { key: 'company', req: false, label: 'Company' }, { key: 'role', req: false, label: 'Role' },
-      { key: 'phone', req: false, label: 'Phone' }, { key: 'email', req: false, label: 'Email' } ], aliases: {
+      { key: 'phone', req: false, label: 'Phone' }, { key: 'email', req: false, label: 'Email' },
+      /* v6.1: Key People "Group" column → contacts.group_name */
+      { key: 'group_name', req: false, label: 'Group' } ], aliases: {
       first_name: ['firstname', 'name', 'givenname'], last_name: ['lastname', 'surname', 'familyname'],
       company: ['company', 'organisation', 'organization'], role: ['role', 'title', 'position'],
-      phone: ['phone', 'mobile', 'tel'], email: ['email', 'mail'] },
+      phone: ['phone', 'mobile', 'tel'], email: ['email', 'mail'],
+      group_name: ['groupname', 'group'] },
       template: 'first_name,last_name,company,role,phone,email\nMario,Rossi,Rapsody,Field technician,+393331234567,mario.rossi@rapsody.it' },
     contracts: { fields: [
       { key: 'site_code', req: true, label: 'Site code' },
@@ -4629,10 +4959,20 @@
     engineers: { fields: [
       { key: 'first_name', req: true, label: 'First name' }, { key: 'last_name', req: false, label: 'Last name' },
       { key: 'company', req: false, label: 'Company' }, { key: 'role', req: false, label: 'Role' },
-      { key: 'phone', req: false, label: 'Phone' }, { key: 'email', req: false, label: 'Email' } ], aliases: {
+      { key: 'phone', req: false, label: 'Phone' }, { key: 'email', req: false, label: 'Email' },
+      /* v6.1: Massimo Engineers sheet columns */
+      { key: 'country', req: false, label: 'Country (2-letter)' },
+      { key: 'skills', req: false, label: 'Skills' },
+      { key: 'cert_level', req: false, label: 'Cert level' },
+      { key: 'project_scope', req: false, label: 'Project scope (site names)' },
+      { key: 'language', req: false, label: 'Language' } ], aliases: {
       first_name: ['firstname', 'name', 'givenname'], last_name: ['lastname', 'surname', 'familyname'],
       company: ['company', 'organisation', 'organization'], role: ['role', 'title', 'position'],
-      phone: ['phone', 'mobile', 'tel'], email: ['email', 'mail'] },
+      phone: ['phone', 'mobile', 'tel'], email: ['email', 'mail'],
+      country: ['country', 'countryiso'], skills: ['skills', 'skill'],
+      cert_level: ['certlevel', 'certification', 'cert'],
+      project_scope: ['projectscope', 'scope'],
+      language: ['language', 'languages', 'lang'] },
       template: 'first_name,last_name,company,role,phone,email\nHassan,Benali,LONGi EU,Field technician,+393331234567,hassan.benali@longi.com' }
   };
   function parseDelimited(text) {
@@ -4670,6 +5010,17 @@
       var keys = ((aliases || {})[f.key]) || [f.key];
       for (var i = 0; i < norm.length; i++) {
         if (keys.indexOf(norm[i]) !== -1) { map[f.key] = headers[i]; break; }
+      }
+      /* v6.1: prefix fallback for flagged fields — exact match first,
+         so generic headers keep existing behavior. */
+      if (map[f.key] == null && f.prefix) {
+        for (var j = 0; j < norm.length; j++) {
+          var hit = false;
+          for (var k = 0; k < keys.length; k++) {
+            if (norm[j].indexOf(keys[k]) === 0 && norm[j].length > keys[k].length) { hit = true; break; }
+          }
+          if (hit) { map[f.key] = headers[j]; break; }
+        }
       }
       if (map[f.key] == null) map[f.key] = '';
     });
@@ -4739,24 +5090,36 @@
           var hi = parsed.headers.indexOf(mapping[f.key]);
           rec[f.key] = hi === -1 ? '' : (cells[hi] || '').trim();
         });
+        /* v6.1: Key People / Engineers sheets carry a single "Name"
+           column — split into first/last for display + writers. */
+        if ((impEntity === 'contacts' || impEntity === 'engineers') &&
+            rec.first_name && !rec.last_name) {
+          var sp = L.splitFullName(rec.first_name);
+          rec.first_name = sp.first; rec.last_name = sp.last;
+        }
+        /* v6.1: Massimo writes "TBD" for unknown emails (3 of 10
+           engineers) — a placeholder is "no email", not a row error. */
+        if ((impEntity === 'contacts' || impEntity === 'engineers') && rec.email &&
+            (L.isNaLike(rec.email) || rec.email.toUpperCase() === 'TBD')) rec.email = '';
         var errs = [];
         fields.forEach(function (f) {
           if (f.req && !rec[f.key]) errs.push(impLabel(f));
         });
         /* entity-specific checks */
         if (impEntity === 'parts') {
-          if (rec.warehouse_code && !whByCode[rec.warehouse_code.toUpperCase()])
+          if (rec.warehouse_code && !L.findWarehouse(rec.warehouse_code, warehouses))
             errs.push(t('parts.imp.badWh'));
           if (rec.qty === '' || isNaN(Number(rec.qty))) errs.push(impLabel({ key: 'qty', label: 'qty' }));
           if (rec.min_qty && isNaN(Number(rec.min_qty))) errs.push(impLabel({ key: 'min_qty', label: 'min_qty' }));
-          if (rec.owner && ['longi', 'customer'].indexOf(rec.owner.toLowerCase()) === -1)
+          if (rec.target_stock && isNaN(Number(rec.target_stock))) errs.push(impLabel({ key: 'target_stock', label: 'target_stock' }));
+          if (rec.owner && !L.normalizeOwner(rec.owner))
             errs.push('owner');
         } else if (impEntity === 'sites') {
-          if (rec.latitude && isNaN(Number(rec.latitude))) errs.push('latitude');
-          if (rec.longitude && isNaN(Number(rec.longitude))) errs.push('longitude');
+          if (rec.latitude && L.parseCoordinate(rec.latitude) == null) errs.push('latitude');
+          if (rec.longitude && L.parseCoordinate(rec.longitude) == null) errs.push('longitude');
           if (rec.country && rec.country.length !== 2) errs.push('country');
         } else if (impEntity === 'warehouses') {
-          if (rec.type && ['on_site', 'off_site'].indexOf(rec.type.toLowerCase()) === -1) errs.push('type');
+          if (rec.type && !L.normalizeWarehouseType(rec.type)) errs.push('type');
         } else if (impEntity === 'contacts' || impEntity === 'engineers') {
           if (rec.email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(rec.email)) errs.push('email');
         } else if (impEntity === 'contracts') {
@@ -4874,13 +5237,27 @@
           .replace('{i}', String(i + 1)).replace('{n}', String(rows.length))) + '</div>';
         try {
           if (impEntity === 'parts') {
-            var up = await sb.from('spare_parts').upsert({
+            /* v6.1: extra inventory columns (migration_v6_1; gated so old
+               backends without the columns keep working). */
+            var partRow = {
               code: rec.code, name: rec.name,
               category: rec.category || null, unit: rec.unit || null,
-              owner: (rec.owner || 'longi').toLowerCase()
-            }, { onConflict: 'code' }).select('id').single();
+              owner: L.normalizeOwner(rec.owner) || 'longi'
+            };
+            if (state.v61) {
+              if (rec.location) partRow.location = rec.location;
+              if (rec.target_stock !== '' && !isNaN(Number(rec.target_stock)))
+                partRow.target_stock = Number(rec.target_stock);
+              if (rec.part_number) partRow.part_number = rec.part_number;
+              if (rec.criticality) partRow.criticality = rec.criticality;
+              if (rec.supplier) partRow.supplier = rec.supplier;
+            }
+            var up = await sb.from('spare_parts').upsert(partRow, { onConflict: 'code' }).select('id').single();
             if (up.error) throw up.error;
-            var wh = whByCode[rec.warehouse_code.toUpperCase()];
+            /* v6.1: warehouse may be given by code OR by name
+               (Massimo's sheet writes names). */
+            var wh = L.findWarehouse(rec.warehouse_code, warehouses);
+            if (!wh) throw new Error(t('parts.imp.badWh') + ': ' + rec.warehouse_code);
             var cur = await sb.from('stock_levels').select('id,qty')
               .eq('warehouse_id', wh.id).eq('part_id', up.data.id).maybeSingle();
             if (cur.error) throw cur.error;
@@ -4902,18 +5279,27 @@
               code: rec.code, name: rec.name,
               country: (rec.country || '').toUpperCase() || null,
               city: rec.city || null, address: rec.address || null,
-              latitude: rec.latitude === '' ? null : Number(rec.latitude),
-              longitude: rec.longitude === '' ? null : Number(rec.longitude),
+              /* v6.1: DMS coordinates from Massimo's sheet. */
+              latitude: L.parseCoordinate(rec.latitude),
+              longitude: L.parseCoordinate(rec.longitude),
               description: rec.description || null
             };
-            if (rec.parent_code) {
+            if (rec.parent_code && !L.isNaLike(rec.parent_code)) {
               var ps = siteByCode[rec.parent_code.toUpperCase()];
               if (!ps) throw new Error('parent site not found: ' + rec.parent_code);
               sfields.parent_site_id = ps.id;
             }
             if (rec.remote_owner_email) {
-              var oid = profByEmail[rec.remote_owner_email.toLowerCase()];
-              if (oid) sfields.remote_owner_id = oid;
+              /* v6.1: MULTIPLE mailboxes (newline/comma separated, prose
+                 around them is ignored). The full list is stored
+                 comma-separated; the first mailbox still resolves the
+                 legacy remote_owner_id profile link. */
+              var mailList = L.extractEmails(rec.remote_owner_email);
+              if (mailList.length) {
+                if (state.v61) sfields.remote_owner_email = mailList.join(',');
+                var oid = profByEmail[mailList[0]];
+                if (oid) sfields.remote_owner_id = oid;
+              }
             }
             var sr2 = await sb.from('sites').upsert(sfields, { onConflict: 'code' }).select('id,code');
             if (sr2.error) throw sr2.error;
@@ -4921,7 +5307,8 @@
           } else if (impEntity === 'warehouses') {
             var wfields = {
               code: rec.code, name: rec.name,
-              type: (rec.type || '').toLowerCase() || null,
+              /* v6.1: "On-site"/"Off-site" → on_site/off_site. */
+              type: L.normalizeWarehouseType(rec.type),
               address: rec.address || null,
               contact_name: rec.contact_name || null,
               contact_phone: rec.contact_phone || null,
@@ -4943,27 +5330,61 @@
               role: rec.role || (impEntity === 'engineers' ? 'engineer' : null),
               phone: rec.phone || null, email: rec.email || null
             };
+            /* v6.1: Key People "Group" column (gated by migration_v6_1). */
+            if (state.v61 && rec.group_name) cfields.group_name = rec.group_name;
+            /* v6.1: engineers' Project Scope = site NAMES (fallback codes). */
+            var scopeIds = (impEntity === 'engineers' && rec.project_scope)
+              ? L.resolveSiteScope(rec.project_scope, state.sites) : [];
+            if (impEntity === 'engineers' && cfields.email) {
+              /* If a login profile already exists for this email, enrich
+                 the profile master data instead of duplicating a contact. */
+              var pex = await sb.from('profiles').select('id').eq('email', cfields.email).maybeSingle();
+              if (pex.error) throw pex.error;
+              if (pex.data) {
+                var pfields = {};
+                if (rec.country) pfields.country = rec.country.toUpperCase();
+                if (rec.skills) pfields.skills = rec.skills;
+                var cl = String(rec.cert_level || '').toLowerCase();
+                if (cl === 'associate' || cl === 'professional') pfields.cert_level = cl;
+                if (rec.language) pfields.language = rec.language.toLowerCase().indexOf('zh') !== -1 ? 'zh' : 'en';
+                if (scopeIds.length) pfields.project_scope = scopeIds;
+                var pur = await sb.from('profiles').update(pfields).eq('id', pex.data.id);
+                if (pur.error) throw pur.error;
+                okN++; continue;
+              }
+            }
             if (cfields.email) {
               var ex = await sb.from('contacts').select('id').eq('email', cfields.email).maybeSingle();
               if (ex.error) throw ex.error;
               if (ex.data) { okN++; continue; } // skip duplicates by email
             }
-            var cr2 = await sb.from('contacts').insert(cfields);
+            var cr2 = await sb.from('contacts').insert(cfields).select('id').single();
             if (cr2.error) throw cr2.error;
+            if (scopeIds.length) {
+              var links = scopeIds.map(function (sid) {
+                return { contact_id: cr2.data.id, site_id: sid };
+              });
+              var lir = await sb.from('contact_projects').insert(links);
+              if (lir.error) throw lir.error;
+            }
           } else if (impEntity === 'contracts') {
             var st = siteByCode[(rec.site_code || '').toUpperCase()];
             if (!st) throw new Error('site not found: ' + rec.site_code);
+            /* v6.1: coverage "24/7" also implies the support_24_7 flag. */
+            var s247 = toBool(rec.support_24_7);
+            if (L.coverageIs247(rec.coverage)) s247 = true;
             var cfr = {
               site_id: st.id,
               response_hours: rec.response_hours === '' ? null : Number(rec.response_hours),
               onsite_hours: rec.onsite_hours === '' ? null : Number(rec.onsite_hours),
               resolve_hours: rec.resolve_hours === '' ? null : Number(rec.resolve_hours),
-              availability_pct: rec.availability_pct === '' ? null : Number(rec.availability_pct),
+              /* v6.1: 0.98-style fractions → 98 (percent). */
+              availability_pct: L.normalizeAvailability(rec.availability_pct),
               valid_from: rec.valid_from || null, valid_to: rec.valid_to || null,
               coverage: rec.coverage || null,
               phone_enabled: toBool(rec.phone_enabled),
               onsite_enabled: toBool(rec.onsite_enabled),
-              support_24_7: toBool(rec.support_24_7),
+              support_24_7: s247,
               penalty_response: rec.penalty_response || null,
               penalty_onsite: rec.penalty_onsite || null,
               penalty_resolve: rec.penalty_resolve || null
@@ -5334,6 +5755,12 @@
         (parent ? '<a href="#/site/' + parent.id + '">' + esc(parent.code + ' — ' + parent.name) + '</a>'
                 : esc(t('sites.noParent'))) + '</dd>' +
       '<dt>' + esc(t('sites.remoteOwner')) + '</dt><dd>' + esc(displayName(site.remote_owner_id)) + '</dd>' +
+      /* v6.1: remote owner email list + default support group (dispatch) */
+      (state.v61 && site.remote_owner_email
+        ? '<dt>' + esc(t('sites.remoteOwnerEmail')) + '</dt><dd>' + esc(site.remote_owner_email) + '</dd>' : '') +
+      (state.v61
+        ? '<dt>' + esc(t('sites.defaultGroup')) + '</dt><dd>' +
+          esc(site.default_group_id ? groupName(site.default_group_id) : '—') + '</dd>' : '') +
       '</dl>' +
       (canContract
         ? '<div style="margin-top:12px"><div class="field"><label>' + esc(t('sites.setOwner')) + '</label>' +
@@ -5440,13 +5867,38 @@
           }).join('')
         : '<div class="empty">—</div>') + '</div>';
 
+    /* v6.1: site team roster — contacts linked via contact_projects,
+       showing the per-project role (e.g. Field Service Technician). */
+    function teamCard() {
+      if (!state.v6) return '';
+      var links = state.contactProjects.filter(function (r) { return r.site_id === id; });
+      if (!links.length) return '';
+      var rows = links.map(function (r) {
+        var c = state.contacts.filter(function (x) { return x.id === r.contact_id; })[0];
+        if (!c) return '';
+        var nm = ((c.first_name || '') + ' ' + (c.last_name || '')).trim() || c.email || '—';
+        var role = (state.v61 && r.role) ? r.role : (c.role || '—');
+        return '<tr><td><b>' + esc(nm) + '</b></td>' +
+          '<td class="muted">' + esc(c.company || '—') + '</td>' +
+          '<td>' + esc(role) + '</td>' +
+          '<td class="muted">' + esc(c.phone || '—') + '</td>' +
+          '<td class="muted">' + esc(c.email || '—') + '</td></tr>';
+      }).join('');
+      return '<div class="card"><h2>' + esc(t('sites.team')) + '</h2>' +
+        '<div style="overflow-x:auto"><table class="tbl"><thead><tr>' +
+        '<th>' + esc(t('contacts.firstName')) + '</th><th>' + esc(t('contacts.company')) + '</th>' +
+        '<th>' + esc(t('sites.teamRole')) + '</th><th>' + esc(t('contacts.phone')) + '</th>' +
+        '<th>' + esc(t('contacts.email')) + '</th>' +
+        '</tr></thead><tbody>' + rows + '</tbody></table></div></div>';
+    }
+
     view.innerHTML =
       '<button class="btn btn-sm" id="back-btn" style="margin-bottom:12px">← ' + esc(t('sites.backToSites')) + '</button>' +
       '<div class="detail-head"><span class="tnum">' + esc(site.code) + '</span>' +
         contractBadgeFor(contract) +
         '<span class="badge status-open">' + openCount + ' ' + esc(t('sites.openTickets')) + '</span></div>' +
       '<h1 class="detail-title">' + esc(site.name) + '</h1>' +
-      '<div class="grid-2"><div>' + ident + ccard + '</div><div>' + whcard + tcard + maintCard() + chcard + '</div></div>';
+      '<div class="grid-2"><div>' + ident + ccard + '</div><div>' + whcard + tcard + teamCard() + maintCard() + chcard + '</div></div>';
     document.getElementById('back-btn').onclick = function () { nav('#/sites'); };
     bindTableNav(view);
     /* v7.12: generate the yearly plan (12 maintenance tickets) + print. */

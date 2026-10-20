@@ -67,7 +67,9 @@
     /* v6/v7 additions */
     'contact.manage':        ['admin', 'dispatcher', 'pm'],             // contacts master data
     'workflow.manage':       ['admin'],                                // workflow states/transitions
-    'field.manage':          ['admin', 'dispatcher']                    // custom fields
+    'field.manage':          ['admin', 'dispatcher'],                    // custom fields
+    /* v6.1 additions */
+    'group.manage':          ['admin', 'dispatcher', 'pm']              // support groups
   };
 
   /**
@@ -654,6 +656,172 @@
   }
 
   /* ------------------------------------------------------------------ */
+  /* v6.1 — Massimo Excel import compatibility + support groups         */
+  /* ------------------------------------------------------------------ */
+
+  /**
+   * parseCoordinate(str) → decimal degrees (number) or null.
+   * Accepts plain decimals ("42.35", "-11.61", "42,35") and DMS
+   * ("42°22'47.8\"N", "11°33'09.2\"E", "42°22.79'N"). S/W → negative.
+   * Returns null when the string cannot be parsed as a coordinate.
+   */
+  function parseCoordinate(str) {
+    if (str == null) return null;
+    var s = String(str).trim();
+    if (!s) return null;
+    // fast path: plain decimal ("42.35", "-11.61", "42,35")
+    if (/^[+-]?(\d+([.,]\d+)?|[.,]\d+)$/.test(s)) {
+      var d = Number(s.replace(',', '.'));
+      return isNaN(d) ? null : d;
+    }
+    var m = s.match(/^\s*([+-]?\d+(?:[.,]\d+)?)\s*[°ºdD]?\s*(?:(\d+(?:[.,]\d+)?)\s*['′'mM]?\s*)?(?:(\d+(?:[.,]\d+)?)\s*["″"sS]?\s*)?\s*([NSEWnsew])?\s*$/);
+    if (!m) return null;
+    function num(x) { return Number(String(x).replace(',', '.')); }
+    var deg = num(m[1]);
+    var min = m[2] != null ? num(m[2]) : 0;
+    var sec = m[3] != null ? num(m[3]) : 0;
+    if (isNaN(deg) || isNaN(min) || isNaN(sec)) return null;
+    if (min >= 60 || sec >= 60) return null;
+    var v = Math.abs(deg) + min / 60 + sec / 3600;
+    var hemi = (m[4] || '').toUpperCase();
+    var neg = deg < 0 || hemi === 'S' || hemi === 'W';
+    return neg ? -v : v;
+  }
+
+  var EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+  /**
+   * extractEmails(text) → array of unique lowercase valid emails.
+   * Splits on whitespace / commas / semicolons; drops prose tokens
+   * (e.g. Massimo's "IMPORTANT: IS NECESSARY TO CREATE ANOTHER EMAIL…").
+   */
+  function extractEmails(text) {
+    var out = [], seen = {};
+    String(text || '').split(/[\s,;]+/).forEach(function (tok) {
+      var t = tok.trim().toLowerCase();
+      if (EMAIL_RE.test(t) && !seen[t]) { seen[t] = true; out.push(t); }
+    });
+    return out;
+  }
+
+  /**
+   * isNaLike(v) → true for NA / N/A / '-' / 'NA (…)' style placeholders,
+   * so junk like "NA (what do you mean for parent site code?)" is
+   * treated as "no parent" instead of a lookup error.
+   */
+  function isNaLike(v) {
+    var w = String(v == null ? '' : v).trim().toUpperCase();
+    if (!w) return false;
+    return w === 'NA' || w === 'N/A' || w === '-' ||
+      w.indexOf('NA ') === 0 || w.indexOf('NA(') === 0 ||
+      w.indexOf('N/A ') === 0 || w.indexOf('N/A(') === 0;
+  }
+
+  /**
+   * splitFullName(name) → { first, last }; splits at the FIRST space.
+   * "Massimo Marchetti" → {first:'Massimo', last:'Marchetti'}.
+   */
+  function splitFullName(name) {
+    var s = String(name || '').trim().replace(/\s+/g, ' ');
+    var i = s.indexOf(' ');
+    if (i === -1) return { first: s, last: '' };
+    return { first: s.slice(0, i), last: s.slice(i + 1) };
+  }
+
+  /**
+   * normalizeWarehouseType(v) → 'on_site' | 'off_site' | null.
+   * Accepts "On-site", "off_site", "OFF SITE", …
+   */
+  function normalizeWarehouseType(v) {
+    var w = String(v == null ? '' : v).trim().toLowerCase().replace(/[-\s]+/g, '_');
+    if (w === 'on_site' || w === 'off_site') return w;
+    return null;
+  }
+
+  /**
+   * normalizeOwner(v) → 'longi' | 'customer' | null (case-insensitive).
+   */
+  function normalizeOwner(v) {
+    var w = String(v == null ? '' : v).trim().toLowerCase();
+    return (w === 'longi' || w === 'customer') ? w : null;
+  }
+
+  /**
+   * normalizeAvailability(v) → percentage number or null.
+   * Fractions ≤ 1 (e.g. 0.98) are ×100; plain percentages pass through.
+   */
+  function normalizeAvailability(v) {
+    if (v == null || String(v).trim() === '') return null;
+    var n = Number(String(v).trim().replace(',', '.'));
+    if (isNaN(n) || n < 0) return null;
+    if (n <= 1) n = n * 100;
+    return Math.round(n * 100) / 100;
+  }
+
+  /**
+   * coverageIs247(v) → true when the coverage text means 24/7.
+   */
+  function coverageIs247(v) {
+    return String(v == null ? '' : v).replace(/\s+/g, '') === '24/7';
+  }
+
+  /**
+   * resolveSiteScope(value, sites) → array of site ids.
+   * Tokens split on [,;\n]; each token matches a site by NAME
+   * (case-insensitive) first, then by CODE, then by CITY — Massimo
+   * writes "Montalto di Castro" while the site is named
+   * 'Montalto " La Viola"' (city name is how people refer to it).
+   */
+  function resolveSiteScope(value, sites) {
+    var out = [], seen = {};
+    var byName = {}, byCode = {};
+    function push(id) { if (id && !seen[id]) { seen[id] = true; out.push(id); } }
+    (sites || []).forEach(function (s) {
+      if (s.name) byName[String(s.name).trim().toLowerCase()] = s.id;
+      if (s.code) byCode[String(s.code).trim().toUpperCase()] = s.id;
+    });
+    String(value || '').split(/[,\;\n]+/).forEach(function (tok) {
+      var t = tok.trim();
+      if (!t) return;
+      var id = byName[t.toLowerCase()] || byCode[t.toUpperCase()];
+      if (id) { push(id); return; }
+      (sites || []).forEach(function (s) {
+        if (s.city && String(s.city).trim().toLowerCase() === t.toLowerCase()) push(s.id);
+      });
+    });
+    return out;
+  }
+
+  /**
+   * normKey(s) → normalized key for fuzzy name matching
+   * (lowercase, trimmed, collapsed whitespace, dashes unified).
+   */
+  function normKey(s) {
+    return String(s == null ? '' : s).toLowerCase().trim()
+      .replace(/[–—−]/g, '-').replace(/\s+/g, ' ');
+  }
+
+  /**
+   * findWarehouse(value, warehouses) → warehouse row or null.
+   * Code match first, then name match (both normalized) — Massimo's
+   * spare-parts sheet writes warehouse NAMES, not codes.
+   */
+  function findWarehouse(value, warehouses) {
+    var v = normKey(value);
+    if (!v) return null;
+    var list = warehouses || [], hit = null, i;
+    for (i = 0; i < list.length; i++) {
+      if (normKey(list[i].code) === v) { hit = list[i]; break; }
+    }
+    if (!hit) {
+      for (i = 0; i < list.length; i++) {
+        if (normKey(list[i].name) === v) { hit = list[i]; break; }
+      }
+    }
+    return hit;
+  }
+
+  /* ------------------------------------------------------------------ */
   /* v7 — trackers, configurable workflow, custom fields                 */
   /* ------------------------------------------------------------------ */
 
@@ -926,6 +1094,18 @@
     stockStatus: stockStatus,
     buildSiteTree: buildSiteTree,
     validateContact: validateContact,
+    /* v6.1 additions */
+    parseCoordinate: parseCoordinate,
+    extractEmails: extractEmails,
+    isNaLike: isNaLike,
+    splitFullName: splitFullName,
+    normalizeWarehouseType: normalizeWarehouseType,
+    normalizeOwner: normalizeOwner,
+    normalizeAvailability: normalizeAvailability,
+    coverageIs247: coverageIs247,
+    resolveSiteScope: resolveSiteScope,
+    normKey: normKey,
+    findWarehouse: findWarehouse,
     TRACKERS: TRACKERS,
     TRACKER_KEYS: TRACKER_KEYS,
     WORKFLOW_TEMPLATES: WORKFLOW_TEMPLATES,
