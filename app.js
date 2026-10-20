@@ -5627,7 +5627,7 @@
                (Massimo's sheet writes names). */
             var wh = L.findWarehouse(rec.warehouse_code, warehouses);
             if (!wh) throw new Error(t('parts.imp.badWh') + ': ' + rec.warehouse_code);
-            var cur = await sb.from('stock_levels').select('id,qty')
+            var cur = await sb.from('stock_levels').select('qty')
               .eq('warehouse_id', wh.id).eq('part_id', up.data.id).maybeSingle();
             if (cur.error) throw cur.error;
             var qty = mode === 'add'
