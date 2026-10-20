@@ -959,11 +959,11 @@
 
   /**
    * fieldVisibleIn(field, status) — simplified field/status permission:
-   * empty visible_statuses → visible in every status.
+   * empty show_in_states → visible in every status.
    */
   function fieldVisibleIn(field, status) {
     if (!field) return false;
-    var vs = field.visible_statuses || [];
+    var vs = field.show_in_states || [];
     if (!vs.length) return true;
     return vs.indexOf(status) !== -1;
   }

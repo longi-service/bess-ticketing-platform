@@ -213,7 +213,7 @@ CREATE TABLE IF NOT EXISTS custom_fields (
   options          JSONB NOT NULL DEFAULT '[]',
   trackers         TEXT[] NOT NULL DEFAULT '{}',
   required         BOOLEAN NOT NULL DEFAULT FALSE,
-  visible_statuses TEXT[] NOT NULL DEFAULT '{}',
+  show_in_states   TEXT[] NOT NULL DEFAULT '{}',
   sort             INT NOT NULL DEFAULT 0,
   is_active        BOOLEAN NOT NULL DEFAULT TRUE,
   created_at       TIMESTAMPTZ NOT NULL DEFAULT now()

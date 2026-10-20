@@ -588,9 +588,9 @@ eq('dayState Date object works', L.dayState(null, new Date(2026, 9, 10)), 'weeke
   eq('validateCustomValues ok', L.validateCustomValues(fields, { f1: 'x', f2: '3', f3: 'a', f4: ['x'] }), []);
   eq('validateCustomValues invalid', L.validateCustomValues(fields, { f1: 'x', f2: 'NaN!', f3: 'z', f4: 'no' }),
     ['f2:invalid', 'f3:invalid', 'f4:invalid']);
-  ok('fieldVisibleIn empty=all', L.fieldVisibleIn({ visible_statuses: [] }, 'open'));
-  ok('fieldVisibleIn restricted', L.fieldVisibleIn({ visible_statuses: ['open'] }, 'open')
-    && !L.fieldVisibleIn({ visible_statuses: ['open'] }, 'closed'));
+  ok('fieldVisibleIn empty=all', L.fieldVisibleIn({ show_in_states: [] }, 'open'));
+  ok('fieldVisibleIn restricted', L.fieldVisibleIn({ show_in_states: ['open'] }, 'open')
+    && !L.fieldVisibleIn({ show_in_states: ['open'] }, 'closed'));
 
   // validateCustomFieldDef (v7.1 fix — the function was missing entirely)
   const cfCodes = (d) => L.validateCustomFieldDef(d).map((e) => e.code);
