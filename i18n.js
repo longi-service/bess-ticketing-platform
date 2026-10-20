@@ -412,6 +412,7 @@
     'parts.imp.paste': 'Paste data (CSV / TSV)',
     'parts.imp.pastePh': 'code\tname\twarehouse_code\tqty\nINV-001\tInverter fuse\tWH-EU-01\t50',
     'parts.imp.upload': '…or upload a file',
+    'parts.imp.xlsxUnavailable': 'Could not read that Excel file. The spreadsheet library may still be loading — check your connection and try again, or paste the data as CSV instead.',
     'parts.imp.parse': 'Parse',
     'parts.imp.empty': 'Nothing to parse — paste data or upload a file first.',
     'parts.imp.mapping': 'Map columns to fields',
@@ -889,7 +890,13 @@
     'cf.type.checklist': 'Checklist',
     'cf.type.signature': 'Signature',
     'cf.type.textarea': 'Long text',
-    'cf.invalid': 'Please complete the highlighted custom fields.'
+    'cf.invalid': 'Please complete the highlighted custom fields.',
+    'cf.err.keyRequired': 'Field key is required.',
+    'cf.err.keyFormat': 'Field key must start with a lowercase letter and use only lowercase letters, digits and underscores.',
+    'cf.err.type': 'Please choose a valid field type.',
+    'cf.err.label': 'Please fill in at least one label (EN or ZH).',
+    'cf.err.options': 'Dropdown and checklist fields need at least one option.',
+    'cf.err.trackers': 'Please apply the field to at least one valid tracker.'
   };
 
   var zh = {
@@ -1298,6 +1305,7 @@
     'parts.imp.paste': '粘贴数据（CSV / TSV）',
     'parts.imp.pastePh': 'code\tname\twarehouse_code\tqty\nINV-001\tInverter fuse\tWH-EU-01\t50',
     'parts.imp.upload': '…或上传文件',
+    'parts.imp.xlsxUnavailable': '无法读取该 Excel 文件。表格解析库可能尚未加载完成——请检查网络后重试，或改用粘贴 CSV 数据。',
     'parts.imp.parse': '解析',
     'parts.imp.empty': '没有可解析的内容——请先粘贴数据或上传文件。',
     'parts.imp.mapping': '把列映射到字段',
@@ -1774,7 +1782,13 @@
     'cf.type.checklist': '检查清单',
     'cf.type.signature': '签字',
     'cf.type.textarea': '长文本',
-    'cf.invalid': '请填写标红的自定义字段。'
+    'cf.invalid': '请填写标红的自定义字段。',
+    'cf.err.keyRequired': '字段标识必填。',
+    'cf.err.keyFormat': '字段标识须以小写字母开头，只能包含小写字母、数字和下划线。',
+    'cf.err.type': '请选择有效的字段类型。',
+    'cf.err.label': '请至少填写一个标签（英文或中文）。',
+    'cf.err.options': '下拉和检查清单字段至少需要一个选项。',
+    'cf.err.trackers': '请至少选择一个有效的适用工单类型。'
   };
 
   root.I18N = { en: en, zh: zh };

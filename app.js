@@ -4571,7 +4571,7 @@
           is_active: document.getElementById('cfi-active').checked
         };
         var errs = L.validateCustomFieldDef(Object.assign({ key: field.key || 'tmp' }, row));
-        if (errs.length) { toast(errs[0].code, 'error'); btn.disabled = false; return; }
+        if (errs.length) { toast(t(errs[0].code), 'error'); btn.disabled = false; return; }
         if (field.key) row.key = field.key;
         else row.key = document.getElementById('cfi-key').value.trim();
         if (!row.key) { toast(t('new.fillRequired'), 'error'); btn.disabled = false; return; }
@@ -5146,7 +5146,7 @@
       '<div class="form-row">' +
         '<div class="field"><label>' + esc(t('parts.category')) + '</label>' +
           '<input type="text" id="p-cat" value="' + esc(part.category || '') + '"></div>' +
-        '<div class="field"><label>' + esc(t('parts.unit')) + '</label>' +
+        '<div class="field"><label>' + esc(t('parts.unit')) + '<span class="req">*</span></label>' +
           '<input type="text" id="p-unit" value="' + esc(part.unit || '') + '"></div>' +
       '</div>' +
       '<div class="field"><label>' + esc(t('parts.owner')) + '</label>' +
@@ -5164,10 +5164,13 @@
       try {
         var code = document.getElementById('p-code').value.trim();
         var name = document.getElementById('p-name').value.trim();
-        if (!code || !name) { toast(t('new.fillRequired'), 'error'); btn.disabled = false; return; }
+        var unit = document.getElementById('p-unit').value.trim();
+        /* v7.1 fix: spare_parts.unit is NOT NULL in the DB — block the
+           save up front instead of surfacing the raw Postgres error. */
+        if (!code || !name || !unit) { toast(t('new.fillRequired'), 'error'); btn.disabled = false; return; }
         var fields = { code: code, name: name,
                        category: document.getElementById('p-cat').value.trim() || null,
-                       unit: document.getElementById('p-unit').value.trim() || null,
+                       unit: unit,
                        owner: document.getElementById('p-owner').value };
         var r = part.id
           ? await sb.from('spare_parts').update(fields).eq('id', part.id)
@@ -5202,7 +5205,7 @@
   var IMPORT_FIELDS = [
     { key: 'code', req: true }, { key: 'name', req: true },
     { key: 'warehouse_code', req: true }, { key: 'qty', req: true },
-    { key: 'category', req: false }, { key: 'unit', req: false }, { key: 'min_qty', req: false },
+    { key: 'category', req: false }, { key: 'unit', req: true }, { key: 'min_qty', req: false },
     /* v6.1: Massimo inventory columns */
     { key: 'owner', req: false }, { key: 'location', req: false },
     { key: 'target_stock', req: false }, { key: 'part_number', req: false },
@@ -5394,7 +5397,7 @@
           '<textarea id="pi-text" rows="6" placeholder="' +
             esc(t('parts.imp.pastePh')) + '"></textarea></div>' +
         '<div class="field"><label>' + esc(t('parts.imp.upload')) + '</label>' +
-          '<input type="file" id="pi-file" accept=".csv,.tsv,.txt"></div>' +
+          '<input type="file" id="pi-file" accept=".csv,.tsv,.txt,.xlsx,.xls"></div>' +
         '<button class="btn btn-primary" id="pi-parse">' + esc(t('parts.imp.parse')) + '</button>' +
       '</div>' +
       '<div id="pi-step2" style="display:none">' +
@@ -5481,8 +5484,30 @@
     document.getElementById('pi-file').onchange = function () {
       var f = this.files && this.files[0];
       if (!f) return;
+      var setText = function (txt) { document.getElementById('pi-text').value = txt; };
+      /* v7.1 fix: Excel workbooks must go through SheetJS — reading them
+         as text yields binary garbage. Convert the sheet that matches the
+         selected import entity (fallback: first sheet) to CSV and feed
+         the existing paste/parse pipeline. */
+      if (/\.(xlsx|xls)$/i.test(f.name || '')) {
+        if (typeof XLSX === 'undefined') { toast(t('parts.imp.xlsxUnavailable'), 'error'); return; }
+        var xrd = new FileReader();
+        xrd.onload = function () {
+          try {
+            var wb = XLSX.read(new Uint8Array(xrd.result), { type: 'array' });
+            var names = wb.SheetNames || [];
+            if (!names.length) { toast(t('parts.imp.xlsxUnavailable'), 'error'); return; }
+            var pick = names.filter(function (n) { return n === impEntity; })[0] ||
+              names.filter(function (n) { return n.toLowerCase() === impEntity; })[0] ||
+              names[0];
+            setText(XLSX.utils.sheet_to_csv(wb.Sheets[pick]));
+          } catch (e) { toast(t('parts.imp.xlsxUnavailable'), 'error'); }
+        };
+        xrd.readAsArrayBuffer(f);
+        return;
+      }
       var rd = new FileReader();
-      rd.onload = function () { document.getElementById('pi-text').value = rd.result; };
+      rd.onload = function () { setText(rd.result); };
       rd.readAsText(f);
     };
     function currentEntity() { return IMPORT_ENTITIES[impEntity]; }
@@ -6266,7 +6291,7 @@
           var c9 = (state.contracts || {})[site.id];
           var ins = await sb.from('tickets').insert({
             title: t('tracker.maintenance') + ' — ' + site.code + ' ' + plan[mi].slice(0, 7),
-            description: '', status: 'open', priority: 'medium', source: 'internal',
+            description: '', status: 'open', priority: 'medium', source: 'internal_discovery',
             tracker: 'maintenance', workflow_key: site.segment === 'utility' ? 'utility' : 'ci',
             site_id: site.id, planned_date: plan[mi], custom_values: cv,
             created_by: state.profile.id, is_ltsa: !!(c9 && L.isContractActive(c9))
