@@ -270,6 +270,21 @@
         });
       }
     } catch (e) { /* names stay as short ids — non-fatal */ }
+    /* v7.15: customers cannot SELECT profiles (RLS), so the lookup above
+       returns nothing for them and names render as raw id fragments.
+       Fall back to the directory_names() RPC (display names only). */
+    var still = ids.filter(function (id) { return id && !state.nameCache[id]; });
+    if (!still.length) return;
+    try {
+      var rr = await sb.rpc('directory_names');
+      if (!rr.error && rr.data) {
+        rr.data.forEach(function (p) {
+          if (!state.nameCache[p.id]) {
+            state.nameCache[p.id] = p.display_name || p.id.slice(0, 8) + '…';
+          }
+        });
+      }
+    } catch (e) { /* non-fatal */ }
   }
 
   function siteLabel(siteId) {
@@ -1821,8 +1836,12 @@
   async function viewTicketDetail(view, id) {
     var tr = await sb.from('tickets').select('*').eq('id', id).single();
     if (tr.error || !tr.data) {
+      /* v7.15: a missing or RLS-hidden ticket surfaces PostgREST's raw
+         PGRST116 text ("Cannot coerce the result to a single JSON
+         object"). Show a friendly notice instead; not-found and
+         no-access stay deliberately indistinguishable. */
       view.innerHTML = '<div class="inline-err">' +
-        esc(tr.error ? tr.error.message : t('common.error')) + '</div>' +
+        esc(t('detail.notFoundOrNoAccess')) + '</div>' +
         '<button class="btn" id="back-btn">' + esc(t('detail.backToList')) + '</button>';
       document.getElementById('back-btn').onclick = function () { nav('#/tickets'); };
       return;

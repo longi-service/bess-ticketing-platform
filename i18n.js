@@ -155,6 +155,7 @@
 
     /* Ticket detail */
     'detail.backToList': 'Back to tickets',
+    'detail.notFoundOrNoAccess': 'This ticket does not exist or you do not have access to it.',
     'detail.sla': 'SLA clocks',
     'detail.sla.response': 'Response',
     'detail.sla.onsite': 'On-site',
@@ -1048,6 +1049,7 @@
 
     /* Ticket detail */
     'detail.backToList': '返回工单列表',
+    'detail.notFoundOrNoAccess': '工单不存在或您无权访问。',
     'detail.sla': 'SLA 时钟',
     'detail.sla.response': '响应',
     'detail.sla.onsite': '到场',
