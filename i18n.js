@@ -248,6 +248,7 @@
     'detail.tl.comment': 'Comment',
     'detail.tl.photo': 'Photo uploaded',
     'detail.tl.status': 'Status changed',
+    'detail.tl.assigned': 'Assigned to',
 
     /* New ticket */
     'new.title': 'New ticket',
@@ -1189,6 +1190,7 @@
     'detail.tl.comment': '评论',
     'detail.tl.photo': '上传照片',
     'detail.tl.status': '状态变更',
+    'detail.tl.assigned': '指派给',
 
     /* New ticket */
     'new.title': '新建工单',

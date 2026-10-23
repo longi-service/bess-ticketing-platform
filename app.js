@@ -465,6 +465,12 @@
       var cfp = await sb.from('custom_fields').select('depends_on').limit(1);
       state.v8cf = !cfp.error;
     } catch (e) { state.v8owner = false; state.v8cf = false; }
+    /* v8.2: ticket_events audit table exists only after migration_v8_2. */
+    state.v82 = false;
+    try {
+      var evp = await sb.from('ticket_events').select('id', { count: 'exact', head: true });
+      state.v82 = !evp.error;
+    } catch (e) { state.v82 = false; }
   }
 
   /**
@@ -736,6 +742,21 @@
     if (st === 404 || e.name === 'FunctionsFetchError' || e.name === 'FunctionsRelayError') {
       state.emailAvailable = false;
     }
+  }
+
+  /* v8.2: audit events (status changes, assignments). The timeline is
+     synthesized from milestone columns, so generic transitions used to
+     leave no trace (found in the 2026-10-23 full sweep, item 3b).
+     Fire-and-forget: auditing must never block the action itself.
+     No-op until migration_v8_2 lands (state.v82). */
+  function logTicketEvent(ticketId, kind, detail) {
+    if (!state.v82 || !state.profile) return;
+    try {
+      sb.from('ticket_events').insert({
+        ticket_id: ticketId, actor_id: state.profile.id,
+        kind: kind, detail: detail || null
+      }).then(function () {}, function () {});
+    } catch (e) { /* audit is best-effort */ }
   }
 
   function notifyTicketEvent(eventKey, ticket, extraVars, opts) {
@@ -2015,9 +2036,18 @@
     var ar = await sb.from('ticket_attachments').select('*').eq('ticket_id', id).order('created_at');
     var photos = ar.error ? [] : (ar.data || []);
     if (ar.error) apiError(ar.error);
+    /* v8.2: audit events for the timeline (status changes, assignments). */
+    var events = [];
+    if (state.v82) {
+      var evr = await sb.from('ticket_events').select('*').eq('ticket_id', id).order('created_at');
+      if (!evr.error) events = evr.data || [];
+    }
     await resolveNames(collectIds([ticket]).concat(
       comments.map(function (c) { return c.author_id; }),
-      photos.map(function (p) { return p.uploaded_by; })
+      photos.map(function (p) { return p.uploaded_by; }),
+      events.map(function (e) { return e.actor_id; }),
+      events.filter(function (e) { return e.kind === 'assigned' && e.detail && e.detail.indexOf('u:') === 0; })
+        .map(function (e) { return e.detail.slice(2); })
     ));
 
     var p = state.profile, role = p.role;
@@ -2226,7 +2256,7 @@
     document.getElementById('back-btn').onclick = function () { nav('#/tickets'); };
     /* v3 F9: print report (staff only). */
     var prBtn = document.getElementById('print-report-btn');
-    if (prBtn) prBtn.onclick = function () { printServiceReport(ticket, comments, photos); };
+    if (prBtn) prBtn.onclick = function () { printServiceReport(ticket, comments, photos, events); };
     renderPartsBlock(ticket);
 
     /* ----- edit core fields ----- */
@@ -2292,6 +2322,8 @@
           /* v6.2 item 15: notify status change (separate from assignment
              notifications — that path never reaches here). */
           notifyTicketEvent('status_changed', Object.assign({}, ticket, { status: to }), null);
+          /* v8.2: audit event so the timeline shows every transition. */
+          logTicketEvent(ticket.id, 'status', ticket.status + ' → ' + to);
           /* v3 F7: reopening a closed ticket leaves an internal timeline note
              (internal ⇒ does not stop the response clock). */
           if (ticket.status === 'closed' && to === 'open') {
@@ -2391,7 +2423,7 @@
     };
 
     /* ----- timeline (synthesized — no audit table in v1 contract) ----- */
-    renderTimeline(ticket, comments, photos);
+    renderTimeline(ticket, comments, photos, events);
     if (state.v3 && !isCustomer) loadRelatedTickets(ticket.id);
     if (!isCustomer && state.v7) loadSubTickets(ticket);
     if (!isCustomer && state.v8tc) loadTicketPeople(ticket);
@@ -2844,6 +2876,11 @@
         /* v6.2 item 15: notify assignment (single event — the implied
            open→assigned status change does not send a second mail). */
         notifyTicketEvent('ticket_assigned', Object.assign({}, ticket, patch), null);
+        /* v8.2: audit events (detail stores 'u:<userId>' / 'g:<groupId>'
+           for assignments so names resolve at render time). */
+        if (patch.assigned_to) logTicketEvent(ticket.id, 'assigned', 'u:' + patch.assigned_to);
+        else if (patch.assigned_group_id) logTicketEvent(ticket.id, 'assigned', 'g:' + patch.assigned_group_id);
+        if (patch.status) logTicketEvent(ticket.id, 'status', ticket.status + ' → ' + patch.status);
         toast(t('common.saved'), 'ok');
         done();
       } catch (e) { apiError(e); btn.disabled = false; }
@@ -2858,6 +2895,8 @@
         if (allowed.indexOf('open') === -1) { toast(t('common.noPermission'), 'error'); return; }
         var r = await sb.from('tickets').update({ assigned_to: null, status: 'open' }).eq('id', ticket.id);
         if (r.error) throw r.error;
+        /* v8.2: audit event for the implied status change. */
+        logTicketEvent(ticket.id, 'status', ticket.status + ' → open');
         toast(t('common.saved'), 'ok');
         done();
       } catch (e) { apiError(e); }
@@ -2987,10 +3026,20 @@
      the plain glyphs stay as text. */
   var TL_ICONS = {
     created: '＋', responded: '↗', visited: '⚒', escalated: '⚠',
-    resolved: '✓', closed: '■',
+    resolved: '✓', closed: '■', status: '⇄', assigned: '↦',
     comment: icon('message', 12), internal: icon('lock', 12), photo: icon('camera', 12)
   };
-  function renderTimeline(ticket, comments, photos) {
+  /* v8.2: 'open → assigned' style detail → localized status names.
+     Unknown keys (custom workflows) fall back to the raw key. */
+  var TL_STATUS_KEYS = ['open', 'assigned', 'in_progress', 'on_site',
+    'pending_customer', 'resolved', 'closed', 'hq_approval'];
+  function statusLabelPair(detail) {
+    if (!detail) return '';
+    return detail.split(' → ').map(function (s) {
+      return TL_STATUS_KEYS.indexOf(s) !== -1 ? t('status.' + s) : s;
+    }).join(' → ');
+  }
+  function renderTimeline(ticket, comments, photos, events) {
     var el = document.getElementById('timeline');
     var ev = [];
     function add(ts, label, kind) { if (ts) ev.push({ ts: ts, label: label, kind: kind || 'created' }); }
@@ -3000,6 +3049,19 @@
     add(ticket.escalated_at, t('detail.tl.escalated'), 'escalated');
     add(ticket.resolved_at || (ticket.status === 'closed' ? ticket.updated_at : null), t('detail.tl.resolved'), 'resolved');
     add(ticket.closed_at, t('detail.tl.closed'), 'closed');
+    /* v8.2: audit events (status transitions + assignments). */
+    (events || []).forEach(function (e) {
+      var who = e.actor_id ? ' — ' + displayName(e.actor_id) : '';
+      if (e.kind === 'status') {
+        add(e.created_at, t('detail.tl.status') + ': ' + statusLabelPair(e.detail) + who, 'status');
+      } else if (e.kind === 'assigned') {
+        var target = '';
+        if (e.detail && e.detail.indexOf('u:') === 0) target = displayName(e.detail.slice(2));
+        else if (e.detail && e.detail.indexOf('g:') === 0) target = groupName(e.detail.slice(2));
+        else target = e.detail || '';
+        add(e.created_at, t('detail.tl.assigned') + ': ' + target + who, 'assigned');
+      }
+    });
     comments.forEach(function (c) {
       add(c.created_at, t('detail.tl.comment') + ' — ' + displayName(c.author_id) +
         (c.is_internal ? ' (' + t('detail.comments.internal') + ')' : ''),
@@ -3020,7 +3082,7 @@
      populated on click; @media print shows ONLY that div (sidebar/topbar/
      buttons/nav hidden). Includes public comments only — internal notes
      never go on the customer-facing report. */
-  async function printServiceReport(ticket, comments, attachments) {
+  async function printServiceReport(ticket, comments, attachments, events) {
     attachments = attachments || [];
     var pr = document.getElementById('print-report');
     if (!pr) {
@@ -3063,6 +3125,10 @@
     hadd(ticket.visited_at, t('detail.tl.visited'));
     hadd(ticket.resolved_at || (ticket.status === 'closed' ? ticket.updated_at : null), t('detail.tl.resolved'));
     hadd(ticket.closed_at, t('detail.tl.closed'));
+    /* v8.2: audit status transitions join the printed history. */
+    (events || []).forEach(function (e) {
+      if (e.kind === 'status') hadd(e.created_at, t('detail.tl.status') + ': ' + statusLabelPair(e.detail));
+    });
     hist.sort(function (a, b) { return new Date(a.ts) - new Date(b.ts); });
     /* public comments only */
     var pubComments = (comments || []).filter(function (c) { return !c.is_internal; });
