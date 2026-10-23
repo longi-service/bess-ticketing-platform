@@ -6048,7 +6048,7 @@
       supplier: ['supplier', 'primarysupplier'] },
       template: 'code,name,warehouse_code,qty,category,unit,min_qty,owner\nBAT-001,Battery module,WH-EU-01,10, ESS,pcs,2,longi' },
     sites: { fields: [
-      { key: 'code', req: true, label: 'Site code' }, { key: 'name', req: true, label: 'Site name' },
+      { key: 'code', req: true, label: 'Project code' }, { key: 'name', req: true, label: 'Project name' },
       { key: 'country', req: false, label: 'Country (2-letter)' }, { key: 'city', req: false, label: 'City' },
       { key: 'address', req: false, label: 'Address' },
       { key: 'latitude', req: false, label: 'Latitude' }, { key: 'longitude', req: false, label: 'Longitude' },
@@ -6096,7 +6096,7 @@
       group_name: ['groupname', 'group'] },
       template: 'first_name,last_name,company,role,phone,email\nMario,Rossi,Rapsody,Field technician,+393331234567,mario.rossi@rapsody.it' },
     contracts: { fields: [
-      { key: 'site_code', req: true, label: 'Site code' },
+      { key: 'site_code', req: true, label: 'Project code' },
       { key: 'response_hours', req: false, label: 'Response hours' },
       { key: 'onsite_hours', req: false, label: 'On-site hours' },
       { key: 'resolve_hours', req: false, label: 'Resolve hours' },
