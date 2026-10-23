@@ -4643,9 +4643,10 @@
    * #10/#17: Segment and Source dictionaries are maintained here and
    * stored as JSON in app_settings; forms read the merged registry from
    * logic.js, so defaults apply until something is saved here.
-   * #21/#22 (governed): trackers are created/edited ONLY here and only
-   * by admins (tracker.manage) — each tracker binds a status workflow
-   * and the custom fields already bind per tracker on the Fields page. */
+   * #21/#22 (governed): trackers are created/edited ONLY here, by
+   * tracker.manage holders (admin + dispatcher since v8.1) — each
+   * tracker binds a status workflow and the custom fields already
+   * bind per tracker on the Fields page. */
   async function viewSettings(view) {
     var wfKeys = ['ci', 'utility'];
     (state.wfStates || []).forEach(function (s) {

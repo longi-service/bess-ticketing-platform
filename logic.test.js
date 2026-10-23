@@ -826,7 +826,7 @@ eq('dayState Date object works', L.dayState(null, new Date(2026, 9, 10)), 'weeke
   ok('v8 engineer cannot manage sites', !L.can('site.manage', 'engineer'));
   ok('v8 tech_manager like senior engineer', L.can('ticket.transition', 'tech_manager') && L.can('part.view', 'tech_manager') && L.can('plan.view', 'tech_manager'));
   ok('v8 tech_manager cannot manage users', !L.can('user.manage', 'tech_manager'));
-  ok('v8 tracker.manage admin only', L.can('tracker.manage', 'admin') && !L.can('tracker.manage', 'dispatcher'));
+  ok('v8.1 tracker.manage admin+dispatcher', L.can('tracker.manage', 'admin') && L.can('tracker.manage', 'dispatcher') && !L.can('tracker.manage', 'engineer'));
   ok('v8 settings.manage dispatcher', L.can('settings.manage', 'dispatcher') && !L.can('settings.manage', 'pm'));
 })();
 

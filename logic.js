@@ -75,7 +75,7 @@
     /* v8 additions (Europe trial feedback) */
     'site.view':             ['admin', 'dispatcher', 'pm', 'engineer', 'tech_manager'], // read-only project view
     'settings.manage':       ['admin', 'dispatcher'],                   // dictionaries (segments / sources)
-    'tracker.manage':        ['admin']                                  // tracker registry stays HQ-governed
+    'tracker.manage':        ['admin', 'dispatcher']                     // tracker registry (opened to dispatchers 2026-10-23)
   };
 
   /**

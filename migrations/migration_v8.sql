@@ -139,13 +139,15 @@ END $$;
 -- watchers, dispatchers/admins), as an array.
 CREATE OR REPLACE FUNCTION ticket_audience(p_ticket tickets)
 RETURNS UUID[] LANGUAGE sql STABLE AS $$
-  SELECT array_remove(array_cat(array_cat(
-    ARRAY[p_ticket.assigned_to],
-    (SELECT array_agg(member_id) FROM group_members
-      WHERE group_id = p_ticket.assigned_group_id AND member_type = 'profile')),
-    (SELECT array_agg(user_id) FROM ticket_watchers WHERE ticket_id = p_ticket.id)),
-    (SELECT array_agg(id) FROM profiles WHERE role IN ('admin', 'dispatcher') AND is_active))
-  , NULL);
+  SELECT array_remove(
+    ARRAY[p_ticket.assigned_to]
+    || COALESCE((SELECT array_agg(member_id) FROM group_members
+        WHERE group_id = p_ticket.assigned_group_id AND member_type = 'profile'), '{}'::uuid[])
+    || COALESCE((SELECT array_agg(user_id) FROM ticket_watchers
+        WHERE ticket_id = p_ticket.id), '{}'::uuid[])
+    || COALESCE((SELECT array_agg(id) FROM profiles
+        WHERE role IN ('admin', 'dispatcher') AND is_active), '{}'::uuid[]),
+  NULL);
 $$;
 
 -- Tickets: created / assigned / status changed.
