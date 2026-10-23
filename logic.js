@@ -892,6 +892,36 @@
   function sourceDict(stored) { return mergeDict(DEFAULT_SOURCES, stored); }
   function trackerRegistry(stored) { return mergeDict(DEFAULT_TRACKERS, stored); }
 
+  /* v9 (#25): all site ids in the subtree rooted at rootId, root first.
+     Sites link via parent_site_id; cycles are guarded. */
+  function subtreeSiteIds(sites, rootId) {
+    var out = [];
+    if (!rootId) return out;
+    var seen = {};
+    var queue = [rootId];
+    while (queue.length) {
+      var id = queue.shift();
+      if (seen[id]) continue;
+      seen[id] = true;
+      out.push(id);
+      (sites || []).forEach(function (s) {
+        if (s.parent_site_id === id && !seen[s.id]) queue.push(s.id);
+      });
+    }
+    return out;
+  }
+
+  /* v9 (#25): trackers available for a project. allowedKeys null/empty
+     means "no project restriction" -> every active tracker. Otherwise
+     only the listed keys (still active ones). Returns tracker objects. */
+  function availableTrackers(trackers, allowedKeys) {
+    var active = (trackers || []).filter(function (tr) { return tr.is_active !== false; });
+    if (!allowedKeys || !allowedKeys.length) return active;
+    var allow = {};
+    allowedKeys.forEach(function (k) { allow[k] = true; });
+    return active.filter(function (tr) { return allow[tr.key]; });
+  }
+
   /** Workflow for a new ticket: tracker binding wins, then the site
       segment's binding, then the legacy segment rule (utility → utility). */
   function resolveWorkflowKey(tracker, segmentKey, segments) {
@@ -1390,6 +1420,8 @@
     segmentDict: segmentDict,
     sourceDict: sourceDict,
     trackerRegistry: trackerRegistry,
+    subtreeSiteIds: subtreeSiteIds,
+    availableTrackers: availableTrackers,
     resolveWorkflowKey: resolveWorkflowKey,
     DEP_OPS: DEP_OPS,
     evalDependency: evalDependency,

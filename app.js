@@ -476,6 +476,18 @@
       var evp = await sb.from('ticket_events').select('id', { count: 'exact', head: true });
       state.v82 = !evp.error;
     } catch (e) { state.v82 = false; }
+    /* v9 (#25): per-project tracker availability lives in
+       project_trackers (migration_v9). state.projectTrackers maps
+       site_id -> [tracker keys]; a missing/empty entry means the
+       project offers every active tracker. */
+    state.v9pt = false; state.projectTrackers = {};
+    try {
+      var ptp = await sb.from('project_trackers').select('site_id,tracker_key');
+      state.v9pt = !ptp.error;
+      if (state.v9pt) (ptp.data || []).forEach(function (r) {
+        (state.projectTrackers[r.site_id] = state.projectTrackers[r.site_id] || []).push(r.tracker_key);
+      });
+    } catch (e) { state.v9pt = false; }
   }
 
   /**
@@ -581,7 +593,11 @@
     if (filters.tracker) q = q.eq('tracker', filters.tracker);
     if (filters.priority) q = q.eq('priority', filters.priority);
     if (filters.source) q = q.eq('source', filters.source);
-    if (filters.site) q = q.eq('site_id', filters.site);
+    /* v9 (#25): project filter can include the whole subtree. */
+    if (filters.site) {
+      if (filters.subtree) q = q.in('site_id', L.subtreeSiteIds(state.sites, filters.site));
+      else q = q.eq('site_id', filters.site);
+    }
     if (filters.assignee) q = q.eq('assigned_to', filters.assignee);
     /* v6.1: support group filter (column only exists after migration_v6_1). */
     if (filters.group) q = q.eq('assigned_group_id', filters.group);
@@ -1701,7 +1717,7 @@
   var VIEWS_KEY = 'bess_views';
   function blankFilters() {
     return { status: '', tracker: '', priority: '', source: '', site: '', assignee: '', q: '', tag: '', customer: '',
-             unassignedOnly: false, contractOnly: false, group: '' /* v6.1 */ };
+             unassignedOnly: false, contractOnly: false, group: '' /* v6.1 */, subtree: false /* v9 */ };
   }
   function loadSavedViews() {
     try {
@@ -1811,6 +1827,10 @@
           }).join('') + '</select></div>' +
         '<div class="f"><label>' + esc(t('list.filter.site')) + '</label>' +
           '<select id="f-site">' + siteOpts + '</select></div>' +
+        /* v9 (#25): include subprojects in the project filter */
+        '<div class="f"><label>&nbsp;</label><label class="checkbox" style="padding-top:6px">' +
+          '<input type="checkbox" id="f-subtree"' + (f.subtree ? ' checked' : '') + '> ' +
+          esc(t('list.filter.subtree')) + '</label></div>' +
         /* v6.1: support group filter */
         (state.v61
           ? '<div class="f"><label>' + esc(t('list.filter.group')) + '</label>' +
@@ -1868,6 +1888,8 @@
       f.priority = document.getElementById('f-priority').value;
       f.source = document.getElementById('f-source').value;
       f.site = document.getElementById('f-site').value;
+      var subEl = document.getElementById('f-subtree');
+      if (subEl) f.subtree = subEl.checked;
       f.q = document.getElementById('f-q').value;
       var grpEl = document.getElementById('f-group');
       if (grpEl) f.group = grpEl.value;
@@ -1892,6 +1914,8 @@
       var el = document.getElementById(id);
       if (el) el.onchange = refetch;
     });
+    var subCb = document.getElementById('f-subtree');
+    if (subCb) subCb.onchange = refetch;
     var custSel = document.getElementById('f-customer');
     if (custSel) custSel.onchange = refetch;
     document.getElementById('f-q').oninput = function () {
@@ -3779,6 +3803,18 @@
         if (tti && !tti.value) tti.value = newTicketPrefill.title;
       }
     }
+    /* v9 (#25): the tracker dropdown follows the selected project's
+       configured tracker set (unrestricted projects keep all). */
+    function refreshTrackerOptions() {
+      var tsel = document.getElementById('nt-tracker');
+      if (!tsel || !state.v9pt) return;
+      var cur = tsel.value;
+      var list = L.availableTrackers(state.trackers, state.projectTrackers[siteSel.value] || null);
+      tsel.innerHTML = list.map(function (tr) {
+        return '<option value="' + esc(tr.key) + '">' + esc(trackerName(tr.key)) + '</option>';
+      }).join('');
+      if (cur && list.some(function (tr) { return tr.key === cur; })) tsel.value = cur;
+    }
     function refreshContractState() {
       var c = state.contracts[siteSel.value];
       var active = c && L.isContractActive(c);
@@ -3795,6 +3831,7 @@
         var st = state.sites.filter(function (x) { return x.id === siteSel.value; })[0];
         gsel.value = (st && st.default_group_id) || '';
       }
+      refreshTrackerOptions();
     }
     siteSel.onchange = refreshContractState;
     refreshContractState();
@@ -6897,6 +6934,43 @@
     var parent = site.parent_site_id && state.sites.find(function (s) { return s.id === site.parent_site_id; });
     var children = state.sites.filter(function (s) { return s.parent_site_id === id; });
 
+    /* v9 (#25): detail tabs. Subtree roll-up counts are exact head
+       counts per site; the tickets tab lists the subtree's latest 50;
+       the calendar tab shows this project's roster for 14 days
+       (shifts already carry site_id / covered_site_ids). */
+    var tab = (siteTabState.id === id) ? siteTabState.tab : 'overview';
+    var subtreeIds = L.subtreeSiteIds(state.sites, id);
+    var rollup = null;
+    if (children.length) {
+      rollup = { open: 0, total: 0, perSite: [] };
+      for (var ri = 0; ri < subtreeIds.length; ri++) {
+        var rsid = subtreeIds[ri];
+        var ocq = await baseTicketQuery('id', { count: 'exact', head: true })
+          .eq('site_id', rsid).not('status', 'in', '(resolved,closed)');
+        var tcq = await baseTicketQuery('id', { count: 'exact', head: true }).eq('site_id', rsid);
+        var ro = ocq.error ? 0 : (ocq.count || 0);
+        var rt = tcq.error ? 0 : (tcq.count || 0);
+        rollup.open += ro; rollup.total += rt;
+        rollup.perSite.push({ siteId: rsid, open: ro, total: rt });
+      }
+    }
+    var subtreeTickets = [];
+    if (tab === 'tickets') {
+      var strq = await baseTicketQuery().in('site_id', subtreeIds)
+        .order('updated_at', { ascending: false }).limit(50);
+      if (!strq.error) subtreeTickets = strq.data || [];
+    }
+    var calShifts = [];
+    if (tab === 'calendar') {
+      var calFromD = new Date();
+      var calToD = new Date(); calToD.setDate(calToD.getDate() + 13);
+      var csr = await sb.from('shifts').select('*')
+        .gte('day', ymd(calFromD)).lte('day', ymd(calToD))
+        .or('site_id.eq.' + id + ',covered_site_ids.cs.{' + id + '}');
+      if (!csr.error) calShifts = csr.data || [];
+      await resolveNames(calShifts.map(function (s) { return s.engineer_id; }));
+    }
+
     var wr = await sb.from('warehouses').select('*').eq('site_id', id).order('code');
     var warehouses = wr.error ? [] : (wr.data || []);
     if (wr.error) apiError(wr.error);
@@ -7163,13 +7237,99 @@
       '</div>';
     }
 
+    /* v9 (#25): tab card builders. */
+    function rollupCard() {
+      if (!rollup) return '';
+      var rows = rollup.perSite.map(function (r) {
+        var s = state.sites.filter(function (x) { return x.id === r.siteId; })[0];
+        if (!s) return '';
+        return '<tr class="clickable" data-child="' + s.id + '"><td class="tnum">' + esc(s.code) + '</td>' +
+          '<td>' + esc(s.name) + '</td><td>' + r.open + '</td><td>' + r.total + '</td></tr>';
+      }).join('');
+      return '<div class="card"><h2>' + esc(t('sites.rollup')) + '</h2>' +
+        '<div class="muted" style="margin-bottom:6px">' +
+          esc(t('sites.rollupSub', { open: rollup.open, total: rollup.total })) + '</div>' +
+        '<table class="tbl"><thead><tr><th>' + esc(t('sites.code')) + '</th><th>' +
+          esc(t('sites.name')) + '</th><th>' + esc(t('sites.openTickets')) + '</th><th>' +
+          esc(t('list.columns.ticket')) + '</th></tr></thead><tbody>' + rows + '</tbody></table></div>';
+    }
+    function subtreeTicketsCard() {
+      var rows = subtreeTickets.map(function (x) {
+        var s = state.sites.filter(function (y) { return y.id === x.site_id; })[0];
+        return '<tr class="clickable" data-id="' + x.id + '"><td class="tnum">' +
+          esc(L.formatTicketNo(x.ticket_no)) + '</td><td>' + esc(x.title) + '</td><td>' +
+          esc(s ? s.code : '—') + '</td><td>' + statusBadge(x.status) + '</td><td>' +
+          esc(trackerName(x.tracker)) + '</td></tr>';
+      }).join('');
+      return '<div class="card"><h2>' + esc(t('sites.subtreeTickets')) + '</h2>' +
+        (rows
+          ? '<table class="tbl"><thead><tr><th>' + esc(t('list.columns.ticket')) + '</th><th>' +
+            esc(t('list.columns.title')) + '</th><th>' + esc(t('sites.code')) + '</th><th>' +
+            esc(t('common.status')) + '</th><th>' + esc(t('tickets.tracker')) + '</th></tr></thead>' +
+            '<tbody>' + rows + '</tbody></table>'
+          : '<div class="empty">—</div>') + '</div>';
+    }
+    function calendarCard() {
+      var byDay = {};
+      calShifts.forEach(function (s) { (byDay[s.day] = byDay[s.day] || []).push(s); });
+      var days = Object.keys(byDay).sort();
+      var html = days.map(function (d) {
+        var rows = byDay[d].map(function (s) {
+          var kind = s.site_id === id ? t('sites.calOnSite') : t('sites.calCover');
+          return '<div class="related-row"><b>' + esc(displayName(s.engineer_id)) + '</b> ' +
+            '<span class="muted">' + esc(s.status || '') +
+            (s.day_part && s.day_part !== 'full' ? ' · ' + esc(s.day_part) : '') +
+            ' · ' + esc(kind) + '</span>' +
+            (s.note ? '<span class="muted"> — ' + esc(s.note) + '</span>' : '') + '</div>';
+        }).join('');
+        return '<h3 class="section-title" style="margin-top:12px">' + esc(d) + '</h3>' + rows;
+      }).join('');
+      return '<div class="card"><h2>' + esc(t('sites.calendar')) + '</h2>' +
+        (html || '<div class="empty">' + esc(t('sites.calendarNone')) + '</div>') + '</div>';
+    }
+    function trackersCard() {
+      if (!state.v9pt) return '';
+      var canEdit = L.can('tracker.manage', state.profile.role);
+      var allowed = state.projectTrackers[id] || null;
+      var rows = state.trackers.map(function (tr) {
+        var on = !allowed || allowed.indexOf(tr.key) !== -1;
+        return '<label class="checkbox" style="display:block;margin:4px 0">' +
+          '<input type="checkbox" data-ptracker="' + esc(tr.key) + '"' + (on ? ' checked' : '') +
+          (canEdit ? '' : ' disabled') + '> ' + esc(trackerName(tr.key)) +
+          ' <span class="muted">(' + esc(tr.key) + ')</span></label>';
+      }).join('');
+      return '<div class="card"><h2>' + esc(t('sites.trackers')) + '</h2>' +
+        '<p class="muted">' + esc(t('sites.trackersSub')) + '</p>' + rows +
+        (canEdit ? '<div class="form-actions"><button class="btn btn-sm btn-primary" id="ptrackers-save">' +
+          esc(t('common.save')) + '</button></div>' : '') + '</div>';
+    }
+
+    var siteTabBtns = [['overview', 'sites.tabOverview'], ['tickets', 'sites.tabTickets'],
+      ['calendar', 'sites.tabCalendar'], ['settings', 'sites.tabSettings']]
+      .map(function (tb) {
+        return '<button data-stab="' + tb[0] + '"' + (tab === tb[0] ? ' class="active"' : '') + '>' +
+          esc(t(tb[1])) + '</button>';
+      }).join('');
+    var tabBody =
+      tab === 'tickets' ? subtreeTicketsCard() :
+      tab === 'calendar' ? calendarCard() :
+      tab === 'settings'
+        ? '<div class="grid-2"><div>' + membersCard() + '</div><div>' + trackersCard() + '</div></div>' :
+      '<div class="grid-2"><div>' + ident + ccard + '</div><div>' + whcard + tcard + teamCard() +
+        maintCard() + chcard + rollupCard() + '</div></div>';
     view.innerHTML =
       '<button class="btn btn-sm" id="back-btn" style="margin-bottom:12px">← ' + esc(t('sites.backToSites')) + '</button>' +
       '<div class="detail-head"><span class="tnum">' + esc(site.code) + '</span>' +
         contractBadgeFor(contract) +
         '<span class="badge status-open">' + openCount + ' ' + esc(t('sites.openTickets')) + '</span></div>' +
       '<h1 class="detail-title">' + esc(site.name) + '</h1>' +
-      '<div class="grid-2"><div>' + ident + ccard + '</div><div>' + whcard + tcard + teamCard() + membersCard() + maintCard() + chcard + '</div></div>';
+      '<div class="tabs" id="site-tabs" style="margin-bottom:14px">' + siteTabBtns + '</div>' +
+      tabBody;
+    view.querySelectorAll('[data-stab]').forEach(function (b) {
+      b.onclick = function () {
+        siteTabState.id = id; siteTabState.tab = b.getAttribute('data-stab'); render();
+      };
+    });
     document.getElementById('back-btn').onclick = function () { nav('#/sites'); };
     /* v8 (#8): member add/remove writes profiles.project_scope. */
     var memberAddBtn = document.getElementById('member-add-btn');
@@ -7194,6 +7354,29 @@
       };
     });
     bindTableNav(view);
+    /* v9 (#25): project tracker set save (Settings tab). Storing no
+       rows means "unrestricted"; storing a subset restricts the
+       new-ticket dropdown for this project. */
+    var ptSave = document.getElementById('ptrackers-save');
+    if (ptSave) ptSave.onclick = async function () {
+      ptSave.disabled = true;
+      try {
+        var checked = Array.prototype.map.call(
+          view.querySelectorAll('[data-ptracker]:checked'),
+          function (c) { return c.getAttribute('data-ptracker'); });
+        if (!checked.length) { toast(t('sites.trackersMin'), 'error'); ptSave.disabled = false; return; }
+        var del = await sb.from('project_trackers').delete().eq('site_id', id);
+        if (del.error) throw del.error;
+        if (checked.length < state.trackers.length) {
+          var ins = await sb.from('project_trackers').insert(checked.map(function (k) {
+            return { site_id: id, tracker_key: k };
+          }));
+          if (ins.error) throw ins.error;
+        }
+        await loadReferenceData();
+        toast(t('common.saved'), 'ok'); render();
+      } catch (e) { apiError(e); ptSave.disabled = false; }
+    };
     /* v7.12: generate the yearly plan (12 maintenance tickets) + print. */
     var mgBtn = document.getElementById('maint-gen');
     if (mgBtn) mgBtn.onclick = async function () {
@@ -7282,7 +7465,8 @@
             } catch (e) { apiError(e); }
           };
         });
-      document.getElementById('contract-edit').onclick = function () {
+      var ceBtn = document.getElementById('contract-edit');
+      if (ceBtn) ceBtn.onclick = function () {
         openContractModal(site, contract, function () { render(); });
       };
       var cdel = document.getElementById('contract-del');
@@ -7307,7 +7491,8 @@
       });
     }
     if (canSite) {
-      document.getElementById('site-edit').onclick = function () {
+      var seBtn = document.getElementById('site-edit');
+      if (seBtn) seBtn.onclick = function () {
         openSiteModal(site, function () { render(); });
       };
       var sdel = document.getElementById('site-del');
@@ -7432,7 +7617,10 @@
   }
 
   /* ====================== v2: planning & calendar ====================== */
-  var planUi = { weeks: 2, offset: 0, q: '', cert: '' };
+  var planUi = { weeks: 2, offset: 0, q: '', cert: '', site: '' };
+  /* v9 (#25): project detail tabs — overview / tickets (subtree) /
+     calendar (project roster) / settings (members + trackers). */
+  var siteTabState = { id: null, tab: 'overview' };
   var calUi = { y: null, m: null };
   /* v4: prefill stashed by the planning workbench ("create field ticket");
      consumed once by viewNewTicket on creation. */
@@ -7670,6 +7858,12 @@
         var isToday = key === todayKey;
         var cellCls = 'plan-cell cell-' + stKey + (canWrite ? ' clickable' : '') +
           (isToday ? ' plan-today' : '');
+        /* v9 (#25): project filter — shifts belonging to other
+           projects (not on site there, not covering it) fade out. */
+        if (planUi.site && sh && sh.site_id !== planUi.site &&
+            (sh.covered_site_ids || []).indexOf(planUi.site) === -1) {
+          cellCls += ' plan-offsite';
+        }
         /* Merge key for the visual run-merge: same resolved state + day-part,
            and no extra markers (holiday/ticket/note/duty) that would make
            the cells visually different. */
@@ -7713,6 +7907,13 @@
             esc(t('plan.cert.associate')) + '</option>' +
           '<option value="professional"' + (planUi.cert === 'professional' ? ' selected' : '') + '>' +
             esc(t('plan.cert.professional')) + '</option></select></div>' +
+        /* v9 (#25): filter the roster by project */
+        '<div class="f"><label>' + esc(t('sites.name')) + '</label>' +
+          '<select id="plan-site"><option value="">' + esc(t('common.all')) + '</option>' +
+          state.sites.map(function (s) {
+            return '<option value="' + s.id + '"' + (planUi.site === s.id ? ' selected' : '') + '>' +
+              esc(s.code + ' — ' + s.name) + '</option>';
+          }).join('') + '</select></div>' +
         '<div class="f"><label>&nbsp;</label><div style="display:flex;gap:6px;align-items:center">' +
           [1, 2, 4].map(function (w) {
             return '<button class="btn btn-sm' + (planUi.weeks === w ? ' btn-primary' : '') + '" data-weeks="' + w + '">' +
@@ -7742,6 +7943,8 @@
       deb = setTimeout(function () { planUi.q = v; render(); }, 400);
     };
     document.getElementById('plan-cert').onchange = function () { planUi.cert = this.value; render(); };
+    var planSiteSel = document.getElementById('plan-site');
+    if (planSiteSel) planSiteSel.onchange = function () { planUi.site = this.value; render(); };
     if (canWrite) {
       view.querySelectorAll('.plan-cell[data-eng]').forEach(function (el) {
         el.onclick = function () {

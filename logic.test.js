@@ -877,6 +877,28 @@ eq('dayState Date object works', L.dayState(null, new Date(2026, 9, 10)), 'weeke
   eq('v8 validate flags dep-visible', L.validateCustomValues(fields, { gate: 'Si' }, 'open'), ['why:required']);
 })();
 
+/* ---------------- v9: project hierarchy helpers (#25) ---------------- */
+(function () {
+  var sites = [
+    { id: 'IT', parent_site_id: null },
+    { id: 'MONT', parent_site_id: 'IT' },
+    { id: 'RAG', parent_site_id: 'IT' },
+    { id: 'SUB', parent_site_id: 'MONT' },
+    { id: 'OTHER', parent_site_id: null }
+  ];
+  eq('v9 subtree root incl descendants', L.subtreeSiteIds(sites, 'IT'), ['IT', 'MONT', 'RAG', 'SUB']);
+  eq('v9 subtree leaf', L.subtreeSiteIds(sites, 'RAG'), ['RAG']);
+  eq('v9 subtree empty root', L.subtreeSiteIds(sites, null), []);
+  var trs = [
+    { key: 'support', is_active: true },
+    { key: 'spare', is_active: true },
+    { key: 'quality', is_active: false }
+  ];
+  eq('v9 avail unrestricted', L.availableTrackers(trs, null).map(function (x) { return x.key; }), ['support', 'spare']);
+  eq('v9 avail restricted', L.availableTrackers(trs, ['spare']).map(function (x) { return x.key; }), ['spare']);
+  eq('v9 avail empty list = unrestricted', L.availableTrackers(trs, []).map(function (x) { return x.key; }), ['support', 'spare']);
+})();
+
 /* ------------------------------------------------------------------ */
 console.log(`\nlogic.test.js: ${pass} passed, ${fail} failed`);
 if (fail) { console.log('Failed:', failures.join(' | ')); process.exit(1); }

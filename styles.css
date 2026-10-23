@@ -600,6 +600,8 @@ table.tbl tbody tr.clickable:hover td { background: #eef4fd; }
 /* v4: today column — header tinted blue; day cells get a translucent blue
    overlay so the day-state colors stay visible through the full-height band. */
 .plan-head.plan-today { background: var(--blue-tint); color: var(--blue-dark); }
+/* v9 (#25): planning project filter — off-project shifts fade out. */
+.plan-cell.plan-offsite { opacity: .32; }
 .plan-cell.plan-today::after {
   content: ""; position: absolute; inset: 0; background: rgba(79,142,247,.08);
   pointer-events: none;
