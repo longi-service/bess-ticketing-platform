@@ -428,12 +428,17 @@
       var v62p = await sb.from('email_templates').select('id', { count: 'exact', head: true });
       state.v62 = !v62p.error;
     } catch (e) { state.v62 = false; }
-    if (state.v62) {
-      try {
-        var sr = await sb.from('app_settings').select('*');
-        if (!sr.error) (sr.data || []).forEach(function (r) { state.appSettings[r.key] = r.value; });
-      } catch (e) { /* defaults: master on, customer mail off */ }
-    }
+    /* v8.4: app_settings is core config now (email prefs + the v8
+       dictionaries + tracker registry) — load it UNCONDITIONALLY.
+       It used to sit behind the v6.2 email probe (state.v62); with
+       that gate closed, dictionary/tracker saves wrote to the DB but
+       were never read back, so every edit silently reverted to the
+       built-in defaults (found in the 2026-10-23 linkage suite, A1 —
+       it affected admins exactly like dispatchers). */
+    try {
+      var sr = await sb.from('app_settings').select('*');
+      if (!sr.error) (sr.data || []).forEach(function (r) { state.appSettings[r.key] = r.value; });
+    } catch (e) { /* defaults apply */ }
     /* v8: dictionaries + tracker registry live in app_settings and merge
        over the logic.js defaults, so behavior is unchanged until an admin
        edits them on the Settings page. */
@@ -2791,12 +2796,27 @@
         .eq('parent_ticket_id', ticket.id).order('created_at');
       if (r.error) throw r.error;
       var rows = r.data || [];
-      if (!rows.length) {
+      /* v8.4: a sub-ticket shows its parent at the top of this card
+         (the parent link used to be invisible from the child). */
+      var parentHtml = '';
+      if (ticket.parent_ticket_id) {
+        var pr = await sb.from('tickets').select('id,ticket_no,title,status')
+          .eq('id', ticket.parent_ticket_id).single();
+        if (!pr.error && pr.data) {
+          parentHtml = '<div class="related-row"><span class="muted">' +
+            esc(t('ticket.parentTicket')) + ':</span> ' +
+            '<a href="#/ticket/' + pr.data.id + '" class="tnum">' +
+              esc(L.formatTicketNo(pr.data.ticket_no)) + '</a> ' +
+            '<span class="ttl">' + esc(pr.data.title) + '</span> ' +
+            statusBadge(pr.data.status) + '</div>';
+        }
+      }
+      if (!rows.length && !parentHtml) {
         box.innerHTML = '<div class="empty">—</div>';
         return;
       }
       await resolveNames(rows.map(function (x) { return x.assigned_to; }));
-      box.innerHTML = rows.map(function (x) {
+      box.innerHTML = parentHtml + rows.map(function (x) {
         return '<div class="related-row">' +
           '<a href="#/ticket/' + x.id + '" class="tnum">' + esc(L.formatTicketNo(x.ticket_no)) + '</a> ' +
           trackerBadge(x.tracker) + ' ' +
@@ -3273,10 +3293,16 @@
       var box = document.getElementById('lt-results');
       if (!q) { box.innerHTML = ''; return; }
       try {
-        var r = await baseTicketQuery('id,ticket_no,title,status')
-          .neq('id', ticketId)
-          .or('title.ilike.%' + q + '%,description.ilike.%' + q + '%')
-          .order('updated_at', { ascending: false }).limit(15);
+        /* v8.4: accept ticket numbers (T-0075 / 75) like the list
+           search does — title/description alone missed number lookups. */
+        var mNo = q.match(/^t-?0*(\d+)$/i);
+        var lq = baseTicketQuery('id,ticket_no,title,status').neq('id', ticketId);
+        if (mNo) lq = lq.eq('ticket_no', parseInt(mNo[1], 10));
+        else {
+          var likeQ = '%' + q.replace(/[%_]/g, '') + '%';
+          lq = lq.or('title.ilike.' + likeQ + ',description.ilike.' + likeQ);
+        }
+        var r = await lq.order('updated_at', { ascending: false }).limit(15);
         if (r.error) throw r.error;
         box.innerHTML = (r.data || []).map(function (x) {
           return '<div class="related-row">' +
