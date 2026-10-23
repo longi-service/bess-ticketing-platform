@@ -31,7 +31,7 @@ const ROLES = ['admin', 'dispatcher', 'pm', 'engineer', 'customer'];
 /* ------------------------------------------------------------------ */
 const EXPECT_CAN = {
   'ticket.create':         { admin:1, dispatcher:1, pm:1, engineer:1, customer:1 },
-  'ticket.assign':         { admin:1, dispatcher:1, pm:0, engineer:0, customer:0 },
+  'ticket.assign':         { admin:1, dispatcher:1, pm:0, engineer:1, customer:0 },  // v8 #13: engineers reassign
   'ticket.edit.core':      { admin:1, dispatcher:1, pm:0, engineer:0, customer:0 },
   'ticket.edit.own':       { admin:0, dispatcher:0, pm:0, engineer:0, customer:1 },
   'ticket.fieldreport':    { admin:1, dispatcher:1, pm:0, engineer:1, customer:0 },
@@ -811,6 +811,70 @@ eq('dayState Date object works', L.dayState(null, new Date(2026, 9, 10)), 'weeke
   // empty/garbage input is safe
   eq('assemble empty input', L.assembleRecipients({}), []);
   eq('assemble null input', L.assembleRecipients(null), []);
+})();
+
+/* ---------------- v8: permissions / roles ---------------- */
+(function () {
+  ok('v8 role tech_manager exists', L.ROLES.indexOf('tech_manager') !== -1);
+  ok('v8 engineer can assign (#13)', L.can('ticket.assign', 'engineer'));
+  ok('v8 tech_manager can assign', L.can('ticket.assign', 'tech_manager'));
+  ok('v8 customer cannot assign', !L.can('ticket.assign', 'customer'));
+  ok('v8 dispatcher can manage workflow (#18)', L.can('workflow.manage', 'dispatcher'));
+  ok('v8 pm cannot manage workflow', !L.can('workflow.manage', 'pm'));
+  ok('v8 engineer can view sites (#9)', L.can('site.view', 'engineer'));
+  ok('v8 customer cannot view sites', !L.can('site.view', 'customer'));
+  ok('v8 engineer cannot manage sites', !L.can('site.manage', 'engineer'));
+  ok('v8 tech_manager like senior engineer', L.can('ticket.transition', 'tech_manager') && L.can('part.view', 'tech_manager') && L.can('plan.view', 'tech_manager'));
+  ok('v8 tech_manager cannot manage users', !L.can('user.manage', 'tech_manager'));
+  ok('v8 tracker.manage admin only', L.can('tracker.manage', 'admin') && !L.can('tracker.manage', 'dispatcher'));
+  ok('v8 settings.manage dispatcher', L.can('settings.manage', 'dispatcher') && !L.can('settings.manage', 'pm'));
+})();
+
+/* ---------------- v8: dictionaries / tracker registry ---------------- */
+(function () {
+  eq('v8 segments default', L.segmentDict(null).map(function (s) { return s.key; }), ['ci', 'utility']);
+  var seg = L.segmentDict([{ key: 'utility', name_en: 'Grid scale' }, { key: 'resi', name_en: 'Residential', workflow_key: 'ci' }]);
+  eq('v8 segments merged keys', seg.map(function (s) { return s.key; }), ['ci', 'utility', 'resi']);
+  eq('v8 segments override', seg[1].name_en, 'Grid scale');
+  eq('v8 segments deactivate', L.segmentDict([{ key: 'ci', is_active: false }]).map(function (s) { return s.key; }), ['utility']);
+  eq('v8 sources default', L.sourceDict(undefined).length, 3);
+  eq('v8 sources append', L.sourceDict([{ key: 'monitoring_alert', name_en: 'Monitoring alert' }]).length, 4);
+  var tr = L.trackerRegistry([{ key: 'support', workflow_key: 'utility' }, { key: 'audit', name_en: 'Audit', prefix: 'AUD' }]);
+  eq('v8 trackers merged', tr.map(function (x) { return x.key; }), ['support', 'maintenance', 'spare', 'quality', 'audit']);
+  eq('v8 tracker workflow binding', tr[0].workflow_key, 'utility');
+  eq('v8 workflow: tracker wins', L.resolveWorkflowKey({ workflow_key: 'utility' }, 'ci', L.segmentDict(null)), 'utility');
+  eq('v8 workflow: segment binding', L.resolveWorkflowKey({ workflow_key: '' }, 'utility', L.segmentDict(null)), 'utility');
+  eq('v8 workflow: legacy fallback', L.resolveWorkflowKey(null, 'whatever', []), 'ci');
+})();
+
+/* ---------------- v8: field dependencies + required_states ---------------- */
+(function () {
+  var vals = { gate: 'Si', n: 12, tags: ['a', 'b'], blank: '' };
+  ok('v8 dep eq true', L.evalDependency({ field: 'gate', op: 'eq', value: 'Si' }, vals));
+  ok('v8 dep eq false', !L.evalDependency({ field: 'gate', op: 'eq', value: 'No' }, vals));
+  ok('v8 dep neq', L.evalDependency({ field: 'gate', op: 'neq', value: 'No' }, vals));
+  ok('v8 dep one_of scalar', L.evalDependency({ field: 'gate', op: 'one_of', value: 'No, Si' }, vals));
+  ok('v8 dep one_of array', L.evalDependency({ field: 'tags', op: 'one_of', value: 'b, c' }, vals));
+  ok('v8 dep filled', L.evalDependency({ field: 'gate', op: 'filled' }, vals));
+  ok('v8 dep filled false on blank', !L.evalDependency({ field: 'blank', op: 'filled' }, vals));
+  ok('v8 dep empty', L.evalDependency({ field: 'blank', op: 'empty' }, vals));
+  ok('v8 dep gt', L.evalDependency({ field: 'n', op: 'gt', value: 10 }, vals));
+  ok('v8 dep gt false', !L.evalDependency({ field: 'n', op: 'gt', value: 12 }, vals));
+  ok('v8 dep invalid op passes', L.evalDependency({ field: 'n', op: 'bogus', value: 1 }, vals));
+  ok('v8 dep none passes', L.evalDependency(null, vals));
+  var fDep = { key: 'x', depends_on: { field: 'gate', op: 'eq', value: 'Si' } };
+  ok('v8 fieldDepVisible true', L.fieldDepVisible(fDep, vals));
+  ok('v8 fieldDepVisible false', !L.fieldDepVisible(fDep, { gate: 'No' }));
+  ok('v8 required plain', L.fieldRequiredIn({ required: true }, 'open'));
+  ok('v8 required_states hit', L.fieldRequiredIn({ required: false, required_states: ['resolved'] }, 'resolved'));
+  ok('v8 required_states miss', !L.fieldRequiredIn({ required: true, required_states: ['resolved'] }, 'open'));
+  // validateCustomValues: dep-hidden required field is skipped; visible one errors
+  var fields = [
+    { key: 'gate', type: 'text' },
+    { key: 'why', type: 'text', required: true, depends_on: { field: 'gate', op: 'eq', value: 'Si' } }
+  ];
+  eq('v8 validate skips dep-hidden', L.validateCustomValues(fields, { gate: 'No' }, 'open'), []);
+  eq('v8 validate flags dep-visible', L.validateCustomValues(fields, { gate: 'Si' }, 'open'), ['why:required']);
 })();
 
 /* ------------------------------------------------------------------ */

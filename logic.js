@@ -22,7 +22,7 @@
   /* ------------------------------------------------------------------ */
   /* Constants (mirror DATA_CONTRACT.md)                                 */
   /* ------------------------------------------------------------------ */
-  var ROLES = ['admin', 'dispatcher', 'pm', 'engineer', 'customer'];
+  var ROLES = ['admin', 'dispatcher', 'pm', 'engineer', 'customer', 'tech_manager'];
   var STATUSES = ['open', 'assigned', 'in_progress', 'pending', 'pending_customer', 'resolved', 'closed'];
   var PRIORITIES = ['low', 'medium', 'high', 'urgent'];
   var SOURCES = ['customer_feedback', 'internal_discovery', 'pm_logged'];
@@ -47,31 +47,35 @@
   /* Permission matrix — UI gating. RLS is the real enforcement.         */
   /* ------------------------------------------------------------------ */
   var PERMISSION_MATRIX = {
-    'ticket.create':         ['admin', 'dispatcher', 'pm', 'engineer', 'customer'],
-    'ticket.assign':         ['admin', 'dispatcher'],
+    'ticket.create':         ['admin', 'dispatcher', 'pm', 'engineer', 'customer', 'tech_manager'],
+    'ticket.assign':         ['admin', 'dispatcher', 'engineer', 'tech_manager'],
     'ticket.edit.core':      ['admin', 'dispatcher'],          // title/desc/priority/site
     'ticket.edit.own':       ['customer'],                     // own ticket, only while open
-    'ticket.fieldreport':    ['admin', 'dispatcher', 'engineer'],
-    'ticket.transition':     ['admin', 'dispatcher', 'pm', 'engineer'],
-    'comment.internal.post': ['admin', 'dispatcher', 'pm', 'engineer'],
-    'photo.upload':          ['admin', 'dispatcher', 'pm', 'engineer', 'customer'],
+    'ticket.fieldreport':    ['admin', 'dispatcher', 'engineer', 'tech_manager'],
+    'ticket.transition':     ['admin', 'dispatcher', 'pm', 'engineer', 'tech_manager'],
+    'comment.internal.post': ['admin', 'dispatcher', 'pm', 'engineer', 'tech_manager'],
+    'photo.upload':          ['admin', 'dispatcher', 'pm', 'engineer', 'customer', 'tech_manager'],
     'site.manage':           ['admin', 'dispatcher', 'pm'],
     'site.delete':           ['admin'],
     'user.manage':           ['admin'],
     /* v2 additions */
-    'part.view':             ['admin', 'dispatcher', 'pm', 'engineer'],  // catalog/warehouse read
+    'part.view':             ['admin', 'dispatcher', 'pm', 'engineer', 'tech_manager'],  // catalog/warehouse read
     'part.manage':           ['admin', 'dispatcher'],                   // catalog/warehouse CRUD
-    'plan.view':             ['admin', 'dispatcher', 'pm', 'engineer'],  // v5: planning/calendar read (customers excluded — isolation audit)
+    'plan.view':             ['admin', 'dispatcher', 'pm', 'engineer', 'tech_manager'],  // v5: planning/calendar read (customers excluded — isolation audit)
     'plan.manage':           ['admin', 'dispatcher'],                   // shift write
     'contract.manage':       ['admin', 'dispatcher'],                   // LTSA contract CRUD
     /* v6/v7 additions */
-    'contact.manage':        ['admin', 'dispatcher', 'pm'],             // contacts master data
-    'workflow.manage':       ['admin'],                                // workflow states/transitions
+    'contact.manage':        ['admin', 'dispatcher', 'pm', 'tech_manager'],             // contacts master data
+    'workflow.manage':       ['admin', 'dispatcher'],                  // v8: dispatcher included (operations role)
     'field.manage':          ['admin', 'dispatcher'],                    // custom fields
     /* v6.1 additions */
     'group.manage':          ['admin', 'dispatcher', 'pm'],             // support groups
     /* v6.2 additions */
-    'email.manage':          ['admin']                                  // email templates / log / customer-mail switch
+    'email.manage':          ['admin'],                                 // email templates / log / customer-mail switch
+    /* v8 additions (Europe trial feedback) */
+    'site.view':             ['admin', 'dispatcher', 'pm', 'engineer', 'tech_manager'], // read-only project view
+    'settings.manage':       ['admin', 'dispatcher'],                   // dictionaries (segments / sources)
+    'tracker.manage':        ['admin']                                  // tracker registry stays HQ-governed
   };
 
   /**
@@ -127,13 +131,13 @@
         case 'open->assigned':        return role === 'admin' || role === 'dispatcher';
         case 'open->closed':          return role === 'admin' || role === 'dispatcher';
         case 'assigned->in_progress': return role === 'admin' || role === 'dispatcher' ||
-                                             (role === 'engineer' && isAssignee);
+                                             ((role === 'engineer' || role === 'tech_manager') && isAssignee);
         case 'assigned->open':        return role === 'admin' || role === 'dispatcher';
         case 'in_progress->resolved': return role === 'admin' || role === 'dispatcher' ||
-                                             (role === 'engineer' && isAssignee);
+                                             ((role === 'engineer' || role === 'tech_manager') && isAssignee);
         case 'in_progress->assigned': return role === 'admin' || role === 'dispatcher';
         case 'resolved->pending_customer': return role === 'admin' || role === 'dispatcher' ||
-                                             (role === 'engineer' && isAssignee);
+                                             ((role === 'engineer' || role === 'tech_manager') && isAssignee);
         case 'resolved->in_progress': return role === 'admin' || role === 'dispatcher';
         // v2: internal tickets (source != customer_feedback) may close directly;
         // customer tickets MUST go through pending_customer. Missing source
@@ -145,7 +149,7 @@
                                              (role === 'pm' && inScope) ||
                                              (role === 'customer' && isCreator);
         case 'pending_customer->in_progress': return role === 'admin' || role === 'dispatcher' ||
-                                             (role === 'engineer' && isAssignee);
+                                             ((role === 'engineer' || role === 'tech_manager') && isAssignee);
         // v3 F7: reopen — dispatcher/admin/pm only (NOT customer, NOT engineer).
         case 'closed->open': return role === 'admin' || role === 'dispatcher' || role === 'pm';
         default: return false;
@@ -839,6 +843,120 @@
   };
   var TRACKER_KEYS = ['support', 'maintenance', 'spare', 'quality'];
 
+  /* ------------------------------------------------------------------ */
+  /* v8 — maintainable dictionaries + tracker registry                   */
+  /* Stored in app_settings (JSON), merged over these built-in defaults */
+  /* so the app works unchanged before any admin edits them.            */
+  /* ------------------------------------------------------------------ */
+
+  /** Segments: key doubles as the label i18n suffix; workflow_key binds
+      the segment to a status workflow (ticket creation fallback). */
+  var DEFAULT_SEGMENTS = [
+    { key: 'ci',      name_en: 'C&I',           name_zh: '工商业',   workflow_key: 'ci' },
+    { key: 'utility', name_en: 'Utility scale', name_zh: '大型电站', workflow_key: 'utility' }
+  ];
+
+  /** Sources: key doubles as the label i18n suffix (source.<key>). */
+  var DEFAULT_SOURCES = [
+    { key: 'customer_feedback',  name_en: 'Customer feedback',  name_zh: '客户反馈' },
+    { key: 'internal_discovery', name_en: 'Internal discovery', name_zh: '内部发现' },
+    { key: 'pm_logged',          name_en: 'PM logged',          name_zh: 'PM 记录' }
+  ];
+
+  /** Tracker registry defaults (mirror TRACKERS + display names). */
+  var DEFAULT_TRACKERS = [
+    { key: 'support',     name_en: 'Support',          name_zh: '支持',   prefix: 'SUP', color: '#4f8ef7', workflow_key: '', is_active: true },
+    { key: 'maintenance', name_en: 'Maintenance',      name_zh: '维护',   prefix: 'MAN', color: '#22c55e', workflow_key: '', is_active: true },
+    { key: 'spare',       name_en: 'Spare parts',      name_zh: '备件',   prefix: 'RIC', color: '#f59e0b', workflow_key: '', is_active: true },
+    { key: 'quality',     name_en: 'Quality',          name_zh: '质量',   prefix: 'QLT', color: '#8b5cf6', workflow_key: '', is_active: true }
+  ];
+
+  /** Merge a stored dictionary (array of items with .key) over defaults:
+      stored items override same-key defaults; new keys are appended;
+      items with is_active === false are dropped. Invalid input → defaults. */
+  function mergeDict(defaults, stored) {
+    var out = (defaults || []).map(function (d) { return Object.assign({}, d); });
+    if (!Array.isArray(stored)) return out;
+    stored.forEach(function (s) {
+      if (!s || !s.key) return;
+      var i = -1;
+      out.forEach(function (o, j) { if (o.key === s.key) i = j; });
+      if (s.is_active === false) { if (i !== -1) out.splice(i, 1); return; }
+      if (i !== -1) out[i] = Object.assign({}, out[i], s);
+      else out.push(Object.assign({}, s));
+    });
+    return out;
+  }
+
+  function segmentDict(stored) { return mergeDict(DEFAULT_SEGMENTS, stored); }
+  function sourceDict(stored) { return mergeDict(DEFAULT_SOURCES, stored); }
+  function trackerRegistry(stored) { return mergeDict(DEFAULT_TRACKERS, stored); }
+
+  /** Workflow for a new ticket: tracker binding wins, then the site
+      segment's binding, then the legacy segment rule (utility → utility). */
+  function resolveWorkflowKey(tracker, segmentKey, segments) {
+    if (tracker && tracker.workflow_key) return tracker.workflow_key;
+    var seg = null;
+    (segments || DEFAULT_SEGMENTS).forEach(function (s) { if (s.key === segmentKey) seg = s; });
+    if (seg && seg.workflow_key) return seg.workflow_key;
+    return segmentKey === 'utility' ? 'utility' : 'ci';
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* v8 — custom-field dependencies (Massimo manual §24)                 */
+  /* depends_on = { field: <source key>, op: <op>, value: <any> }.      */
+  /* Ops: eq / neq / one_of / filled / empty / gt. When the condition    */
+  /* is false the dependent field is NOT rendered at all. Dependencies   */
+  /* only evaluate within the same form (same tracker).                  */
+  /* ------------------------------------------------------------------ */
+  var DEP_OPS = ['eq', 'neq', 'one_of', 'filled', 'empty', 'gt'];
+
+  function depValueEmpty(v) {
+    return v === undefined || v === null || v === '' ||
+           (Array.isArray(v) && v.length === 0);
+  }
+
+  function evalDependency(dep, values) {
+    if (!dep || !dep.field || DEP_OPS.indexOf(dep.op) === -1) return true;
+    var v = (values || {})[dep.field];
+    switch (dep.op) {
+      case 'filled': return !depValueEmpty(v);
+      case 'empty':  return depValueEmpty(v);
+      case 'eq':     return String(v === undefined || v === null ? '' : v) === String(dep.value === undefined || dep.value === null ? '' : dep.value);
+      case 'neq':    return String(v === undefined || v === null ? '' : v) !== String(dep.value === undefined || dep.value === null ? '' : dep.value);
+      case 'one_of': {
+        var list = String(dep.value === undefined || dep.value === null ? '' : dep.value)
+          .split(',').map(function (s) { return s.trim(); });
+        if (Array.isArray(v)) return v.some(function (x) { return list.indexOf(String(x)) !== -1; });
+        return list.indexOf(String(v === undefined || v === null ? '' : v)) !== -1;
+      }
+      case 'gt': {
+        var a = Number(v), b = Number(dep.value);
+        return !isNaN(a) && !isNaN(b) && a > b;
+      }
+      default: return true;
+    }
+  }
+
+  /** Is this field currently visible, considering its dependency? */
+  function fieldDepVisible(field, values) {
+    if (!field || !field.depends_on) return true;
+    return evalDependency(field.depends_on, values || {});
+  }
+
+  /** Required check honoring required_states (v8): when required_states
+      is a non-empty array the field is mandatory only in those states;
+      otherwise the plain `required` flag applies to every state. */
+  function fieldRequiredIn(field, status) {
+    if (!field) return false;
+    var rs = field.required_states || [];
+    if (Array.isArray(rs) && rs.length) {
+      if (!status) return !!field.required;
+      return rs.indexOf(status) !== -1;
+    }
+    return !!field.required;
+  }
+
   /**
    * WORKFLOW_TEMPLATES — built-in C&I / Utility templates.
    * Mirrors migration_v7.sql seeds; used as fallback when the
@@ -917,17 +1035,17 @@
       case 'open->assigned':        return role === 'admin' || role === 'dispatcher';
       case 'open->closed':          return role === 'admin' || role === 'dispatcher';
       case 'assigned->in_progress': return role === 'admin' || role === 'dispatcher' ||
-                                           (role === 'engineer' && isAssignee);
+                                           ((role === 'engineer' || role === 'tech_manager') && isAssignee);
       case 'assigned->open':        return role === 'admin' || role === 'dispatcher';
       case 'in_progress->resolved': return role === 'admin' || role === 'dispatcher' ||
-                                           (role === 'engineer' && isAssignee);
+                                           ((role === 'engineer' || role === 'tech_manager') && isAssignee);
       case 'in_progress->assigned': return role === 'admin' || role === 'dispatcher';
       case 'in_progress->hq_approval': return role === 'admin' || role === 'dispatcher' ||
-                                           (role === 'engineer' && isAssignee);
+                                           ((role === 'engineer' || role === 'tech_manager') && isAssignee);
       case 'hq_approval->in_progress': return role === 'admin' || role === 'dispatcher';
       case 'hq_approval->resolved':  return role === 'admin' || role === 'dispatcher';
       case 'resolved->pending_customer': return role === 'admin' || role === 'dispatcher' ||
-                                           (role === 'engineer' && isAssignee);
+                                           ((role === 'engineer' || role === 'tech_manager') && isAssignee);
       case 'resolved->in_progress': return role === 'admin' || role === 'dispatcher';
       case 'resolved->closed': return (role === 'admin' || role === 'dispatcher' ||
                                          (role === 'pm' && inScope)) &&
@@ -936,7 +1054,7 @@
                                          (role === 'pm' && inScope) ||
                                          (role === 'customer' && isCreator);
       case 'pending_customer->in_progress': return role === 'admin' || role === 'dispatcher' ||
-                                         (role === 'engineer' && isAssignee);
+                                         ((role === 'engineer' || role === 'tech_manager') && isAssignee);
       case 'closed->open': return role === 'admin' || role === 'dispatcher' || role === 'pm';
       default: return false;
     }
@@ -969,18 +1087,21 @@
   }
 
   /**
-   * validateCustomValues(fields, values) → array of error strings
+   * validateCustomValues(fields, values, [status]) → array of error strings
    * ("<key>:required" / "<key>:invalid"). Pure; UI maps to i18n.
+   * v8: fields hidden by an unsatisfied dependency are skipped entirely;
+   * required honors required_states when a status is supplied.
    */
-  function validateCustomValues(fields, values) {
+  function validateCustomValues(fields, values, status) {
     var errs = [];
     values = values || {};
     (fields || []).forEach(function (f) {
       if (!f || f.is_active === false) return;
+      if (!fieldDepVisible(f, values)) return;
       var v = values[f.key];
       var empty = v === undefined || v === null || v === '' ||
                   (Array.isArray(v) && v.length === 0);
-      if (f.required && empty) { errs.push(f.key + ':required'); return; }
+      if (fieldRequiredIn(f, status) && empty) { errs.push(f.key + ':required'); return; }
       if (empty) return;
       switch (f.type) {
         case 'number':
@@ -1262,6 +1383,18 @@
     findWarehouse: findWarehouse,
     TRACKERS: TRACKERS,
     TRACKER_KEYS: TRACKER_KEYS,
+    /* v8 additions */
+    DEFAULT_SEGMENTS: DEFAULT_SEGMENTS,
+    DEFAULT_SOURCES: DEFAULT_SOURCES,
+    DEFAULT_TRACKERS: DEFAULT_TRACKERS,
+    segmentDict: segmentDict,
+    sourceDict: sourceDict,
+    trackerRegistry: trackerRegistry,
+    resolveWorkflowKey: resolveWorkflowKey,
+    DEP_OPS: DEP_OPS,
+    evalDependency: evalDependency,
+    fieldDepVisible: fieldDepVisible,
+    fieldRequiredIn: fieldRequiredIn,
     WORKFLOW_TEMPLATES: WORKFLOW_TEMPLATES,
     buildTransitions: buildTransitions,
     transitionRuleAllowed: transitionRuleAllowed,

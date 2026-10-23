@@ -434,6 +434,37 @@
         if (!sr.error) (sr.data || []).forEach(function (r) { state.appSettings[r.key] = r.value; });
       } catch (e) { /* defaults: master on, customer mail off */ }
     }
+    /* v8: dictionaries + tracker registry live in app_settings and merge
+       over the logic.js defaults, so behavior is unchanged until an admin
+       edits them on the Settings page. */
+    state.segments = L.segmentDict(state.appSettings.dict_segments);
+    state.sources = L.sourceDict(state.appSettings.dict_sources);
+    state.trackers = L.trackerRegistry(state.appSettings.trackers);
+    /* v8: feature probes — notifications / ticket_watchers /
+       ticket_contacts / group_sites exist only after migration_v8.
+       Each surface degrades silently on an un-migrated backend. */
+    state.v8 = false; state.v8tc = false; state.groupSites = [];
+    try {
+      var v8p = await sb.from('notifications').select('id', { count: 'exact', head: true });
+      state.v8 = !v8p.error;
+    } catch (e) { state.v8 = false; }
+    if (state.v8) {
+      try {
+        var tcp = await sb.from('ticket_watchers').select('ticket_id', { count: 'exact', head: true });
+        state.v8tc = !tcp.error;
+        var gsr = await sb.from('group_sites').select('*');
+        if (!gsr.error) state.groupSites = gsr.data || [];
+      } catch (e) { /* v8 link tables stay off */ }
+    }
+    /* v8: custom_fields.depends_on / required_states exist only after
+       migration_v8 — gate the writes so older backends keep saving. */
+    state.v8owner = false; state.v8cf = false;
+    try {
+      var ow = await sb.from('sites').select('remote_owner_group_id').limit(1);
+      state.v8owner = !ow.error;
+      var cfp = await sb.from('custom_fields').select('depends_on').limit(1);
+      state.v8cf = !cfp.error;
+    } catch (e) { state.v8owner = false; state.v8cf = false; }
   }
 
   /**
@@ -441,10 +472,13 @@
    * otherwise the logic.js built-in template. Never throws.
    */
   function wfTransitions(workflowKey) {
-    var k = workflowKey === 'utility' ? 'utility' : 'ci';
+    /* v8: any workflow key may be bound (tracker/segment settings); the
+       legacy rule forced everything except 'utility' onto 'ci'. */
+    var k = workflowKey || 'ci';
     if (state.v7 && state.wfTrans[k] && Object.keys(state.wfTrans[k]).length)
       return state.wfTrans[k];
-    return L.WORKFLOW_TEMPLATES[k].transitions;
+    var tpl = L.WORKFLOW_TEMPLATES[k] || L.WORKFLOW_TEMPLATES.ci;
+    return tpl.transitions;
   }
 
   /**
@@ -463,12 +497,13 @@
    * wfStateList(workflowKey) — DB-driven states if loaded, else template.
    */
   function wfStateList(workflowKey) {
-    var k = workflowKey === 'utility' ? 'utility' : 'ci';
+    var k = workflowKey || 'ci';
     if (state.v7 && state.wfStates.length) {
       var list = state.wfStates.filter(function (s) { return s.workflow_key === k; });
       if (list.length) return list;
     }
-    return L.WORKFLOW_TEMPLATES[k].states.map(function (s, i) {
+    var tpl = L.WORKFLOW_TEMPLATES[k] || L.WORKFLOW_TEMPLATES.ci;
+    return tpl.states.map(function (s, i) {
       return { workflow_key: k, key: s.key, kind: s.kind, sort: (i + 1) * 10,
                name_en: s.key, name_zh: s.key,
                color_bg: '#f1f5f9', color_fg: '#475569' };
@@ -509,7 +544,7 @@
       if (scope.length) {
         q = q.or('site_id.in.(' + scope.join(',') + '),created_by.eq.' + me + ',assigned_to.eq.' + me);
       }
-    } else if (role === 'engineer') {
+    } else if (role === 'engineer' || role === 'tech_manager') {
       q = q.or('created_by.eq.' + me + ',assigned_to.eq.' + me);
     } else { // customer
       q = q.eq('created_by', me);
@@ -742,6 +777,14 @@
 
   function nav(hash) { window.location.hash = hash; }
 
+  /* v8 (#1): navigate, or render in place when the hash is already the
+     target — assigning the same hash fires no hashchange, which used to
+     leave a white page on refresh (boot relied on the event). */
+  function go(hash) {
+    if (window.location.hash === hash) render();
+    else nav(hash);
+  }
+
   function currentRoute() {
     var h = window.location.hash || '#/dashboard';
     var m = h.match(/^#\/ticket\/([0-9a-f-]{36})$/i);
@@ -749,7 +792,7 @@
     var ms = h.match(/^#\/site\/([0-9a-f-]{36})$/i);
     if (ms) return { name: 'site', id: ms[1] };
     var name = h.replace(/^#\//, '').split('?')[0];
-    if (['login', 'dashboard', 'tickets', 'new', 'parts', 'planning', 'calendar', 'users', 'sites', 'sla-alerts', 'contacts', 'workflow', 'fields', 'groups', 'email'].indexOf(name) === -1) name = 'dashboard';
+    if (['login', 'dashboard', 'tickets', 'new', 'parts', 'planning', 'calendar', 'users', 'sites', 'sla-alerts', 'contacts', 'workflow', 'fields', 'groups', 'email', 'settings'].indexOf(name) === -1) name = 'dashboard';
     return { name: name };
   }
 
@@ -775,7 +818,7 @@
     var route = currentRoute();
     if (KEY_MISSING || CDN_MISSING) { viewLogin(true); return; }
     if (route.name === 'login') {
-      if (state.profile) { nav('#/dashboard'); return; }
+      if (state.profile) { go('#/dashboard'); return; }
       viewLogin(false); return;
     }
     if (!requireAuth(route)) return;
@@ -794,15 +837,16 @@
       }
       else if (route.name === 'planning') { if (guard('plan.view')) await viewPlanning(view); }
       else if (route.name === 'calendar') { if (guard('plan.view')) await viewCalendar(view); }
-      else if (route.name === 'site') { if (guard('site.manage')) await viewSiteDetail(view, route.id); }
+      else if (route.name === 'site') { if (guard('site.view')) await viewSiteDetail(view, route.id); }
       else if (route.name === 'users') { if (guard('user.manage')) await viewUsers(view); }
-      else if (route.name === 'sites') { if (guard('site.manage')) await viewSites(view); }
+      else if (route.name === 'sites') { if (guard('site.view')) await viewSites(view); }
       else if (route.name === 'contacts') { if (guard('contact.manage')) await viewContacts(view); }
       /* v6.1: support groups management */
       else if (route.name === 'groups') { if (guard('group.manage')) await viewGroups(view); }
       /* v6.2: email notification settings (admin) */
       else if (route.name === 'email') { if (guard('email.manage')) await viewEmail(view); }
       else if (route.name === 'workflow') { if (guard('workflow.manage')) await viewWorkflow(view); }
+      else if (route.name === 'settings') { if (guard('settings.manage')) await viewSettings(view); }
       else if (route.name === 'fields') { if (guard('field.manage')) await viewCustomFields(view); }
       else if (route.name === 'sla-alerts') {
         /* v3 F8: dashboard-linked only (no nav item); dispatcher/admin/pm only. */
@@ -833,7 +877,7 @@
         { id: 'calendar',  href: '#/calendar',  label: t('nav.calendar'),  perm: 'plan.view' }
       ] },
       { title: t('nav.group.manage'), links: [
-        { id: 'sites',     href: '#/sites',     label: t('nav.sites'),     perm: 'site.manage' },
+        { id: 'sites',     href: '#/sites',     label: t('nav.sites'),     perm: 'site.view' },
         { id: 'contacts',  href: '#/contacts',  label: t('nav.contacts'),  perm: 'contact.manage' },
         /* v6.1: support groups (dispatch rules per Massimo) */
         { id: 'groups',    href: '#/groups',    label: t('nav.groups'),    perm: 'group.manage' },
@@ -841,6 +885,8 @@
         { id: 'email',     href: '#/email',     label: t('nav.email'),     perm: 'email.manage' },
         { id: 'workflow',  href: '#/workflow',  label: t('nav.workflow'),  perm: 'workflow.manage' },
         { id: 'fields',    href: '#/fields',    label: t('nav.fields'),    perm: 'field.manage' },
+        /* v8: dictionaries + tracker registry (governed settings) */
+        { id: 'settings',  href: '#/settings',  label: t('nav.settings'),  perm: 'settings.manage' },
         { id: 'users',     href: '#/users',     label: t('nav.users'),     perm: 'user.manage' }
       ] }
     ];
@@ -867,6 +913,9 @@
             '<div class="side-user-actions">' +
               '<button class="lang-toggle" id="lang-toggle">' +
                 (lang === 'en' ? '中文' : 'EN') + '</button>' +
+              /* v8 (#4): in-app notification bell */
+              '<button class="btn btn-sm" id="notif-bell-btn" style="display:none">🔔' +
+                '<span id="notif-badge" class="notif-badge" style="display:none"></span></button>' +
               /* v6.2: personal email-notification preferences */
               '<button class="btn btn-sm" id="notif-prefs-btn">' + esc(t('nav.myNotifications')) + '</button>' +
               '<button class="btn btn-sm" id="logout-btn">' + esc(t('nav.logout')) + '</button>' +
@@ -888,6 +937,12 @@
     document.getElementById('logout-btn').onclick = logout;
     /* v6.2: personal notification preferences modal (all roles). */
     document.getElementById('notif-prefs-btn').onclick = openMyNotificationsModal;
+    /* v8 (#4): notification bell — badge refresh + panel. */
+    var bellBtn = document.getElementById('notif-bell-btn');
+    if (bellBtn) {
+      bellBtn.onclick = function () { openNotifPanel(); };
+      refreshNotifBadge();
+    }
     // Mobile off-canvas behavior.
     document.getElementById('hamburger').onclick = function () {
       document.body.classList.toggle('sidebar-open');
@@ -907,6 +962,89 @@
     try { await sb.auth.signOut(); } catch (e) {}
     state.user = null; state.profile = null; state.nameCache = {};
     nav('#/login');
+  }
+
+  /* ------------------------- v8 helpers ------------------------------- */
+  /* Localized dictionary label: stored name wins, i18n key is fallback. */
+  function dictName(item, i18nKey) {
+    if (!item) return i18nKey || '';
+    var n = lang === 'zh' ? (item.name_zh || item.name_en) : (item.name_en || item.name_zh);
+    if (n) return n;
+    if (i18nKey) { var s = t(i18nKey); if (s !== i18nKey) return s; }
+    return item.key || '';
+  }
+  function sourceLabel(key) {
+    var it = null;
+    (state.sources || []).forEach(function (s) { if (s.key === key) it = s; });
+    return dictName(it, 'source.' + key);
+  }
+  function segmentLabel(key) {
+    var it = null;
+    (state.segments || []).forEach(function (s) { if (s.key === key) it = s; });
+    return dictName(it, 'sites.segment.' + key);
+  }
+  function trackerByKey(key) {
+    var it = null;
+    (state.trackers || []).forEach(function (x) { if (x.key === key) it = x; });
+    if (!it && L.TRACKERS[key]) {
+      var d = L.TRACKERS[key];
+      it = { key: key, prefix: d.prefix, color: d.color, workflow_key: '' };
+    }
+    return it;
+  }
+  function trackerName(key) {
+    var tr = trackerByKey(key);
+    return tr ? dictName(tr, 'tracker.' + key) : key;
+  }
+
+  /* v8 (#4): notification bell badge + panel. Data comes from the
+     notifications table (migration_v8, trigger-populated). */
+  async function refreshNotifBadge() {
+    var btn = document.getElementById('notif-bell-btn');
+    var badge = document.getElementById('notif-badge');
+    if (!btn || !badge) return;
+    if (!state.v8 || !state.profile) { btn.style.display = 'none'; return; }
+    btn.style.display = '';
+    try {
+      var r = await sb.from('notifications').select('id', { count: 'exact', head: true })
+        .eq('user_id', state.profile.id).eq('is_read', false);
+      var n = r.count || 0;
+      badge.textContent = n > 99 ? '99+' : String(n);
+      badge.style.display = n ? '' : 'none';
+    } catch (e) { /* badge stays hidden on error */ }
+  }
+
+  async function openNotifPanel() {
+    if (!state.v8) { toast(t('notif.unavailable'), 'error'); return; }
+    var r = await sb.from('notifications').select('*')
+      .eq('user_id', state.profile.id)
+      .order('created_at', { ascending: false }).limit(30);
+    var rows = (r && r.data) || [];
+    var body = rows.length ? rows.map(function (n) {
+      return '<div class="notif-row' + (n.is_read ? '' : ' unread') + '" data-nid="' + n.id + '"' +
+        (n.ticket_id ? ' data-ticket="' + n.ticket_id + '"' : '') + '>' +
+        '<div class="notif-kind">' + esc(t('notif.kind.' + n.kind)) + '</div>' +
+        '<div class="notif-main"><b>' + esc(n.ticket_no || '') + '</b> ' + esc(n.detail || '') + '</div>' +
+        '<div class="notif-time muted">' + esc(fmtDate(n.created_at)) + '</div></div>';
+    }).join('') : '<div class="empty">' + esc(t('notif.empty')) + '</div>';
+    var close = openModal(t('notif.title'),
+      '<div class="notif-list">' + body + '</div>',
+      '<button class="btn" id="notif-readall">' + esc(t('notif.markAllRead')) + '</button>');
+    var ra = document.getElementById('notif-readall');
+    if (ra) ra.onclick = async function () {
+      await sb.from('notifications').update({ is_read: true })
+        .eq('user_id', state.profile.id).eq('is_read', false);
+      close(); refreshNotifBadge();
+    };
+    document.querySelectorAll('.notif-row').forEach(function (el) {
+      el.onclick = async function () {
+        var nid = el.getAttribute('data-nid');
+        var tid = el.getAttribute('data-ticket');
+        try { await sb.from('notifications').update({ is_read: true }).eq('id', nid); } catch (e) {}
+        close(); refreshNotifBadge();
+        if (tid) nav('#/ticket/' + tid);
+      };
+    });
   }
 
   /* ------------------------------- login -------------------------------- */
@@ -1034,7 +1172,7 @@
   }
 
   /** Shared post-sign-in: profile load + is_active gate. */
-  async function afterSignIn(authUser) {
+  async function afterSignIn(authUser, opts) {
     var pr = await sb.from('profiles').select('*').eq('id', authUser.id).single();
     if (pr.error || !pr.data) {
       await sb.auth.signOut();
@@ -1055,7 +1193,16 @@
     }
     await loadReferenceData();
     state.ready = true;
-    nav('#/dashboard');
+    /* v8 (#1): on boot (page refresh) restore the route the user was on
+       instead of always forcing the dashboard — and render explicitly,
+       because navigating to the hash already in the URL fires no
+       hashchange and used to leave a white page. */
+    if (opts && opts.fromBoot) {
+      var h = window.location.hash || '';
+      if (!h || h === '#/login') { go('#/dashboard'); return; }
+      render(); return;
+    }
+    go('#/dashboard');
   }
 
   /* ----------------------------- dashboard ------------------------------ */
@@ -1208,7 +1355,7 @@
 
     /* Team workload */
     var er = await sb.from('profiles').select('id,display_name,email')
-      .eq('role', 'engineer').eq('is_active', true).order('display_name');
+      .in('role', ['engineer', 'tech_manager']).eq('is_active', true).order('display_name');
     var engineers = er.error ? [] : (er.data || []);
     var wl = engineers.map(function (e) {
       var assigned = open.filter(function (x) { return x.assigned_to === e.id; });
@@ -1479,11 +1626,11 @@
       '</tr>';
   }
 
-  /** v7.7: tracker badge (color-coded, i18n label). */
+  /** v7.7: tracker badge (color-coded). v8: registry-driven label/color. */
   function trackerBadge(tracker) {
-    var tr = L.TRACKERS[tracker] || L.TRACKERS.support;
+    var tr = trackerByKey(tracker) || trackerByKey('support');
     return '<span class="badge" style="background:' + tr.color + '22;color:' + tr.color +
-      ';border:1px solid ' + tr.color + '55">' + esc(t('tracker.' + tr.key)) + '</span>';
+      ';border:1px solid ' + tr.color + '55">' + esc(trackerName(tr.key)) + '</span>';
   }
 
   function ticketTable(tickets) {
@@ -1570,7 +1717,7 @@
     var role = state.profile.role;
     var filtersActive = !!(f.status || f.priority || f.source || f.site || f.q || f.tag || f.customer ||
                            f.unassignedOnly || f.contractOnly || f.group); // v3 U6 quick filters count too
-    var scopeLimited = role === 'engineer' || role === 'customer' ||
+    var scopeLimited = role === 'engineer' || role === 'tech_manager' || role === 'customer' ||
       (role === 'pm' && (state.profile.project_scope || []).length > 0);
     /* v3 D7: "Showing X of Y" = loaded rows vs. filter matches (all pages). */
     function scopeLineInner(loaded) {
@@ -1623,15 +1770,19 @@
         (state.v7
           ? '<div class="f"><label>' + esc(t('tickets.tracker')) + '</label>' +
             '<select id="f-tracker"><option value="">' + esc(t('common.all')) + '</option>' +
-            L.TRACKER_KEYS.map(function (k) {
-              return '<option value="' + k + '"' + (f.tracker === k ? ' selected' : '') + '>' +
-                esc(t('tracker.' + k)) + '</option>';
+            state.trackers.map(function (tr) {
+              return '<option value="' + esc(tr.key) + '"' + (f.tracker === tr.key ? ' selected' : '') + '>' +
+                esc(trackerName(tr.key)) + '</option>';
             }).join('') + '</select></div>'
           : '') +
         '<div class="f"><label>' + esc(t('list.filter.priority')) + '</label>' +
           '<select id="f-priority">' + selectOpts(L.PRIORITIES, 'priority.', f.priority) + '</select></div>' +
         '<div class="f"><label>' + esc(t('list.filter.source')) + '</label>' +
-          '<select id="f-source">' + selectOpts(L.SOURCES, 'source.', f.source) + '</select></div>' +
+          '<select id="f-source">' + '<option value="">' + esc(t('common.all')) + '</option>' +
+          state.sources.map(function (s) {
+            return '<option value="' + esc(s.key) + '"' + (f.source === s.key ? ' selected' : '') + '>' +
+              esc(sourceLabel(s.key)) + '</option>';
+          }).join('') + '</select></div>' +
         '<div class="f"><label>' + esc(t('list.filter.site')) + '</label>' +
           '<select id="f-site">' + siteOpts + '</select></div>' +
         /* v6.1: support group filter */
@@ -1873,7 +2024,7 @@
     var ctx = L.transitionCtx(ticket, p);
     var transitions = ticketTransitions(ticket, role, ctx);
     var canAssign = L.can('ticket.assign', role);
-    var canFieldReport = L.can('ticket.fieldreport', role) && (role !== 'engineer' || ctx.isAssignee);
+    var canFieldReport = L.can('ticket.fieldreport', role) && ((role !== 'engineer' && role !== 'tech_manager') || ctx.isAssignee);
     var canEditCore = L.can('ticket.edit.core', role) ||
                       (role === 'customer' && ctx.isCreator && ticket.status === 'open');
     var canUpload = L.canUploadPhoto(ticket, p);
@@ -1908,7 +2059,7 @@
       '<div class="detail-head"><span class="tnum">' + esc(L.formatTicketNo(ticket.ticket_no)) + '</span>' +
         statusBadge(ticket.status) + priBadge(ticket.priority) +
         trackerBadge(ticket.tracker) +
-        badge('status-open', t('source.' + ticket.source)) +
+        badge('status-open', sourceLabel(ticket.source)) +
         (ticket.is_ltsa ? badge('escalated', t('detail.contractTicket')) : '') +
         (ticket.escalated ? badge('escalated', t('detail.escalated')) : '') +
         (state.v3 ? tagPills(ticket.tags) : '') + '</div>' +
@@ -2011,7 +2162,7 @@
       '<div>' + // right column: facts rail
         '<div class="card"><h2>' + esc(t('common.details')) + '</h2>' +
           '<div class="sf-row"><span class="k">' + esc(t('detail.source')) + '</span>' +
-            '<span class="v">' + esc(t('source.' + ticket.source)) + '</span></div>' +
+            '<span class="v">' + esc(sourceLabel(ticket.source)) + '</span></div>' +
           '<div class="sf-row"><span class="k">' + esc(t('detail.site')) + '</span>' +
             '<span class="v">' + esc(siteLabel(ticket.site_id)) + '</span></div>' +
           '<div class="sf-row"><span class="k">' + esc(t('detail.createdBy')) + '</span>' +
@@ -2053,6 +2204,21 @@
             '<div style="margin-top:10px;display:flex;gap:8px">' +
               '<button class="btn btn-sm" id="new-sub-btn">+ ' + esc(t('ticket.newSub')) + '</button>' +
             '</div></div>'
+          : '') +
+        /* v8: related contacts + internal watchers (staff only). */
+        (!isCustomer && state.v8tc
+          ? '<div class="card"><h2>' + esc(t('detail.people')) + '</h2>' +
+            '<div class="muted" style="margin-bottom:4px">' + esc(t('detail.contacts')) + '</div>' +
+            '<div id="tk-contacts"><div class="empty">' + esc(t('common.loading')) + '</div></div>' +
+            '<div style="display:flex;gap:6px;margin:8px 0 14px">' +
+              '<select id="tk-contact-add" style="flex:1"></select>' +
+              '<button class="btn btn-sm" id="tk-contact-add-btn">+ ' + esc(t('common.add')) + '</button>' +
+              '<button class="btn btn-sm" id="tk-contact-new-btn">+ ' + esc(t('contacts.new')) + '</button></div>' +
+            '<div class="muted" style="margin-bottom:4px">' + esc(t('detail.watchers')) + '</div>' +
+            '<div id="tk-watchers"><div class="empty">' + esc(t('common.loading')) + '</div></div>' +
+            '<div style="display:flex;gap:6px;margin-top:8px">' +
+              '<select id="tk-watcher-add" style="flex:1"></select>' +
+              '<button class="btn btn-sm" id="tk-watcher-add-btn">+ ' + esc(t('common.add')) + '</button></div></div>'
           : '') +
       '</div></div>';
 
@@ -2228,6 +2394,7 @@
     renderTimeline(ticket, comments, photos);
     if (state.v3 && !isCustomer) loadRelatedTickets(ticket.id);
     if (!isCustomer && state.v7) loadSubTickets(ticket);
+    if (!isCustomer && state.v8tc) loadTicketPeople(ticket);
     /* v7.11: service reports + v7.14 custom fields */
     if (!isCustomer && state.v7) loadServiceReports(ticket);
     if (state.v7) renderCustomFieldValues(ticket);
@@ -2431,14 +2598,45 @@
         default:
           inner = '<input type="text" id="cf-' + f.key + '" value="' + esc(v || '') + '">';
       }
-      return '<div class="field"><label>' + esc(label) +
-        (f.required ? '<span class="req">*</span>' : '') + '</label>' + inner + '</div>';
+      return '<div class="field" id="cfw-' + f.key + '"><label>' + esc(label) +
+        (L.fieldRequiredIn(f, ticket.status) ? '<span class="req">*</span>' : '') + '</label>' + inner + '</div>';
     }
     var body = fields.map(fldHtml).join('');
     var close = openModal(t('cf.title'), body,
       '<button class="btn" id="m-cancel">' + esc(t('common.cancel')) + '</button>' +
       '<button class="btn btn-primary" id="m-save">' + esc(t('common.save')) + '</button>');
     document.getElementById('m-cancel').onclick = close;
+    /* v8 (#23): field dependencies — re-evaluate visibility on every
+       input; a field whose dependency fails is not rendered at all. */
+    function collectCfValues() {
+      var out = Object.assign({}, values);
+      fields.forEach(function (f) {
+        var el = document.getElementById('cf-' + f.key);
+        if (f.type === 'checkbox') { if (el) out[f.key] = el.checked; }
+        else if (f.type === 'checklist') {
+          out[f.key] = Array.prototype.map.call(
+            document.querySelectorAll('.cf-cl-' + f.key + ':checked'),
+            function (x) { return x.value; });
+        } else if (f.type === 'signature') { /* unchanged here */ }
+        else if (el) out[f.key] = el.value;
+      });
+      return out;
+    }
+    function applyDeps() {
+      var cur = collectCfValues();
+      fields.forEach(function (f) {
+        var w = document.getElementById('cfw-' + f.key);
+        if (w) w.style.display = L.fieldDepVisible(f, cur) ? '' : 'none';
+      });
+    }
+    fields.forEach(function (f) {
+      var el = document.getElementById('cf-' + f.key);
+      if (el) { el.addEventListener('change', applyDeps); el.addEventListener('input', applyDeps); }
+      document.querySelectorAll('.cf-cl-' + f.key).forEach(function (c) {
+        c.addEventListener('change', applyDeps);
+      });
+    });
+    applyDeps();
     document.getElementById('m-save').onclick = async function () {
       var btn = this; btn.disabled = true;
       try {
@@ -2452,7 +2650,7 @@
           } else if (f.type === 'signature') { /* unchanged here */ }
           else out[f.key] = document.getElementById('cf-' + f.key).value;
         });
-        var errs = L.validateCustomValues(fields, out);
+        var errs = L.validateCustomValues(fields, out, ticket.status);
         if (errs.length) { toast(t('cf.invalid'), 'error'); btn.disabled = false; return; }
         var r = await sb.from('tickets').update({ custom_values: out }).eq('id', ticket.id);
         if (r.error) throw r.error;
@@ -2462,6 +2660,97 @@
   }
 
   /* v7.10: load child tickets (parent_ticket_id) + show their status. */
+  /* v8: related contacts + watchers on the ticket detail page. */
+  async function loadTicketPeople(ticket) {
+    var cBox = document.getElementById('tk-contacts');
+    var wBox = document.getElementById('tk-watchers');
+    if (!cBox || !wBox) return;
+    try {
+      var cr = await sb.from('ticket_contacts').select('*').eq('ticket_id', ticket.id);
+      var links = cr.error ? [] : (cr.data || []);
+      var linkedC = {};
+      links.forEach(function (l) { linkedC[l.contact_id] = true; });
+      cBox.innerHTML = links.map(function (l) {
+        var c = (state.contacts || []).filter(function (x) { return x.id === l.contact_id; })[0];
+        if (!c) return '';
+        var nm = ((c.first_name || '') + ' ' + (c.last_name || '')).trim() || c.email || '—';
+        return '<div class="related-row"><b>' + esc(nm) + '</b> ' +
+          (c.company ? '<span class="muted">(' + esc(c.company) + ')</span> ' : '') +
+          (c.email ? '<span class="muted">' + esc(c.email) + '</span>' : '') +
+          ' <button class="btn-link danger" data-tcdel="' + l.id + '">✕</button></div>';
+      }).join('') || '<div class="empty">—</div>';
+      var cSel = document.getElementById('tk-contact-add');
+      if (cSel) {
+        cSel.innerHTML = (state.contacts || []).filter(function (c) { return !linkedC[c.id]; })
+          .map(function (c) {
+            var nm = ((c.first_name || '') + ' ' + (c.last_name || '')).trim() || c.email || '—';
+            return '<option value="' + c.id + '">' + esc(nm + (c.company ? ' (' + c.company + ')' : '')) + '</option>';
+          }).join('') || '<option value="">' + esc(t('common.none')) + '</option>';
+      }
+      var wr = await sb.from('ticket_watchers').select('*').eq('ticket_id', ticket.id);
+      var watchers = wr.error ? [] : (wr.data || []);
+      await resolveNames(watchers.map(function (w) { return w.user_id; }));
+      var linkedW = {};
+      watchers.forEach(function (w) { linkedW[w.user_id] = true; });
+      wBox.innerHTML = watchers.map(function (w) {
+        return '<div class="related-row">' + esc(displayName(w.user_id)) +
+          ' <button class="btn-link danger" data-twdel="' + w.id + '">✕</button></div>';
+      }).join('') || '<div class="empty">—</div>';
+      var pr = await sb.from('profiles').select('id,display_name,email,role')
+        .eq('is_active', true).order('display_name');
+      var wSel = document.getElementById('tk-watcher-add');
+      if (wSel && !pr.error) {
+        wSel.innerHTML = (pr.data || []).filter(function (u) {
+          return u.role !== 'customer' && !linkedW[u.id];
+        }).map(function (u) {
+          state.nameCache[u.id] = u.display_name || u.email;
+          return '<option value="' + u.id + '">' + esc(u.display_name || u.email) + '</option>';
+        }).join('') || '<option value="">' + esc(t('common.none')) + '</option>';
+      }
+      cBox.querySelectorAll('[data-tcdel]').forEach(function (b) {
+        b.onclick = async function () {
+          await sb.from('ticket_contacts').delete().eq('id', b.getAttribute('data-tcdel'));
+          loadTicketPeople(ticket);
+        };
+      });
+      wBox.querySelectorAll('[data-twdel]').forEach(function (b) {
+        b.onclick = async function () {
+          await sb.from('ticket_watchers').delete().eq('id', b.getAttribute('data-twdel'));
+          loadTicketPeople(ticket);
+        };
+      });
+      var caBtn = document.getElementById('tk-contact-add-btn');
+      if (caBtn) caBtn.onclick = async function () {
+        var cid = cSel && cSel.value;
+        if (!cid) return;
+        var r = await sb.from('ticket_contacts').insert(
+          { ticket_id: ticket.id, contact_id: cid, added_by: state.profile.id });
+        if (r.error) { apiError(r.error); return; }
+        loadTicketPeople(ticket);
+      };
+      var cnBtn = document.getElementById('tk-contact-new-btn');
+      if (cnBtn) cnBtn.onclick = function () {
+        openQuickContactModal(async function (c) {
+          if (!c || !c.id) return;
+          await sb.from('ticket_contacts').insert(
+            { ticket_id: ticket.id, contact_id: c.id, added_by: state.profile.id });
+          loadTicketPeople(ticket);
+        });
+      };
+      var waBtn = document.getElementById('tk-watcher-add-btn');
+      if (waBtn) waBtn.onclick = async function () {
+        var uid = wSel && wSel.value;
+        if (!uid) return;
+        var r = await sb.from('ticket_watchers').insert(
+          { ticket_id: ticket.id, user_id: uid, added_by: state.profile.id });
+        if (r.error) { apiError(r.error); return; }
+        loadTicketPeople(ticket);
+      };
+    } catch (e) {
+      cBox.innerHTML = '<div class="inline-err">' + esc(e.message || t('common.error')) + '</div>';
+    }
+  }
+
   async function loadSubTickets(ticket) {
     var box = document.getElementById('sub-list');
     if (!box) return;
@@ -2494,7 +2783,7 @@
     try {
       /* v4: extra columns feed the assignment recommendation. */
       res = await sb.from('profiles').select('id,display_name,email,country,country_code,regions,skills,remote_capable')
-        .eq('role', 'engineer').eq('is_active', true).order('display_name');
+        .in('role', ['engineer', 'tech_manager']).eq('is_active', true).order('display_name');
     } catch (e) { res = { error: e }; }
     if (res.error) {
       box.innerHTML = '<div class="inline-err">' + esc(res.error.message || t('common.error')) + '</div>';
@@ -2803,7 +3092,7 @@
         row(t('detail.site'), siteLabel(ticket.site_id)) +
         row(t('common.status'), t('status.' + ticket.status)) +
         row(t('common.priority'), t('priority.' + ticket.priority)) +
-        row(t('detail.source'), t('source.' + ticket.source)) +
+        row(t('detail.source'), sourceLabel(ticket.source)) +
         row(t('detail.assignee'), displayName(ticket.assigned_to)) +
         row(t('detail.createdBy'), displayName(ticket.created_by)) +
         row(t('common.createdAt'), fmtDate(ticket.created_at)) +
@@ -3038,7 +3327,7 @@
       return;
     }
     var er = await sb.from('profiles').select('id,display_name,email,country,country_code,regions,skills,remote_capable')
-      .eq('role', 'engineer').eq('is_active', true).order('display_name');
+      .in('role', ['engineer', 'tech_manager']).eq('is_active', true).order('display_name');
     if (er.error) { apiError(er.error); return; }
     var engineers = er.data || [];
     /* v4: rank engineers by region match (REAL ranking, not decorative). */
@@ -3228,7 +3517,10 @@
       return;
     }
     var role = state.profile.role;
-    var sources = role === 'customer' ? ['customer_feedback'] : L.SOURCES;
+    /* v8 (#17): sources come from the maintained dictionary. */
+    var sources = role === 'customer'
+      ? ['customer_feedback']
+      : state.sources.map(function (s) { return s.key; });
     /* v5 P1: role-differentiated required fields. Customers only need
        title + site + description + a photo/video; the technical fields
        (serial/fw/error/actions) become optional with an "if known" hint. */
@@ -3263,15 +3555,16 @@
           }).join('') + '</select></div>' +
         '<div class="field"><label>' + esc(t('new.field.source')) + '<span class="req">*</span></label>' +
           '<select id="nt-source">' + sources.map(function (s) {
-            return '<option value="' + s + '">' + esc(t('source.' + s)) + '</option>';
+            return '<option value="' + esc(s) + '">' + esc(sourceLabel(s)) + '</option>';
           }).join('') + '</select>' +
           (isCustomer ? '<div class="hint">' + esc(t('new.sourceHint.customer')) + '</div>' : '') + '</div>' +
-        /* v7.7: tracker selection (hidden until migration_v7). */
+        /* v7.7: tracker selection (hidden until migration_v7).
+           v8 (#19/#21): options come from the governed tracker registry. */
         (state.v7
           ? '<div class="field"><label>' + esc(t('new.tracker')) + '</label>' +
-            '<select id="nt-tracker">' + L.TRACKER_KEYS.map(function (k) {
-              return '<option value="' + k + '"' + (k === 'support' ? ' selected' : '') + '>' +
-                esc(t('tracker.' + k)) + '</option>';
+            '<select id="nt-tracker">' + state.trackers.map(function (tr) {
+              return '<option value="' + esc(tr.key) + '"' + (tr.key === 'support' ? ' selected' : '') + '>' +
+                esc(trackerName(tr.key)) + '</option>';
             }).join('') + '</select></div>'
           : '') +
         '<div class="field"><label>' + esc(t('new.field.site')) + star('nt-site') + '</label>' +
@@ -3311,12 +3604,71 @@
           ? '<div class="field span2"><label>' + esc(t('new.field.tags')) + '</label>' +
             '<input type="text" id="nt-tags" placeholder="' + esc(t('new.field.tagsPh')) + '"></div>'
           : '') +
+        /* v8 (tier-2 variant): related contacts + internal watchers.
+           Contacts are external people (no account needed); watchers are
+           internal users only — external mail stays on the customer
+           channel by design. */
+        (state.v8tc && !isCustomer
+          ? '<div class="field span2"><label>' + esc(t('new.contacts')) + '</label>' +
+            '<input type="text" id="nt-contact-q" placeholder="' + esc(t('new.contactsPh')) + '">' +
+            '<div id="nt-contacts" class="check-list"></div>' +
+            '<button type="button" class="btn btn-sm" id="nt-contact-new">+ ' + esc(t('contacts.new')) + '</button></div>' +
+            '<div class="field span2"><label>' + esc(t('new.watchers')) + '</label>' +
+            '<div id="nt-watchers" class="check-list"><span class="muted">' + esc(t('common.loading')) + '</span></div></div>'
+          : '') +
         '<div class="form-actions span2">' +
           '<button type="submit" class="btn btn-primary" id="nt-submit">' + esc(t('common.create')) + '</button>' +
           '<button type="button" class="btn" id="nt-cancel">' + esc(t('common.cancel')) + '</button>' +
         '</div>' +
       '</form></div>';
     document.getElementById('nt-cancel').onclick = function () { nav('#/tickets'); };
+    /* v8: contacts/watchers picker state + rendering. */
+    var ntContactSel = {};
+    var ntWatcherSel = {};
+    function renderNtContacts() {
+      var box = document.getElementById('nt-contacts');
+      if (!box) return;
+      var q = (document.getElementById('nt-contact-q').value || '').trim().toLowerCase();
+      var list = (state.contacts || []).filter(function (c) {
+        if (!q) return true;
+        return (((c.first_name || '') + ' ' + (c.last_name || '') + ' ' +
+          (c.company || '') + ' ' + (c.email || '')).toLowerCase().indexOf(q) !== -1);
+      }).slice(0, 30);
+      box.innerHTML = list.map(function (c) {
+        var nm = ((c.first_name || '') + ' ' + (c.last_name || '')).trim() || c.email || '—';
+        return '<label><input type="checkbox" class="nt-contact" value="' + c.id + '"' +
+          (ntContactSel[c.id] ? ' checked' : '') + '> ' + esc(nm) +
+          (c.company ? ' <span class="muted">(' + esc(c.company) + ')</span>' : '') + '</label>';
+      }).join('') || '<span class="muted">' + esc(t('contacts.none')) + '</span>';
+      box.querySelectorAll('.nt-contact').forEach(function (cb) {
+        cb.onchange = function () { ntContactSel[cb.value] = cb.checked; };
+      });
+    }
+    if (state.v8tc && !isCustomer) {
+      renderNtContacts();
+      document.getElementById('nt-contact-q').oninput = renderNtContacts;
+      document.getElementById('nt-contact-new').onclick = function () {
+        openQuickContactModal(function (c) {
+          if (c && c.id) { ntContactSel[c.id] = true; renderNtContacts(); }
+        });
+      };
+      sb.from('profiles').select('id,display_name,email,role').eq('is_active', true)
+        .order('display_name').then(function (r) {
+          var box = document.getElementById('nt-watchers');
+          if (!box) return;
+          var users = (r.error ? [] : (r.data || [])).filter(function (u) {
+            return u.role !== 'customer' && u.id !== state.profile.id;
+          });
+          box.innerHTML = users.map(function (u) {
+            state.nameCache[u.id] = u.display_name || u.email;
+            return '<label><input type="checkbox" class="nt-watcher" value="' + u.id + '"> ' +
+              esc(u.display_name || u.email) + ' <span class="muted">(' + esc(t('role.' + u.role)) + ')</span></label>';
+          }).join('') || '<span class="muted">—</span>';
+          box.querySelectorAll('.nt-watcher').forEach(function (cb) {
+            cb.onchange = function () { ntWatcherSel[cb.value] = cb.checked; };
+          });
+        });
+    }
     /* v2 R3: a site with an active LTSA contract forces is_ltsa + urgent + contract SLA. */
     var siteSel = document.getElementById('nt-site');
     var priSel = document.getElementById('nt-priority');
@@ -3432,7 +3784,9 @@
         };
         if (state.v7) {
           insData.tracker = trackerVal;
-          insData.workflow_key = (siteRow && siteRow.segment === 'utility') ? 'utility' : 'ci';
+          /* v8 (#22): tracker binding wins, then segment binding. */
+          insData.workflow_key = L.resolveWorkflowKey(
+            trackerByKey(trackerVal), siteRow && siteRow.segment, state.segments);
           if (newTicketPrefill && newTicketPrefill.parentTicketId) {
             insData.parent_ticket_id = newTicketPrefill.parentTicketId;
           }
@@ -3449,6 +3803,17 @@
         }
         var ins = await sb.from('tickets').insert(insData).select('id,ticket_no').single();
         if (ins.error) throw ins.error;
+        /* v8: persist related contacts + watchers chosen on the form. */
+        if (state.v8tc) {
+          try {
+            var wRows = Object.keys(ntWatcherSel).filter(function (k) { return ntWatcherSel[k]; })
+              .map(function (uid) { return { ticket_id: ins.data.id, user_id: uid, added_by: state.profile.id }; });
+            if (wRows.length) await sb.from('ticket_watchers').insert(wRows);
+            var cRows = Object.keys(ntContactSel).filter(function (k) { return ntContactSel[k]; })
+              .map(function (cid) { return { ticket_id: ins.data.id, contact_id: cid, added_by: state.profile.id }; });
+            if (cRows.length) await sb.from('ticket_contacts').insert(cRows);
+          } catch (e) { /* links are best-effort; the ticket itself is saved */ }
+        }
         /* v6.2 item 15: notify creation (creator is excluded by the
            notifier itself — they don't need mail about their own action). */
         notifyTicketEvent('ticket_created',
@@ -3500,12 +3865,17 @@
     var rows = users.map(function (u) {
       var scope = (u.project_scope && u.project_scope.length)
         ? u.project_scope.map(siteShort).join(', ') : t('users.projectScopeAll');
+      /* v8 (#7): the user's support groups, from group_members. */
+      var ugroups = (state.groupMembers || [])
+        .filter(function (m) { return m.member_type === 'profile' && m.member_id === u.id; })
+        .map(function (m) { return groupName(m.group_id); }).filter(Boolean).join(', ') || '—';
       var main = '<tr>' +
         '<td><b>' + esc(u.display_name || '—') + '</b><br><span class="muted">' + esc(u.email || '') + '</span></td>' +
         '<td>' + esc(t('role.' + u.role)) + '</td>' +
         '<td>' + certBadge(u.cert_level) + '</td>' +
         '<td class="muted">' + esc(u.country || '—') + '</td>' +
         '<td class="muted">' + esc(scope) + '</td>' +
+        '<td class="muted">' + esc(ugroups) + '</td>' +
         '<td>' + (u.is_active
             ? badge('sla-ok', t('users.active'))
             : badge('status-closed', t('users.deactivate'))) + '</td>' +
@@ -3518,9 +3888,9 @@
          country_code, remote_capable, skills, regions. Hidden when !v4
          (columns don't exist on older backends). */
       var extra = '';
-      if (state.v4 && u.role === 'engineer') {
+      if (state.v4 && (u.role === 'engineer' || u.role === 'tech_manager')) {
         var ccVal = ((u.country_code || u.country) || '').toUpperCase();
-        extra = '<tr class="eng-extra" data-engrow="' + u.id + '"><td colspan="7">' +
+        extra = '<tr class="eng-extra" data-engrow="' + u.id + '"><td colspan="8">' +
           '<div class="micro-label" style="margin-bottom:8px">' + esc(t('users.scheduling')) + '</div>' +
           '<div class="ee-grid">' +
             '<div class="field"><label>' + esc(t('users.countryCode')) + '</label>' +
@@ -3555,6 +3925,8 @@
       '<th>' + esc(t('users.displayName')) + '</th><th>' + esc(t('common.role')) + '</th>' +
       '<th>' + esc(t('users.certLevel')) + '</th>' +
       '<th>' + esc(t('common.country')) + '</th><th>' + esc(t('users.projectScope')) + '</th>' +
+      /* v8 (#7): group memberships visible next to the project scope */
+      '<th>' + esc(t('nav.groups')) + '</th>' +
       '<th>' + esc(t('common.status')) + '</th><th>' + esc(t('common.actions')) + '</th>' +
       '</tr></thead><tbody>' + rows + '</tbody></table></div></div>';
     document.getElementById('user-new').onclick = function () { openUserModal(null, users, function () { render(); }); };
@@ -3870,7 +4242,8 @@
         '<span class="grow"></span>' + statusBadge +
         contractBadgeFor(contract) +
         '<span class="badge status-open">' + (counts[s.id] || 0) + ' ' + esc(t('sites.openTickets')) + '</span>' +
-        '<span class="muted" style="font-size:12px">' + esc(displayName(s.remote_owner_id)) + '</span>' +
+        '<span class="muted" style="font-size:12px">' +
+          esc(s.remote_owner_group_id ? ('👥 ' + groupName(s.remote_owner_group_id)) : displayName(s.remote_owner_id)) + '</span>' +
       '</div>';
     }
     var bodyHtml;
@@ -3892,27 +4265,33 @@
       })('__root', 0);
       bodyHtml = out.join('') || '<div class="empty">' + esc(t('list.noResults')) + '</div>';
     }
+    /* v8 (#9): engineers get this page read-only (site.view without
+       site.manage) — creation and the customer register stay gated. */
+    var canManageSites = L.can('site.manage', state.profile.role);
     view.innerHTML =
       '<div class="page-head"><h1>' + esc(t('sites.title')) + '</h1>' +
-      '<button class="btn btn-primary" id="site-new">+ ' + esc(t('sites.new')) + '</button></div>' +
+      (canManageSites
+        ? '<button class="btn btn-primary" id="site-new">+ ' + esc(t('sites.new')) + '</button>'
+        : '<span class="muted">' + esc(t('sites.readOnly')) + '</span>') + '</div>' +
       '<div class="card"><h2 class="section-title">' + esc(t('sites.tree')) + '</h2>' +
       '<div class="field" style="max-width:360px"><input type="text" id="site-q" placeholder="' +
         esc(t('sites.searchPh')) + '" value="' + esc(state.siteSearch || '') + '"></div>' +
       '<div id="site-tree">' + bodyHtml + '</div></div>' +
-      (state.v3 ? '<div class="card" id="customers-card"></div>' : '');
+      (state.v3 && canManageSites ? '<div class="card" id="customers-card"></div>' : '');
     var deb = null;
     document.getElementById('site-q').oninput = function () {
       var v = this.value;
       clearTimeout(deb);
       deb = setTimeout(function () { state.siteSearch = v; render(); }, 400);
     };
-    document.getElementById('site-new').onclick = function () {
+    var siteNewBtn = document.getElementById('site-new');
+    if (siteNewBtn) siteNewBtn.onclick = function () {
       openSiteModal(null, function () { render(); });
     };
     view.querySelectorAll('[data-site]').forEach(function (el) {
       el.onclick = function () { nav('#/site/' + el.getAttribute('data-site')); };
     });
-    if (state.v3) renderCustomersCard();
+    if (state.v3 && canManageSites) renderCustomersCard();
   }
 
   /* v3 F6: customer company register (admin/dispatcher via site.manage gate). */
@@ -4060,8 +4439,13 @@
       (memByGroup[m.group_id] = memByGroup[m.group_id] || []).push(m);
     });
     var rows = state.groups.map(function (g) {
+      /* v8 (#6): projects linked to this group. */
+      var gprojects = (state.groupSites || [])
+        .filter(function (gs) { return gs.group_id === g.id; })
+        .map(function (gs) { return siteShort(gs.site_id); }).filter(Boolean).join(', ') || '—';
       return '<tr><td><b>' + esc(g.name) + '</b></td>' +
         '<td class="muted">' + esc(g.description || '—') + '</td>' +
+        '<td class="muted">' + esc(gprojects) + '</td>' +
         '<td>' + (memByGroup[g.id] || []).length + '</td>' +
         '<td>' + badge(g.is_active === false ? 'status-closed' : 'sla-ok',
             t(g.is_active === false ? 'groups.inactive' : 'groups.active')) + '</td>' +
@@ -4075,10 +4459,11 @@
       '<p class="muted">' + esc(t('groups.sub')) + '</p>' +
       '<div class="card"><div style="overflow-x:auto"><table class="tbl"><thead><tr>' +
       '<th>' + esc(t('groups.name')) + '</th><th>' + esc(t('groups.description')) + '</th>' +
+      '<th>' + esc(t('groups.projects')) + '</th>' +
       '<th>' + esc(t('groups.members')) + '</th><th>' + esc(t('groups.active')) + '</th>' +
       '<th>' + esc(t('common.actions')) + '</th>' +
       '</tr></thead><tbody>' +
-      (rows || '<tr><td colspan="5"><div class="empty">' + esc(t('groups.none')) + '</div></td></tr>') +
+      (rows || '<tr><td colspan="6"><div class="empty">' + esc(t('groups.none')) + '</div></td></tr>') +
       '</tbody></table></div></div>';
     function refresh() { loadReferenceData().then(function () { viewGroups(view); }); }
     document.getElementById('group-new').onclick = function () {
@@ -4110,11 +4495,24 @@
 
   function openGroupModal(group, done) {
     group = group || {};
+    /* v8 (#6): a group can be linked to projects (group_sites). */
+    var linkedSites = {};
+    (state.groupSites || []).forEach(function (gs) {
+      if (group.id && gs.group_id === group.id) linkedSites[gs.site_id] = true;
+    });
     var body =
       '<div class="field"><label>' + esc(t('groups.name')) + '<span class="req">*</span></label>' +
         '<input type="text" id="g-name" value="' + esc(group.name || '') + '"></div>' +
       '<div class="field"><label>' + esc(t('groups.description')) + '</label>' +
         '<textarea id="g-desc" style="height:52px">' + esc(group.description || '') + '</textarea></div>' +
+      (state.v8
+        ? '<div class="field"><label>' + esc(t('groups.projects')) + '</label>' +
+          '<div class="check-list">' +
+          state.sites.map(function (s) {
+            return '<label><input type="checkbox" class="g-site" value="' + s.id + '"' +
+              (linkedSites[s.id] ? ' checked' : '') + '> ' + esc(s.code + ' — ' + s.name) + '</label>';
+          }).join('') + '</div></div>'
+        : '') +
       '<div class="field"><label><input type="checkbox" id="g-active"' +
         (group.is_active !== false ? ' checked' : '') + '> ' + esc(t('groups.active')) + '</label></div>';
     var close = openModal(group.id ? t('groups.edit') : t('groups.new'), body,
@@ -4130,10 +4528,27 @@
           is_active: document.getElementById('g-active').checked
         };
         if (!row.name) { toast(t('new.fillRequired'), 'error'); btn.disabled = false; return; }
-        var r = group.id
-          ? await sb.from('groups').update(row).eq('id', group.id)
-          : await sb.from('groups').insert(row);
-        if (r.error) throw r.error;
+        var gid = group.id;
+        if (gid) {
+          var ru = await sb.from('groups').update(row).eq('id', gid);
+          if (ru.error) throw ru.error;
+        } else {
+          var ri = await sb.from('groups').insert(row).select('id');
+          if (ri.error) throw ri.error;
+          gid = ri.data && ri.data[0] && ri.data[0].id;
+        }
+        /* v8 (#6): rewrite this group's project links. */
+        if (state.v8 && gid) {
+          var want = {};
+          document.querySelectorAll('.g-site:checked').forEach(function (c) { want[c.value] = true; });
+          await sb.from('group_sites').delete().eq('group_id', gid);
+          var ids = Object.keys(want);
+          if (ids.length) {
+            var rl = await sb.from('group_sites').insert(
+              ids.map(function (sid) { return { group_id: gid, site_id: sid }; }));
+            if (rl.error) throw rl.error;
+          }
+        }
         toast(t('groups.saved'), 'ok');
         close(); done();
       } catch (e) { apiError(e); btn.disabled = false; }
@@ -4224,6 +4639,171 @@
      template (C&I / Utility). DB rows drive ticketTransitions() at runtime. */
   /* v6.2 item 15: email notification admin — send log, templates,
      switches, test send. Gated on state.v62 (migration_v6_2). */
+  /* ================= v8: settings (dictionaries + trackers) ============
+   * #10/#17: Segment and Source dictionaries are maintained here and
+   * stored as JSON in app_settings; forms read the merged registry from
+   * logic.js, so defaults apply until something is saved here.
+   * #21/#22 (governed): trackers are created/edited ONLY here and only
+   * by admins (tracker.manage) — each tracker binds a status workflow
+   * and the custom fields already bind per tracker on the Fields page. */
+  async function viewSettings(view) {
+    var wfKeys = ['ci', 'utility'];
+    (state.wfStates || []).forEach(function (s) {
+      if (wfKeys.indexOf(s.workflow_key) === -1) wfKeys.push(s.workflow_key);
+    });
+    function wfOptions(sel) {
+      return '<option value="">' + esc(t('common.none')) + '</option>' + wfKeys.map(function (k) {
+        return '<option value="' + esc(k) + '"' + (sel === k ? ' selected' : '') + '>' + esc(k) + '</option>';
+      }).join('');
+    }
+    function dictRows(kind, items, withWorkflow) {
+      return items.map(function (it, i) {
+        return '<tr>' +
+          '<td><input type="text" class="ds-key" data-k="' + kind + '" data-i="' + i + '" value="' + esc(it.key) + '"></td>' +
+          '<td><input type="text" class="ds-en" data-k="' + kind + '" data-i="' + i + '" value="' + esc(it.name_en || '') + '"></td>' +
+          '<td><input type="text" class="ds-zh" data-k="' + kind + '" data-i="' + i + '" value="' + esc(it.name_zh || '') + '"></td>' +
+          (withWorkflow
+            ? '<td><select class="ds-wf" data-k="' + kind + '" data-i="' + i + '">' + wfOptions(it.workflow_key || '') + '</select></td>'
+            : '') +
+          '<td><button class="btn btn-sm btn-danger" data-dsdel="' + kind + ':' + i + '">' + esc(t('common.delete')) + '</button></td></tr>';
+      }).join('');
+    }
+    var canTrackers = L.can('tracker.manage', state.profile.role);
+    var trackerRows = (state.trackers || []).map(function (tr, i) {
+      return '<tr>' +
+        '<td><input type="text" class="tk-key" data-i="' + i + '" value="' + esc(tr.key) + '"></td>' +
+        '<td><input type="text" class="tk-en" data-i="' + i + '" value="' + esc(tr.name_en || '') + '"></td>' +
+        '<td><input type="text" class="tk-zh" data-i="' + i + '" value="' + esc(tr.name_zh || '') + '"></td>' +
+        '<td><input type="text" class="tk-prefix" data-i="' + i + '" value="' + esc(tr.prefix || '') + '" style="width:64px"></td>' +
+        '<td><input type="color" class="tk-color" data-i="' + i + '" value="' + esc(tr.color || '#4f8ef7') + '"></td>' +
+        '<td><select class="tk-wf" data-i="' + i + '">' + wfOptions(tr.workflow_key || '') + '</select></td>' +
+        '<td><button class="btn btn-sm btn-danger" data-tkdel="' + i + '">' + esc(t('common.delete')) + '</button></td></tr>';
+    }).join('');
+    view.innerHTML =
+      '<div class="page-head"><h1>' + esc(t('settings.title')) + '</h1></div>' +
+      '<div class="card"><h2 class="section-title">' + esc(t('settings.dictTitle')) + '</h2>' +
+      '<p class="muted">' + esc(t('settings.dictSub')) + '</p>' +
+      '<h3>' + esc(t('sites.segment')) + '</h3>' +
+      '<table class="tbl"><thead><tr><th>Key</th><th>EN</th><th>中文</th><th>' + esc(t('settings.workflow')) + '</th><th></th></tr></thead>' +
+      '<tbody id="ds-segments">' + dictRows('segments', state.segments, true) + '</tbody></table>' +
+      '<button class="btn btn-sm" id="ds-seg-add">+ ' + esc(t('settings.addRow')) + '</button>' +
+      '<h3 style="margin-top:18px">' + esc(t('settings.sources')) + '</h3>' +
+      '<table class="tbl"><thead><tr><th>Key</th><th>EN</th><th>中文</th><th></th></tr></thead>' +
+      '<tbody id="ds-sources">' + dictRows('sources', state.sources, false) + '</tbody></table>' +
+      '<button class="btn btn-sm" id="ds-src-add">+ ' + esc(t('settings.addRow')) + '</button>' +
+      '<div class="form-actions"><button class="btn btn-primary" id="ds-save">' + esc(t('common.save')) + '</button></div></div>' +
+      (canTrackers
+        ? '<div class="card"><h2 class="section-title">' + esc(t('settings.trackers')) + '</h2>' +
+          '<p class="muted">' + esc(t('settings.trackersSub')) + '</p>' +
+          '<table class="tbl"><thead><tr><th>Key</th><th>EN</th><th>中文</th><th>' + esc(t('settings.prefix')) + '</th>' +
+          '<th>' + esc(t('settings.color')) + '</th><th>' + esc(t('settings.workflow')) + '</th><th></th></tr></thead>' +
+          '<tbody id="tk-body">' + trackerRows + '</tbody></table>' +
+          '<button class="btn btn-sm" id="tk-add">+ ' + esc(t('settings.addRow')) + '</button>' +
+          '<div class="form-actions"><button class="btn btn-primary" id="tk-save">' + esc(t('common.save')) + '</button></div></div>'
+        : '');
+    function collectDict(kind, withWorkflow) {
+      var out = [];
+      view.querySelectorAll('.ds-key[data-k="' + kind + '"]').forEach(function (inp) {
+        var i = inp.getAttribute('data-i');
+        var key = inp.value.trim();
+        if (!key) return;
+        var item = {
+          key: key,
+          name_en: view.querySelector('.ds-en[data-k="' + kind + '"][data-i="' + i + '"]').value.trim(),
+          name_zh: view.querySelector('.ds-zh[data-k="' + kind + '"][data-i="' + i + '"]').value.trim()
+        };
+        if (withWorkflow) {
+          item.workflow_key = view.querySelector('.ds-wf[data-k="' + kind + '"][data-i="' + i + '"]').value || '';
+        }
+        out.push(item);
+      });
+      return out;
+    }
+    async function saveSettingsKey(key, value) {
+      var r = await sb.from('app_settings').upsert({ key: key, value: value }, { onConflict: 'key' });
+      if (r.error) throw r.error;
+      state.appSettings[key] = value;
+    }
+    view.querySelectorAll('[data-dsdel]').forEach(function (b) {
+      b.onclick = function () {
+        var row = b.closest('tr'); if (row) row.remove();
+      };
+    });
+    function addDictRow(kind, withWorkflow) {
+      var tb = document.getElementById(kind === 'segments' ? 'ds-segments' : 'ds-sources');
+      var i = 'n' + Date.now();
+      var tr = document.createElement('tr');
+      tr.innerHTML =
+        '<td><input type="text" class="ds-key" data-k="' + kind + '" data-i="' + i + '" value=""></td>' +
+        '<td><input type="text" class="ds-en" data-k="' + kind + '" data-i="' + i + '" value=""></td>' +
+        '<td><input type="text" class="ds-zh" data-k="' + kind + '" data-i="' + i + '" value=""></td>' +
+        (withWorkflow ? '<td><select class="ds-wf" data-k="' + kind + '" data-i="' + i + '">' + wfOptions('') + '</select></td>' : '') +
+        '<td><button class="btn btn-sm btn-danger" onclick="this.closest(\'tr\').remove()">' + esc(t('common.delete')) + '</button></td>';
+      tb.appendChild(tr);
+    }
+    document.getElementById('ds-seg-add').onclick = function () { addDictRow('segments', true); };
+    document.getElementById('ds-src-add').onclick = function () { addDictRow('sources', false); };
+    document.getElementById('ds-save').onclick = async function () {
+      var btn = this; btn.disabled = true;
+      try {
+        await saveSettingsKey('dict_segments', collectDict('segments', true));
+        await saveSettingsKey('dict_sources', collectDict('sources', false));
+        await loadReferenceData();
+        toast(t('common.saved'), 'ok'); render();
+      } catch (e) { apiError(e); btn.disabled = false; }
+    };
+    if (canTrackers) {
+      view.querySelectorAll('[data-tkdel]').forEach(function (b) {
+        b.onclick = function () { var row = b.closest('tr'); if (row) row.remove(); };
+      });
+      document.getElementById('tk-add').onclick = function () {
+        var tb = document.getElementById('tk-body');
+        var i = 'n' + Date.now();
+        var tr = document.createElement('tr');
+        tr.innerHTML =
+          '<td><input type="text" class="tk-key" data-i="' + i + '" value=""></td>' +
+          '<td><input type="text" class="tk-en" data-i="' + i + '" value=""></td>' +
+          '<td><input type="text" class="tk-zh" data-i="' + i + '" value=""></td>' +
+          '<td><input type="text" class="tk-prefix" data-i="' + i + '" value="" style="width:64px"></td>' +
+          '<td><input type="color" class="tk-color" data-i="' + i + '" value="#4f8ef7"></td>' +
+          '<td><select class="tk-wf" data-i="' + i + '">' + wfOptions('') + '</select></td>' +
+          '<td><button class="btn btn-sm btn-danger" onclick="this.closest(\'tr\').remove()">' + esc(t('common.delete')) + '</button></td>';
+        tb.appendChild(tr);
+      };
+      document.getElementById('tk-save').onclick = async function () {
+        var btn = this; btn.disabled = true;
+        try {
+          var out = [];
+          view.querySelectorAll('.tk-key').forEach(function (inp) {
+            var i = inp.getAttribute('data-i');
+            var key = inp.value.trim();
+            if (!key) return;
+            out.push({
+              key: key,
+              name_en: view.querySelector('.tk-en[data-i="' + i + '"]').value.trim(),
+              name_zh: view.querySelector('.tk-zh[data-i="' + i + '"]').value.trim(),
+              prefix: view.querySelector('.tk-prefix[data-i="' + i + '"]').value.trim().toUpperCase(),
+              color: view.querySelector('.tk-color[data-i="' + i + '"]').value,
+              workflow_key: view.querySelector('.tk-wf[data-i="' + i + '"]').value || '',
+              is_active: true
+            });
+          });
+          /* Deactivated = trackers that existed before but were removed
+             from the table: mark them inactive so the registry merge
+             drops them (their tickets keep the stored key). */
+          (state.trackers || []).forEach(function (tr) {
+            if (!out.some(function (o) { return o.key === tr.key; })) {
+              out.push(Object.assign({}, tr, { is_active: false }));
+            }
+          });
+          await saveSettingsKey('trackers', out);
+          await loadReferenceData();
+          toast(t('common.saved'), 'ok'); render();
+        } catch (e) { apiError(e); btn.disabled = false; }
+      };
+    }
+  }
+
   async function viewEmail(view) {
     if (!state.v62) {
       view.innerHTML = '<div class="page"><div class="inline-err">' +
@@ -4524,9 +5104,9 @@
       '<div class="page-head"><h1>' + esc(t('cf.title')) + '</h1>' +
       '<button class="btn btn-primary" id="cf-new">+ ' + esc(t('cf.new')) + '</button></div>' +
       '<p class="muted">' + esc(t('cf.sub')) + '</p>' +
-      '<div class="tabs">' + L.TRACKER_KEYS.map(function (k) {
-        return '<button data-trk="' + k + '"' + (trk === k ? ' class="active"' : '') + '>' +
-          esc(t('tracker.' + k)) + '</button>';
+      '<div class="tabs">' + state.trackers.map(function (tr) {
+        return '<button data-trk="' + esc(tr.key) + '"' + (trk === tr.key ? ' class="active"' : '') + '>' +
+          esc(trackerName(tr.key)) + '</button>';
       }).join('') + '</div>' +
       '<div class="card"><div style="overflow-x:auto"><table class="tbl"><thead><tr>' +
         '<th>' + esc(t('cf.key')) + '</th><th>' + esc(t('cf.labelEn')) + '</th>' +
@@ -4587,12 +5167,38 @@
         '<input type="text" id="cfi-opts" value="' +
         esc(Array.isArray(field.options) ? field.options.join(', ') : '') + '"></div>' +
       '<div class="field"><label>' + esc(t('cf.trackers')) + '</label>' +
-        L.TRACKER_KEYS.map(function (k) {
+        state.trackers.map(function (tr) {
           return '<label style="display:block;font-weight:normal"><input type="checkbox" class="cfi-trk" value="' +
-            k + '"' + (trks.indexOf(k) !== -1 ? ' checked' : '') + '> ' + esc(t('tracker.' + k)) + '</label>';
+            esc(tr.key) + '"' + (trks.indexOf(tr.key) !== -1 ? ' checked' : '') + '> ' + esc(trackerName(tr.key)) + '</label>';
         }).join('') + '</div>' +
       '<div class="field"><label>' + esc(t('cf.visibleStatuses')) + '</label>' +
         '<input type="text" id="cfi-states" value="' + esc((field.show_in_states || []).join(', ')) + '"></div>' +
+      /* v8 (#21): required only in specific states (empty = all states). */
+      (state.v8cf
+        ? '<div class="field"><label>' + esc(t('cf.requiredStatuses')) + '</label>' +
+          '<input type="text" id="cfi-reqstates" value="' + esc((field.required_states || []).join(', ')) + '">' +
+          '<div class="hint">' + esc(t('cf.requiredStatusesHint')) + '</div></div>' +
+          /* v8 (#23): dependency — this field renders only when the
+             source field satisfies the condition (same tracker). */
+          '<div class="field"><label>' + esc(t('cf.dependsOn')) + '</label>' +
+          '<div style="display:flex;gap:6px;flex-wrap:wrap">' +
+          '<select id="cfi-dep-field" style="flex:2;min-width:140px"><option value="">' + esc(t('common.none')) + '</option>' +
+          state.customFields.filter(function (x) { return x.key !== field.key; }).map(function (x) {
+            var lb = lang === 'zh' ? (x.label_zh || x.label_en) : (x.label_en || x.label_zh);
+            return '<option value="' + esc(x.key) + '"' +
+              (field.depends_on && field.depends_on.field === x.key ? ' selected' : '') + '>' +
+              esc(lb || x.key) + '</option>';
+          }).join('') + '</select>' +
+          '<select id="cfi-dep-op" style="flex:1;min-width:110px">' + L.DEP_OPS.map(function (op) {
+            return '<option value="' + op + '"' +
+              (field.depends_on && field.depends_on.op === op ? ' selected' : '') + '>' +
+              esc(t('cf.dep.op.' + op)) + '</option>';
+          }).join('') + '</select>' +
+          '<input type="text" id="cfi-dep-value" style="flex:1;min-width:100px" placeholder="' +
+            esc(t('cf.dep.valuePh')) + '" value="' +
+            esc(field.depends_on && field.depends_on.value != null ? field.depends_on.value : '') + '">' +
+          '</div><div class="hint">' + esc(t('cf.dependsOnHint')) + '</div></div>'
+        : '') +
       '<div class="field"><label style="font-weight:normal"><input type="checkbox" id="cfi-req"' +
         (field.required ? ' checked' : '') + '> ' + esc(t('cf.required')) + '</label> ' +
         '<label style="font-weight:normal"><input type="checkbox" id="cfi-active"' +
@@ -4618,6 +5224,17 @@
           required: document.getElementById('cfi-req').checked,
           is_active: document.getElementById('cfi-active').checked
         };
+        /* v8: dependency + per-state required (migration_v8 columns). */
+        if (state.v8cf) {
+          row.required_states = document.getElementById('cfi-reqstates').value.split(',')
+            .map(function (s) { return s.trim(); }).filter(Boolean);
+          var depField = document.getElementById('cfi-dep-field').value;
+          row.depends_on = depField
+            ? { field: depField,
+                op: document.getElementById('cfi-dep-op').value,
+                value: document.getElementById('cfi-dep-value').value }
+            : null;
+        }
         var errs = L.validateCustomFieldDef(Object.assign({ key: field.key || 'tmp' }, row));
         if (errs.length) { toast(t(errs[0].code), 'error'); btn.disabled = false; return; }
         /* v7.3: custom_fields.label_en/label_zh are both NOT NULL in the
@@ -4745,6 +5362,49 @@
     };
   }
 
+  /* v8 (#15): quick-create a contact from anywhere (ticket forms).
+     Inserts into the shared contact directory, then calls done(contact). */
+  function openQuickContactModal(done) {
+    var body =
+      '<div class="form-row">' +
+        '<div class="field"><label>' + esc(t('contacts.firstName')) + '<span class="req">*</span></label>' +
+          '<input type="text" id="qc-first"></div>' +
+        '<div class="field"><label>' + esc(t('contacts.lastName')) + '</label>' +
+          '<input type="text" id="qc-last"></div>' +
+      '</div>' +
+      '<div class="form-row">' +
+        '<div class="field"><label>' + esc(t('contacts.email')) + '</label>' +
+          '<input type="email" id="qc-email"></div>' +
+        '<div class="field"><label>' + esc(t('contacts.phone')) + '</label>' +
+          '<input type="text" id="qc-phone"></div>' +
+      '</div>' +
+      '<div class="field"><label>' + esc(t('contacts.company')) + '</label>' +
+        '<input type="text" id="qc-company"></div>';
+    var close = openModal(t('contacts.new'), body,
+      '<button class="btn" id="m-cancel">' + esc(t('common.cancel')) + '</button>' +
+      '<button class="btn btn-primary" id="m-save">' + esc(t('common.save')) + '</button>');
+    document.getElementById('m-cancel').onclick = close;
+    document.getElementById('m-save').onclick = async function () {
+      var btn = this; btn.disabled = true;
+      try {
+        var first = document.getElementById('qc-first').value.trim();
+        if (!first) { toast(t('new.fillRequired'), 'error'); btn.disabled = false; return; }
+        var row = {
+          first_name: first,
+          last_name: document.getElementById('qc-last').value.trim() || null,
+          email: document.getElementById('qc-email').value.trim() || null,
+          phone: document.getElementById('qc-phone').value.trim() || null,
+          company: document.getElementById('qc-company').value.trim() || null
+        };
+        var r = await sb.from('contacts').insert(row).select('*').single();
+        if (r.error) throw r.error;
+        await loadReferenceData();
+        toast(t('common.saved'), 'ok');
+        close(); if (done) done(r.data);
+      } catch (e) { apiError(e); btn.disabled = false; }
+    };
+  }
+
   function openCustomerModal(customer, done) {
     customer = customer || {};
     function fld(id, label, val, ph) {
@@ -4847,9 +5507,9 @@
           }).join('') + '</select></div>' +
         '<div class="field"><label>' + esc(t('sites.segment')) + '</label>' +
           '<select id="s-segment">' +
-          ['ci', 'utility'].map(function (k) {
-            return '<option value="' + k + '"' + ((site.segment || 'ci') === k ? ' selected' : '') + '>' +
-              esc(t('sites.segment.' + k)) + '</option>';
+          state.segments.map(function (sg) {
+            return '<option value="' + esc(sg.key) + '"' + ((site.segment || 'ci') === sg.key ? ' selected' : '') + '>' +
+              esc(dictName(sg, 'sites.segment.' + sg.key)) + '</option>';
           }).join('') + '</select></div>' +
       '</div>' +
       '<div class="field"><label>' + esc(t('sites.workflowMode')) + '</label>' +
@@ -4875,24 +5535,54 @@
             esc(x.code + ' — ' + x.name) + '</option>';
         }).join('') + '</select></div>' +
       '<div class="field"><label>' + esc(t('sites.remoteOwner')) + '</label>' +
-        '<select id="s-owner"><option value="">' + esc(t('sites.noOwner')) + '</option></select></div>' +
+        '<select id="s-owner"><option value="">' + esc(t('sites.noOwner')) + '</option>' +
+        '<optgroup id="s-owner-people" label="' + esc(t('sites.ownerPeople')) + '"></optgroup>' +
+        (state.v8owner
+          ? '<optgroup id="s-owner-groups" label="' + esc(t('sites.ownerGroups')) + '">' +
+            state.groups.filter(function (g) { return g.is_active !== false; }).map(function (g) {
+              return '<option value="g:' + g.id + '"' +
+                (site.remote_owner_group_id === g.id ? ' selected' : '') + '>' + esc(g.name) + '</option>';
+            }).join('') + '</optgroup>'
+          : '') +
+        '</select></div>' +
       (state.v3
         ? '<div class="field"><label>' + esc(t('sites.customer')) + '</label>' +
-          '<select id="s-customer"><option value="">' + esc(t('common.none')) + '</option>' +
+          '<div style="display:flex;gap:6px"><select id="s-customer" style="flex:1"><option value="">' + esc(t('common.none')) + '</option>' +
           state.customers.map(function (c) {
             return '<option value="' + c.id + '"' + (site.customer_id === c.id ? ' selected' : '') + '>' +
               esc(c.company_name) + '</option>';
-          }).join('') + '</select></div>'
+          }).join('') + '</select>' +
+          /* v8 (#12): create the customer right here — the register used
+             to be discoverable only at the bottom of the Projects page. */
+          '<button type="button" class="btn btn-sm" id="s-customer-new">+ ' + esc(t('customers.new')) + '</button></div></div>'
         : '');
     var close = openModal(site.id ? t('sites.edit') : t('sites.new'), body,
       '<button class="btn" id="m-cancel">' + esc(t('common.cancel')) + '</button>' +
       '<button class="btn btn-primary" id="m-save">' + esc(t('common.save')) + '</button>');
     document.getElementById('m-cancel').onclick = close;
-    // Remote-owner picker: any active non-customer user (best effort on RLS).
+    /* v8 (#12): quick-create a customer from the site form. */
+    var custNewBtn = document.getElementById('s-customer-new');
+    if (custNewBtn) custNewBtn.onclick = function () {
+      var before = {};
+      state.customers.forEach(function (c) { before[c.id] = true; });
+      openCustomerModal(null, async function () {
+        await loadReferenceData();
+        var sel = document.getElementById('s-customer');
+        if (!sel) return;
+        var cur = sel.value;
+        sel.innerHTML = '<option value="">' + esc(t('common.none')) + '</option>' +
+          state.customers.map(function (c) {
+            return '<option value="' + c.id + '">' + esc(c.company_name) + '</option>';
+          }).join('');
+        var fresh = state.customers.filter(function (c) { return !before[c.id]; })[0];
+        sel.value = fresh ? fresh.id : cur;
+      });
+    };
     sb.from('profiles').select('id,display_name,email,role').eq('is_active', true)
       .order('display_name').then(function (r) {
         var sel = document.getElementById('s-owner');
-        if (!sel) return;
+        var og = document.getElementById('s-owner-people');
+        if (!sel || !og) return;
         if (!r.error) {
           (r.data || []).forEach(function (u) {
             if (u.role === 'customer') return;
@@ -4901,7 +5591,7 @@
             o.value = u.id;
             o.textContent = (u.display_name || u.email) + ' (' + t('role.' + u.role) + ')';
             if (site.remote_owner_id === u.id) o.selected = true;
-            sel.appendChild(o);
+            og.appendChild(o);
           });
         }
       });
@@ -4915,6 +5605,7 @@
           var v = document.getElementById(id).value.trim();
           return v === '' || isNaN(Number(v)) ? null : Number(v);
         }
+        var ownerVal = document.getElementById('s-owner').value || '';
         var fields = {
           code: code,
           name: name,
@@ -4922,7 +5613,8 @@
           city: document.getElementById('s-city').value.trim() || null,
           address: document.getElementById('s-addr').value.trim() || null,
           parent_site_id: document.getElementById('s-parent').value || null,
-          remote_owner_id: document.getElementById('s-owner').value || null,
+          /* v8 (#11): remote owner may be a group ("g:<id>") or a person. */
+          remote_owner_id: ownerVal.indexOf('g:') === 0 ? null : (ownerVal || null),
           description: document.getElementById('s-desc').value.trim() || null,
           status: document.getElementById('s-status').value,
           latitude: numOrNull('s-lat'),
@@ -4930,6 +5622,9 @@
           workflow_mode: document.getElementById('s-wfmode').value,
           segment: document.getElementById('s-segment').value
         };
+        if (state.v8owner) {
+          fields.remote_owner_group_id = ownerVal.indexOf('g:') === 0 ? ownerVal.slice(2) : null;
+        }
         if (state.v3) {
           var custSel = document.getElementById('s-customer');
           fields.customer_id = custSel ? (custSel.value || null) : (site.customer_id || null);
@@ -5933,7 +6628,7 @@
     if (!el) return;
     var role = state.profile.role;
     var canIssue = L.can('part.view', role); // everyone except customer
-    var canReturn = role === 'engineer' || role === 'dispatcher' || role === 'admin';
+    var canReturn = role === 'engineer' || role === 'tech_manager' || role === 'dispatcher' || role === 'admin';
     el.innerHTML = '<div class="card"><h2>' + esc(t('detail.parts')) + '</h2>' +
       '<div class="empty">' + esc(t('common.loading')) + '</div></div>';
     var res = await sb.from('part_transactions').select('*')
@@ -6182,7 +6877,8 @@
       '<dt>' + esc(t('sites.parentSite')) + '</dt><dd>' +
         (parent ? '<a href="#/site/' + parent.id + '">' + esc(parent.code + ' — ' + parent.name) + '</a>'
                 : esc(t('sites.noParent'))) + '</dd>' +
-      '<dt>' + esc(t('sites.remoteOwner')) + '</dt><dd>' + esc(displayName(site.remote_owner_id)) + '</dd>' +
+      '<dt>' + esc(t('sites.remoteOwner')) + '</dt><dd>' +
+        esc(site.remote_owner_group_id ? ('👥 ' + groupName(site.remote_owner_group_id)) : displayName(site.remote_owner_id)) + '</dd>' +
       /* v6.1: remote owner email list + default support group (dispatch) */
       (state.v61 && site.remote_owner_email
         ? '<dt>' + esc(t('sites.remoteOwnerEmail')) + '</dt><dd>' + esc(site.remote_owner_email) + '</dd>' : '') +
@@ -6320,14 +7016,90 @@
         '</tr></thead><tbody>' + rows + '</tbody></table></div></div>';
     }
 
+    /* v8 (#6/#8): project members & linked groups. Members are derived
+       from profiles.project_scope; all-scope staff (empty scope) are
+       summarized, not listed. Editing is admin-only (user.manage) and
+       writes project_scope — the single source of truth. */
+    var siteUsers = [];
+    try {
+      var sur = await sb.from('profiles')
+        .select('id,display_name,email,role,project_scope').eq('is_active', true);
+      if (!sur.error) siteUsers = sur.data || [];
+    } catch (e) { siteUsers = []; }
+    function membersCard() {
+      var gids = {};
+      if (site.default_group_id) gids[site.default_group_id] = true;
+      (state.groupSites || []).forEach(function (gs) { if (gs.site_id === id) gids[gs.group_id] = true; });
+      var gnames = Object.keys(gids).map(function (gid) { return groupName(gid); }).filter(Boolean);
+      var explicit = siteUsers.filter(function (u) {
+        return Array.isArray(u.project_scope) && u.project_scope.indexOf(id) !== -1;
+      });
+      var allScopeCount = siteUsers.filter(function (u) {
+        return u.role !== 'customer' && (!Array.isArray(u.project_scope) || !u.project_scope.length);
+      }).length;
+      var canEditMembers = L.can('user.manage', state.profile.role);
+      var rows = explicit.map(function (u) {
+        return '<tr><td><b>' + esc(u.display_name || u.email) + '</b></td>' +
+          '<td><span class="role-tag">' + esc(t('role.' + u.role)) + '</span></td>' +
+          '<td class="muted">' + esc(u.email || '') + '</td>' +
+          (canEditMembers
+            ? '<td><button class="btn btn-sm btn-danger" data-member-remove="' + u.id + '">' +
+              esc(t('common.remove')) + '</button></td>'
+            : '') + '</tr>';
+      }).join('');
+      var candidates = siteUsers.filter(function (u) {
+        return explicit.indexOf(u) === -1 &&
+          (!Array.isArray(u.project_scope) || u.project_scope.length);
+      });
+      return '<div class="card"><h2>' + esc(t('sites.members')) + '</h2>' +
+        '<div class="muted" style="margin-bottom:6px">' + esc(t('sites.linkedGroups')) + ': ' +
+          esc(gnames.length ? gnames.join(', ') : '—') + '</div>' +
+        (allScopeCount
+          ? '<div class="muted" style="margin-bottom:6px">' +
+            esc(t('sites.allScopeStaff', { n: allScopeCount })) + '</div>' : '') +
+        (rows
+          ? '<table class="tbl"><tbody>' + rows + '</tbody></table>'
+          : '<div class="empty">' + esc(t('sites.noMembers')) + '</div>') +
+        (canEditMembers && candidates.length
+          ? '<div style="display:flex;gap:6px;margin-top:10px"><select id="member-add-sel" style="flex:1">' +
+            candidates.map(function (u) {
+              return '<option value="' + u.id + '">' + esc((u.display_name || u.email) + ' (' + u.email + ')') + '</option>';
+            }).join('') + '</select>' +
+            '<button class="btn btn-sm btn-primary" id="member-add-btn">+ ' + esc(t('sites.addMember')) + '</button></div>'
+          : '') +
+      '</div>';
+    }
+
     view.innerHTML =
       '<button class="btn btn-sm" id="back-btn" style="margin-bottom:12px">← ' + esc(t('sites.backToSites')) + '</button>' +
       '<div class="detail-head"><span class="tnum">' + esc(site.code) + '</span>' +
         contractBadgeFor(contract) +
         '<span class="badge status-open">' + openCount + ' ' + esc(t('sites.openTickets')) + '</span></div>' +
       '<h1 class="detail-title">' + esc(site.name) + '</h1>' +
-      '<div class="grid-2"><div>' + ident + ccard + '</div><div>' + whcard + tcard + teamCard() + maintCard() + chcard + '</div></div>';
+      '<div class="grid-2"><div>' + ident + ccard + '</div><div>' + whcard + tcard + teamCard() + membersCard() + maintCard() + chcard + '</div></div>';
     document.getElementById('back-btn').onclick = function () { nav('#/sites'); };
+    /* v8 (#8): member add/remove writes profiles.project_scope. */
+    var memberAddBtn = document.getElementById('member-add-btn');
+    if (memberAddBtn) memberAddBtn.onclick = async function () {
+      var uid = document.getElementById('member-add-sel').value;
+      var u = siteUsers.filter(function (x) { return x.id === uid; })[0];
+      if (!u) return;
+      var scope = (Array.isArray(u.project_scope) ? u.project_scope : []).concat([id]);
+      var r = await sb.from('profiles').update({ project_scope: scope }).eq('id', uid);
+      if (r.error) { apiError(r.error); return; }
+      toast(t('common.saved'), 'ok'); render();
+    };
+    view.querySelectorAll('[data-member-remove]').forEach(function (b) {
+      b.onclick = async function () {
+        var uid = b.getAttribute('data-member-remove');
+        var u = siteUsers.filter(function (x) { return x.id === uid; })[0];
+        if (!u) return;
+        var scope = (u.project_scope || []).filter(function (s) { return s !== id; });
+        var r = await sb.from('profiles').update({ project_scope: scope }).eq('id', uid);
+        if (r.error) { apiError(r.error); return; }
+        toast(t('common.saved'), 'ok'); render();
+      };
+    });
     bindTableNav(view);
     /* v7.12: generate the yearly plan (12 maintenance tickets) + print. */
     var mgBtn = document.getElementById('maint-gen');
@@ -6674,7 +7446,7 @@
 
   async function viewPlanning(view) {
     var canWrite = L.can('plan.manage', state.profile.role);
-    var er = await sb.from('profiles').select('*').eq('role', 'engineer').eq('is_active', true)
+    var er = await sb.from('profiles').select('*').in('role', ['engineer', 'tech_manager']).eq('is_active', true)
       .order('display_name');
     if (er.error) {
       view.innerHTML = '<div class="inline-err">' + esc(er.error.message) + '</div>';
@@ -7433,8 +8205,8 @@
       var s = await sb.auth.getSession();
       if (s.data && s.data.session && s.data.session.user) {
         if (isRecovery) { viewSetPassword(); return; }
-        await afterSignIn(s.data.session.user);
-        return; // afterSignIn navigates to dashboard
+        await afterSignIn(s.data.session.user, { fromBoot: true });
+        return; // afterSignIn restores the current route (v8 #1)
       }
     } catch (e) { /* fall through to login */ }
     render();
