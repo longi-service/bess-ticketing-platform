@@ -6385,6 +6385,13 @@
 
   function openTransferCreateDialog(fromWh, part, stockRow, warehouses, siteMap, done) {
     var onHand = stockRow ? Number(stockRow.qty) : null;
+    /* v9.2.4: validate against AVAILABLE stock (on hand − reserved), not
+       on-hand. With the v12 reserve model a transfer created for
+       reserved stock passes the create check and then fails at approval
+       with the (now translated) insufficient-stock error. The low-stock
+       warning below still uses on-hand — it is about physical stock vs
+       the safety level. */
+    var avail = (state.v12 && stockRow) ? L.availableStock(stockRow.qty, stockRow.reserved_qty) : onHand;
     var minQty = stockRow && stockRow.min_qty != null ? Number(stockRow.min_qty) : null;
     var targets = warehouses.filter(function (w) { return w.id !== fromWh.id; });
     var body =
@@ -6402,7 +6409,7 @@
         '<div class="field"><label>' + esc(t('transfer.qty')) + '<span class="req">*</span></label>' +
           '<input type="number" id="tf-qty" value="1" min="1" step="1">' +
           '<div class="muted" style="font-size:12px;margin-top:4px">' +
-            esc(t('parts.stock') + ': ' + (onHand == null ? '—' : String(onHand)) + ' ' + (part.unit || '')) +
+            esc(t('parts.stockAvailable').replace('{n}', String(avail == null ? '—' : avail)) + ' ' + (part.unit || '')) +
           '</div></div>' +
       '</div>' +
       '<div class="field"><label>' + esc(t('transfer.note')) + '</label>' +
@@ -6427,9 +6434,9 @@
       try {
         var toId = document.getElementById('tf-to').value;
         var qty = Number(qtyEl.value);
-        var err = L.transferQtyCheck(qty, onHand);
+        var err = L.transferQtyCheck(qty, avail);
         if (err === 'invalid') { toast(t('transfer.qtyInvalid'), 'error'); btn.disabled = false; return; }
-        if (err === 'over') { toast(t('transfer.overStock').replace('{n}', String(onHand)), 'error'); btn.disabled = false; return; }
+        if (err === 'over') { toast(t('transfer.overStock').replace('{n}', String(avail)), 'error'); btn.disabled = false; return; }
         if (!toId) { toast(t('new.fillRequired'), 'error'); btn.disabled = false; return; }
         var r = await sb.rpc('create_transfer', {
           p_part_id: part.id, p_qty: qty, p_from_warehouse_id: fromWh.id,
