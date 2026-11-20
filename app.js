@@ -491,6 +491,22 @@
         (state.projectTrackers[r.site_id] = state.projectTrackers[r.site_id] || []).push(r.tracker_key);
       });
     } catch (e) { state.v9pt = false; }
+    /* v11 (M9-03): transfers table exists only after migration_v11.
+       The transfer UI degrades silently on an un-migrated backend. */
+    state.v11 = false;
+    try {
+      var v11p = await sb.from('transfers').select('id', { count: 'exact', head: true });
+      state.v11 = !v11p.error;
+    } catch (e) { state.v11 = false; }
+    /* v12 (M9-06): approval sub-tickets + reserve model —
+       tickets.source_transaction_id and stock_levels.reserved_qty exist
+       only after migration_v12. New behavior degrades silently on an
+       un-migrated backend (issues deduct immediately, as before). */
+    state.v12 = false;
+    try {
+      var v12p = await sb.from('tickets').select('source_transaction_id').limit(1);
+      state.v12 = !v12p.error;
+    } catch (e) { state.v12 = false; }
   }
 
   /**
@@ -2402,12 +2418,28 @@
         btn.disabled = true;
         try {
           /* v7.11: close gate — a service report (with customer signature)
-             must be uploaded before the ticket can be closed. */
-          if (to === 'closed' && state.v7) {
+             must be uploaded before the ticket can be closed.
+             v12 (M9-06): approval sub-tickets are exempt — they are
+             internal approvals of a parts issue and never carry a service
+             report; without the exemption a rejection (→closed) would be
+             impossible and the parent-close rule could never be satisfied. */
+          if (to === 'closed' && state.v7 && !(state.v12 && L.isApprovalSubTicket(ticket))) {
             var gate = L.canCloseTicket(ticket, photos, ticket.custom_values);
             if (!gate.ok) {
               toast(t(gate.reason === 'signature_missing' ? 'ticket.signatureMissing'
                                                           : 'ticket.reportRequired'), 'error');
+              btn.disabled = false; return;
+            }
+          }
+          /* v12 (M9-06, §6.7): a parent ticket cannot close while any of
+             its approval sub-tickets is still open (neither approved nor
+             rejected). A query failure is reported, not silently ignored. */
+          if (to === 'closed' && state.v12) {
+            var subs = await sb.from('tickets').select('id,status,source_transaction_id')
+              .eq('parent_ticket_id', ticket.id);
+            if (subs.error) { apiError(subs.error); btn.disabled = false; return; }
+            if (L.hasOpenApprovalSubTickets(subs.data || [])) {
+              toast(t('parts.approval.closeBlocked'), 'error');
               btn.disabled = false; return;
             }
           }
@@ -2425,6 +2457,28 @@
           if (to === 'closed') patch.closed_at = new Date().toISOString();
           var r = await sb.from('tickets').update(patch).eq('id', ticket.id);
           if (r.error) throw r.error;
+          /* v12 (M9-06, §6.8): approval sub-ticket inventory linkage.
+             Status first, inventory second: if the finalize/release RPC
+             fails, the status change already stands and the reservation
+             stays held (no over-issue), and the dispatcher retries by
+             moving the sub-ticket back and approving/rejecting again —
+             the RPCs are idempotent, so the retry is safe. Doing it the
+             other way round (inventory first) would be worse: a failed
+             status update after a successful finalize could never be
+             undone by a later rejection. A DB trigger was rejected for
+             the same reason — it would couple inventory to every status
+             write (bulk/recompute paths included) and a trigger failure
+             would block legitimate status changes. */
+          var invErr = null;
+          if (state.v12 && L.isApprovalSubTicket(ticket)) {
+            var invAction = L.approvalInventoryAction(to);
+            if (invAction && ticket.source_transaction_id) {
+              var ir = await sb.rpc(invAction === 'finalize'
+                ? 'finalize_part_reservation' : 'release_part_reservation',
+                { p_transaction_id: ticket.source_transaction_id });
+              if (ir.error) invErr = ir.error;
+            }
+          }
           /* v6.2 item 15: notify status change (separate from assignment
              notifications — that path never reaches here). */
           notifyTicketEvent('status_changed', Object.assign({}, ticket, { status: to }), null);
@@ -2441,7 +2495,8 @@
               });
             } catch (e) { apiError(e); }
           }
-          toast(t('detail.transition.done'), 'ok');
+          if (invErr) toast(t('parts.approval.inventoryFailed'), 'error');
+          else toast(t('detail.transition.done'), 'ok');
           render();
         } catch (e) { apiError(e); btn.disabled = false; }
       };
@@ -2893,7 +2948,12 @@
     var box = document.getElementById('sub-list');
     if (!box) return;
     try {
-      var r = await sb.from('tickets').select('id,ticket_no,title,status,tracker,assigned_to')
+      /* v12 (M9-06): the approval badge needs source_transaction_id; the
+         column does not exist on an un-migrated backend, so gate the select. */
+      var subCols = state.v12
+        ? 'id,ticket_no,title,status,tracker,assigned_to,source_transaction_id'
+        : 'id,ticket_no,title,status,tracker,assigned_to';
+      var r = await sb.from('tickets').select(subCols)
         .eq('parent_ticket_id', ticket.id).order('created_at');
       if (r.error) throw r.error;
       var rows = r.data || [];
@@ -2921,6 +2981,8 @@
         return '<div class="related-row">' +
           '<a href="#/ticket/' + x.id + '" class="tnum">' + esc(L.formatTicketNo(x.ticket_no)) + '</a> ' +
           trackerBadge(x.tracker) + ' ' +
+          /* v12 (M9-06): approval sub-tickets carry the approval badge. */
+          (state.v12 && x.source_transaction_id ? badge('contract', t('parts.approval.badge')) + ' ' : '') +
           '<span class="ttl">' + esc(x.title) + '</span> ' + statusBadge(x.status) +
           (x.assigned_to ? ' <span class="muted">' + esc(displayName(x.assigned_to)) + '</span>' : '') +
           '</div>';
@@ -5933,6 +5995,22 @@
       .order('created_at', { ascending: false }).limit(100);
     var txs = txr.error ? [] : (txr.data || []);
     if (txr.error) apiError(txr.error);
+    /* v11 (M9-03): transfers — newest first; silent when the backend
+       has not run migration_v11 (state.v11 probe in loadReferenceData). */
+    var transfers = [];
+    if (state.v11) {
+      var tfr = await sb.from('transfers').select('*')
+        .order('created_at', { ascending: false }).limit(100);
+      transfers = tfr.error ? [] : (tfr.data || []);
+      if (tfr.error) apiError(tfr.error);
+      var tIds = [];
+      transfers.forEach(function (x) {
+        [x.requested_by, x.approved_by, x.dispatched_by, x.received_by].forEach(function (u) {
+          if (u && tIds.indexOf(u) === -1) tIds.push(u);
+        });
+      });
+      await resolveNames(tIds);
+    }
 
     var partMap = {}; parts.forEach(function (p) { partMap[p.id] = p; });
     var whMap = {}; warehouses.forEach(function (w) { whMap[w.id] = w; });
@@ -5972,16 +6050,28 @@
       return stock.filter(function (s) { return s.warehouse_id === whId; }).map(function (s) {
         var p = partMap[s.part_id] || {};
         var qty = Number(s.qty), min = s.min_qty == null ? null : Number(s.min_qty);
-        /* v6.4: TechCRM 3-state stock badge (OK/low/critical). */
-        var st = L.stockStatus(qty, min);
+        /* v6.4: TechCRM 3-state stock badge (OK/low/critical).
+           v12 (M9-06): the badge follows available stock (on hand −
+           reserved); a non-zero hold is shown next to the on-hand qty. */
+        var resv = state.v12 ? (Number(s.reserved_qty) || 0) : 0;
+        var avail = state.v12 ? L.availableStock(s.qty, s.reserved_qty) : qty;
+        var st = L.stockStatus(avail, min);
         var stCls = st === 'critical' ? 'sla-breached' : st === 'low' ? 'sla-warning' : 'sla-ok';
         var cls = st === 'ok' ? '' : (st === 'critical' ? 'low-stock-red' : 'low-stock-amber');
+        /* v11 (M9-03): per-stock transfer entry — admin anywhere, PM only
+           for this warehouse's project (scope checked in logic.js). */
+        var canTfr = state.v11 && L.canCreateTransfer(state.profile, (whMap[whId] || {}).site_id);
         return '<tr class="' + cls + '"><td></td>' +
           '<td><b>' + esc(p.code || '—') + '</b> ' + esc(p.name || '') + '</td>' +
-          '<td class="tnum">' + esc(String(s.qty)) + ' ' + esc(p.unit || '') + '</td>' +
+          '<td class="tnum">' + esc(String(s.qty)) + ' ' + esc(p.unit || '') +
+          (resv > 0 ? ' <span class="muted">(' +
+            esc(t('parts.stock.reserved').replace('{n}', String(resv))) + ')</span>' : '') + '</td>' +
           '<td class="muted">' + esc(min == null ? '—' : String(s.min_qty)) + '</td>' +
           '<td>' + badge(stCls, t('parts.stock.' + st)) + '</td>' +
-          '<td></td></tr>';
+          '<td>' + (canTfr
+            ? '<button class="btn btn-sm" data-transfer="' + whId + '::' + s.part_id + '">' +
+              esc(t('transfer.button')) + '</button>'
+            : '') + '</td></tr>';
       }).join('');
     }
     var whHtml = '';
@@ -6008,10 +6098,14 @@
       var p = partMap[x.part_id] || {};
       var w = whMap[x.warehouse_id] || {};
       var isIssue = Number(x.qty_delta) < 0;
+      /* v11 (M9-03): transfer ledger rows (transfer_id set) get their own
+         badge — transfer out / transfer in — instead of issue / return. */
+      var isTfr = !!x.transfer_id;
+      var txKey = isTfr ? (isIssue ? 'parts.tx.transferOut' : 'parts.tx.transferIn')
+                        : (isIssue ? 'parts.tx.issue' : 'parts.tx.return');
       var tno = ticketNos[x.ticket_id];
       return '<tr><td class="muted">' + esc(fmtDate(x.created_at)) + '</td>' +
-        '<td>' + badge(isIssue ? 'pri-high' : 'sla-ok',
-          t(isIssue ? 'parts.tx.issue' : 'parts.tx.return')) + '</td>' +
+        '<td>' + badge(isIssue ? 'pri-high' : 'sla-ok', t(txKey)) + '</td>' +
         '<td><b>' + esc(p.code || '—') + '</b> ' + esc(p.name || '') + '</td>' +
         '<td class="tnum">' + esc(String(Math.abs(Number(x.qty_delta)))) + ' ' + esc(p.unit || '') + '</td>' +
         '<td class="muted">' + esc(w.code || '—') + '</td>' +
@@ -6020,6 +6114,34 @@
             : '<span class="muted">—</span>') + '</td>' +
         '<td class="muted">' + esc(displayName(x.actor_id)) + '</td>' +
         '<td class="muted">' + esc(x.note || '—') + '</td></tr>';
+    }).join('');
+
+    /* v11 (M9-03): transfer list — newest first, row click opens detail.
+       Action buttons follow the transfer's status and the viewer's role. */
+    var transferRows = transfers.map(function (x) {
+      var p = partMap[x.part_id] || {};
+      var fw = whMap[x.from_warehouse_id] || {};
+      var tw = whMap[x.to_warehouse_id] || {};
+      var stCls = x.status === 'pending' ? 'sla-warning'
+        : x.status === 'approved' ? 'contract'
+        : x.status === 'dispatched' ? 'pri-high'
+        : x.status === 'received' ? 'sla-ok' : 'sla-breached';
+      var acts = '';
+      if (x.status === 'pending' && L.canApproveTransfer(state.profile))
+        acts += '<button class="btn btn-sm" data-tf-approve="' + x.id + '">' + esc(t('transfer.approve')) + '</button> ' +
+          '<button class="btn btn-sm btn-danger" data-tf-reject="' + x.id + '">' + esc(t('transfer.reject')) + '</button>';
+      else if (x.status === 'approved' && L.canDispatchTransfer(state.profile, fw.site_id))
+        acts += '<button class="btn btn-sm" data-tf-dispatch="' + x.id + '">' + esc(t('transfer.dispatch')) + '</button>';
+      else if (x.status === 'dispatched' && L.canReceiveTransfer(state.profile, tw.site_id))
+        acts += '<button class="btn btn-sm" data-tf-receive="' + x.id + '">' + esc(t('transfer.receive')) + '</button>';
+      return '<tr data-tf-row="' + x.id + '"><td class="muted">' + esc(fmtDate(x.created_at)) + '</td>' +
+        '<td><b>' + esc(p.code || '—') + '</b> ' + esc(p.name || '') + '</td>' +
+        '<td class="tnum">' + esc(String(x.qty)) + ' ' + esc(p.unit || '') + '</td>' +
+        '<td class="muted">' + esc(fw.code || '—') + '</td>' +
+        '<td class="muted">' + esc(tw.code || '—') + '</td>' +
+        '<td>' + badge(stCls, t('transfer.status.' + x.status)) + '</td>' +
+        '<td class="muted">' + esc(displayName(x.requested_by)) + '</td>' +
+        '<td>' + (acts || '<span class="muted">—</span>') + '</td></tr>';
     }).join('');
 
     view.innerHTML =
@@ -6059,7 +6181,17 @@
         '<th>' + esc(t('parts.warehouse')) + '</th><th>' + esc(t('parts.tx.ticket')) + '</th>' +
         '<th>' + esc(t('parts.tx.actor')) + '</th><th>' + esc(t('parts.tx.note')) + '</th>' +
         '</tr></thead><tbody>' + (ledgerRows || '<tr><td colspan="8"><div class="empty">—</div></td></tr>') +
-        '</tbody></table></div></div>';
+        '</tbody></table></div></div>' +
+      /* v11 (M9-03): transfer list — hidden entirely until migration_v11. */
+      (state.v11 ? '<div class="card"><h2>' + esc(t('transfer.title')) + '</h2>' +
+        '<div style="overflow-x:auto"><table class="tbl"><thead><tr>' +
+        '<th>' + esc(t('common.createdAt')) + '</th><th>' + esc(t('transfer.part')) + '</th>' +
+        '<th>' + esc(t('transfer.qty')) + '</th><th>' + esc(t('transfer.from')) + '</th>' +
+        '<th>' + esc(t('transfer.to')) + '</th><th>' + esc(t('common.status')) + '</th>' +
+        '<th>' + esc(t('transfer.requestedBy')) + '</th><th>' + esc(t('common.actions')) + '</th>' +
+        '</tr></thead><tbody>' + (transferRows || '<tr><td colspan="8"><div class="empty">' +
+        esc(t('transfer.noTransfers')) + '</div></td></tr>') +
+        '</tbody></table></div></div>' : '');
 
     /* v6.4: cross-warehouse part search — which warehouse holds this part. */
     (function () {
@@ -6079,10 +6211,14 @@
           var w = whMap[s.warehouse_id] || {};
           var hay = ((p.code || '') + ' ' + (p.name || '')).toLowerCase();
           if (hay.indexOf(q) === -1) return;
-          var st = L.stockStatus(s.qty, s.min_qty);
+          /* v12 (M9-06): badge follows available stock; show the hold. */
+          var resv = state.v12 ? (Number(s.reserved_qty) || 0) : 0;
+          var st = L.stockStatus(state.v12 ? L.availableStock(s.qty, s.reserved_qty) : s.qty, s.min_qty);
           rows.push('<tr><td><b>' + esc(p.code || '—') + '</b> ' + esc(p.name || '') + '</td>' +
             '<td class="muted">' + esc(w.code ? w.code + ' — ' + w.name : '—') + '</td>' +
-            '<td class="tnum">' + esc(String(s.qty)) + ' ' + esc(p.unit || '') + '</td>' +
+            '<td class="tnum">' + esc(String(s.qty)) + ' ' + esc(p.unit || '') +
+            (resv > 0 ? ' <span class="muted">(' +
+              esc(t('parts.stock.reserved').replace('{n}', String(resv))) + ')</span>' : '') + '</td>' +
             '<td>' + badge(st === 'critical' ? 'sla-breached' : st === 'low' ? 'sla-warning' : 'sla-ok',
               t('parts.stock.' + st)) + '</td>' +
             '<td>' + esc(t('parts.owner.' + (p.owner || 'longi'))) + '</td></tr>');
@@ -6124,6 +6260,316 @@
         deleteWarehouse(w, function () { render(); });
       };
     });
+    /* v11 (M9-03): transfer actions. Row click opens the detail dialog;
+       the action buttons do the in-place step (approve / dispatch dialog
+       / receipt confirm); reject opens the detail dialog, where the
+       reason is entered. */
+    view.querySelectorAll('[data-transfer]').forEach(function (b) {
+      b.onclick = function () {
+        var kv = b.getAttribute('data-transfer').split('::');
+        var w = warehouses.find(function (x) { return x.id === kv[0]; });
+        var p = parts.find(function (x) { return x.id === kv[1]; });
+        var s = stock.find(function (x) { return x.warehouse_id === kv[0] && x.part_id === kv[1]; });
+        if (w && p) openTransferCreateDialog(w, p, s, warehouses, siteMap, function () { render(); });
+      };
+    });
+    view.querySelectorAll('[data-tf-row]').forEach(function (r) {
+      r.onclick = function (e) {
+        if (e.target.closest('button')) return;
+        var id = r.getAttribute('data-tf-row');
+        var tr = transfers.find(function (x) { return x.id === id; });
+        if (tr) openTransferDetailDialog(tr, partMap, whMap, function () { render(); });
+      };
+    });
+    view.querySelectorAll('[data-tf-approve]').forEach(function (b) {
+      b.onclick = async function () {
+        try {
+          var r = await sb.rpc('approve_transfer', { p_transfer_id: b.getAttribute('data-tf-approve') });
+          if (r.error) throw r.error;
+          toast(t('transfer.approved'), 'ok'); render();
+        } catch (e) { apiError(e); }
+      };
+    });
+    view.querySelectorAll('[data-tf-reject]').forEach(function (b) {
+      b.onclick = function () {
+        var tr = transfers.find(function (x) { return x.id === b.getAttribute('data-tf-reject'); });
+        if (tr) openTransferDetailDialog(tr, partMap, whMap, function () { render(); });
+      };
+    });
+    view.querySelectorAll('[data-tf-dispatch]').forEach(function (b) {
+      b.onclick = function () {
+        var tr = transfers.find(function (x) { return x.id === b.getAttribute('data-tf-dispatch'); });
+        if (tr) openTransferDispatchDialog(tr, partMap, whMap, function () { render(); });
+      };
+    });
+    view.querySelectorAll('[data-tf-receive]').forEach(function (b) {
+      b.onclick = async function () {
+        if (!window.confirm(t('transfer.receiveConfirm'))) return;
+        try {
+          var r = await sb.rpc('receive_transfer', { p_transfer_id: b.getAttribute('data-tf-receive') });
+          if (r.error) throw r.error;
+          toast(t('transfer.received'), 'ok'); render();
+        } catch (e) { apiError(e); }
+      };
+    });
+  }
+
+  /* ================= v11 (M9-03): cross-warehouse transfers ================= */
+  /* uploadTransferPhoto(transferId, file) → storage path. Mirrors
+     uploadPhoto() but writes to the transfer-photos bucket and keeps no
+     ticket_attachments row — the path lives on the transfers row. */
+  async function uploadTransferPhoto(transferId, file) {
+    var path = L.transferPhotoPath(transferId, file.name);
+    var up = await sb.storage.from('transfer-photos').upload(path, file, {
+      contentType: file.type || 'application/octet-stream', upsert: true
+    });
+    if (up.error) throw up.error;
+    return path;
+  }
+
+  /* transferPhotoUrls(paths) → [{path, url}] signed URLs for the detail
+     dialog gallery. Mirrors the renderGallery signed-URL loop. */
+  async function transferPhotoUrls(paths) {
+    var out = [];
+    for (var i = 0; i < (paths || []).length; i++) {
+      var url = null;
+      try {
+        var s = await sb.storage.from('transfer-photos').createSignedUrl(paths[i], 3600);
+        if (!s.error) url = s.data.signedUrl;
+      } catch (e) {}
+      out.push({ path: paths[i], url: url });
+    }
+    return out;
+  }
+
+  /* transferWhLabel(w, siteMap) → "WH-EU-01 — Central (IT-MDC-01)" or
+     "WH-EU-01 — Central (无项目（中央仓）)" for a central warehouse. */
+  function transferWhLabel(w, siteMap) {
+    if (!w) return '—';
+    var site = siteMap && siteMap[w.site_id];
+    return w.code + ' — ' + w.name + ' (' + (site ? site.code : t('parts.noSite')) + ')';
+  }
+
+  function openTransferCreateDialog(fromWh, part, stockRow, warehouses, siteMap, done) {
+    var onHand = stockRow ? Number(stockRow.qty) : null;
+    var minQty = stockRow && stockRow.min_qty != null ? Number(stockRow.min_qty) : null;
+    var targets = warehouses.filter(function (w) { return w.id !== fromWh.id; });
+    var body =
+      '<div class="form-row">' +
+        '<div class="field"><label>' + esc(t('transfer.part')) + '</label>' +
+          '<input type="text" value="' + esc(part.code + ' — ' + part.name) + '" disabled></div>' +
+        '<div class="field"><label>' + esc(t('transfer.from')) + '</label>' +
+          '<input type="text" value="' + esc(transferWhLabel(fromWh, siteMap)) + '" disabled></div>' +
+      '</div>' +
+      '<div class="form-row">' +
+        '<div class="field"><label>' + esc(t('transfer.to')) + '<span class="req">*</span></label>' +
+          '<select id="tf-to">' + targets.map(function (w) {
+            return '<option value="' + w.id + '">' + esc(transferWhLabel(w, siteMap)) + '</option>';
+          }).join('') + '</select></div>' +
+        '<div class="field"><label>' + esc(t('transfer.qty')) + '<span class="req">*</span></label>' +
+          '<input type="number" id="tf-qty" value="1" min="1" step="1">' +
+          '<div class="muted" style="font-size:12px;margin-top:4px">' +
+            esc(t('parts.stock') + ': ' + (onHand == null ? '—' : String(onHand)) + ' ' + (part.unit || '')) +
+          '</div></div>' +
+      '</div>' +
+      '<div class="field"><label>' + esc(t('transfer.note')) + '</label>' +
+        '<input type="text" id="tf-note" placeholder="' + esc(t('transfer.notePh')) + '"></div>' +
+      '<div id="tf-warn" class="inline-err" style="display:none"></div>';
+    var close = openModal(t('transfer.button'), body,
+      '<button class="btn" id="m-cancel">' + esc(t('common.cancel')) + '</button>' +
+      '<button class="btn btn-primary" id="m-save">' + esc(t('common.save')) + '</button>');
+    document.getElementById('m-cancel').onclick = close;
+    var qtyEl = document.getElementById('tf-qty');
+    var warnEl = document.getElementById('tf-warn');
+    qtyEl.oninput = function () {
+      var q = Number(qtyEl.value);
+      if (q > 0 && L.transferWarnsLowStock(q, onHand, minQty)) {
+        warnEl.textContent = t('transfer.lowStockWarn')
+          .replace('{a}', String(onHand)).replace('{m}', String(minQty));
+        warnEl.style.display = '';
+      } else warnEl.style.display = 'none';
+    };
+    document.getElementById('m-save').onclick = async function () {
+      var btn = this; btn.disabled = true;
+      try {
+        var toId = document.getElementById('tf-to').value;
+        var qty = Number(qtyEl.value);
+        var err = L.transferQtyCheck(qty, onHand);
+        if (err === 'invalid') { toast(t('transfer.qtyInvalid'), 'error'); btn.disabled = false; return; }
+        if (err === 'over') { toast(t('transfer.overStock').replace('{n}', String(onHand)), 'error'); btn.disabled = false; return; }
+        if (!toId) { toast(t('new.fillRequired'), 'error'); btn.disabled = false; return; }
+        var r = await sb.rpc('create_transfer', {
+          p_part_id: part.id, p_qty: qty, p_from_warehouse_id: fromWh.id,
+          p_to_warehouse_id: toId, p_note: document.getElementById('tf-note').value.trim() || null
+        });
+        if (r.error) throw r.error;
+        close(); toast(t('transfer.created'), 'ok'); done();
+      } catch (e) { apiError(e); btn.disabled = false; }
+    };
+  }
+
+  async function openTransferDetailDialog(tr, partMap, whMap, done) {
+    var p = partMap[tr.part_id] || {};
+    var fw = whMap[tr.from_warehouse_id] || {};
+    var tw = whMap[tr.to_warehouse_id] || {};
+    var stCls = tr.status === 'pending' ? 'sla-warning'
+      : tr.status === 'approved' ? 'contract'
+      : tr.status === 'dispatched' ? 'pri-high'
+      : tr.status === 'received' ? 'sla-ok' : 'sla-breached';
+    function row(k, v) {
+      return '<tr><td class="muted" style="width:130px">' + esc(k) + '</td><td>' + v + '</td></tr>';
+    }
+    function who(id, at) {
+      return id ? esc(displayName(id)) + (at ? ' · ' + esc(fmtDate(at)) : '') : '—';
+    }
+    var body =
+      '<table class="tbl"><tbody>' +
+      row(t('transfer.part'), '<b>' + esc(p.code || '—') + '</b> ' + esc(p.name || '')) +
+      row(t('transfer.qty'), esc(String(tr.qty)) + ' ' + esc(p.unit || '')) +
+      row(t('transfer.from'), esc(fw.code || '—') + ' — ' + esc(fw.name || '')) +
+      row(t('transfer.to'), esc(tw.code || '—') + ' — ' + esc(tw.name || '')) +
+      row(t('common.status'), badge(stCls, t('transfer.status.' + tr.status))) +
+      row(t('transfer.requestedBy'), who(tr.requested_by, tr.created_at)) +
+      row(t('transfer.approvedBy'), who(tr.approved_by, tr.approved_at)) +
+      row(t('transfer.dispatchedBy'), who(tr.dispatched_by, tr.dispatched_at)) +
+      row(t('transfer.receivedBy'), who(tr.received_by, tr.received_at)) +
+      (tr.delivery_method ? row(t('transfer.deliveryMethod'), esc(t('transfer.delivery.' + tr.delivery_method))) : '') +
+      (tr.tracking_no ? row(t('transfer.trackingNo'), esc(tr.tracking_no)) : '') +
+      (tr.note ? row(t('transfer.note'), esc(tr.note)) : '') +
+      (tr.reject_reason ? row(t('transfer.rejectReason'), esc(tr.reject_reason)) : '') +
+      '</tbody></table>' +
+      '<h3 style="margin-top:14px">' + esc(t('transfer.photos')) + '</h3>' +
+      '<div id="tf-photos"><div class="empty">' + esc(t('common.loading')) + '</div></div>' +
+      (tr.status === 'pending' && L.canApproveTransfer(state.profile)
+        ? '<div class="field" style="margin-top:14px"><label>' + esc(t('transfer.rejectReason')) + '</label>' +
+          '<input type="text" id="tf-reason" placeholder="' + esc(t('transfer.rejectReasonPh')) + '"></div>'
+        : '');
+    var foot = '<button class="btn" id="m-cancel">' + esc(t('common.cancel')) + '</button>';
+    if (tr.status === 'pending' && L.canApproveTransfer(state.profile))
+      foot += '<button class="btn btn-danger" id="tf-reject-btn">' + esc(t('transfer.reject')) + '</button>' +
+        '<button class="btn btn-primary" id="tf-approve-btn">' + esc(t('transfer.approve')) + '</button>';
+    if (tr.status === 'approved' && L.canDispatchTransfer(state.profile, fw.site_id))
+      foot += '<button class="btn btn-primary" id="tf-dispatch-btn">' + esc(t('transfer.dispatch')) + '</button>';
+    if (tr.status === 'dispatched' && L.canReceiveTransfer(state.profile, tw.site_id))
+      foot += '<button class="btn btn-primary" id="tf-receive-btn">' + esc(t('transfer.receive')) + '</button>';
+    var close = openModal(t('transfer.detail'), body, foot);
+    document.getElementById('m-cancel').onclick = close;
+    var ab = document.getElementById('tf-approve-btn');
+    if (ab) ab.onclick = async function () {
+      ab.disabled = true;
+      try {
+        var r = await sb.rpc('approve_transfer', { p_transfer_id: tr.id });
+        if (r.error) throw r.error;
+        close(); toast(t('transfer.approved'), 'ok'); done();
+      } catch (e) { apiError(e); ab.disabled = false; }
+    };
+    var rb = document.getElementById('tf-reject-btn');
+    if (rb) rb.onclick = async function () {
+      var reason = document.getElementById('tf-reason').value.trim();
+      if (!reason) { toast(t('new.fillRequired'), 'error'); return; }
+      if (!window.confirm(t('transfer.rejectConfirm'))) return;
+      rb.disabled = true;
+      try {
+        /* reject_transfer takes the reason as p_note (migration_v11). */
+        var r = await sb.rpc('reject_transfer', { p_transfer_id: tr.id, p_note: reason });
+        if (r.error) throw r.error;
+        close(); toast(t('transfer.rejected'), 'ok'); done();
+      } catch (e) { apiError(e); rb.disabled = false; }
+    };
+    var db = document.getElementById('tf-dispatch-btn');
+    if (db) db.onclick = function () {
+      close(); openTransferDispatchDialog(tr, partMap, whMap, done);
+    };
+    var cb = document.getElementById('tf-receive-btn');
+    if (cb) cb.onclick = async function () {
+      if (!window.confirm(t('transfer.receiveConfirm'))) return;
+      cb.disabled = true;
+      try {
+        var r = await sb.rpc('receive_transfer', { p_transfer_id: tr.id });
+        if (r.error) throw r.error;
+        close(); toast(t('transfer.received'), 'ok'); done();
+      } catch (e) { apiError(e); cb.disabled = false; }
+    };
+    /* Proof photos load after the modal opens (same pattern as the
+       ticket photo gallery) so the dialog never blocks on signed URLs. */
+    var photos = await transferPhotoUrls(tr.photo_paths || []);
+    var phEl = document.getElementById('tf-photos');
+    if (phEl) phEl.innerHTML = photos.length
+      ? '<div class="gallery">' + photos.map(function (it) {
+          return it.url
+            ? '<div class="photo"><a href="' + esc(it.url) + '" target="_blank" rel="noopener"><img src="' +
+              esc(it.url) + '" alt=""></a></div>'
+            : '<div class="photo"><div class="empty">—</div></div>';
+        }).join('') + '</div>'
+      : '<div class="empty">' + esc(t('transfer.noPhotos')) + '</div>';
+  }
+
+  function openTransferDispatchDialog(tr, partMap, whMap, done) {
+    var p = partMap[tr.part_id] || {};
+    var fw = whMap[tr.from_warehouse_id] || {};
+    var tw = whMap[tr.to_warehouse_id] || {};
+    var body =
+      '<p class="muted">' + esc((p.code || '') + ' — ' + (p.name || '') + ' × ' + String(tr.qty) +
+        ' · ' + (fw.code || '') + ' → ' + (tw.code || '')) + '</p>' +
+      '<div class="field"><label>' + esc(t('transfer.deliveryMethod')) + '<span class="req">*</span></label>' +
+        '<label style="display:block;margin:4px 0"><input type="radio" name="tf-method" value="courier" checked> ' +
+          esc(t('transfer.delivery.courier')) + '</label>' +
+        '<label style="display:block;margin:4px 0"><input type="radio" name="tf-method" value="self_carry"> ' +
+          esc(t('transfer.delivery.self_carry')) + '</label></div>' +
+      '<div class="field" id="tf-tracking-wrap"><label>' + esc(t('transfer.trackingNo')) + '<span class="req">*</span></label>' +
+        '<input type="text" id="tf-tracking" placeholder="' + esc(t('transfer.trackingNoPh')) + '"></div>' +
+      '<div class="field"><label>' + esc(t('transfer.photos')) + '<span class="req">*</span></label>' +
+        '<input type="file" id="tf-photos-in" accept="image/*" multiple>' +
+        '<div class="muted" style="font-size:12px;margin-top:4px">' + esc(t('transfer.photosHint')) + '</div>' +
+        '<div id="tf-preview" style="margin-top:8px"></div></div>';
+    var close = openModal(t('transfer.dispatch'), body,
+      '<button class="btn" id="m-cancel">' + esc(t('common.cancel')) + '</button>' +
+      '<button class="btn btn-primary" id="m-save">' + esc(t('transfer.dispatch')) + '</button>');
+    document.getElementById('m-cancel').onclick = close;
+    var files = [];
+    var input = document.getElementById('tf-photos-in');
+    input.onchange = function () {
+      files = Array.prototype.slice.call(input.files || []);
+      document.getElementById('tf-preview').innerHTML = files.length
+        ? files.map(function (f) { return '<div class="muted">• ' + esc(f.name) + '</div>'; }).join('')
+        : '';
+    };
+    document.querySelectorAll('input[name="tf-method"]').forEach(function (r) {
+      r.onchange = function () {
+        var m = (document.querySelector('input[name="tf-method"]:checked') || {}).value;
+        document.getElementById('tf-tracking-wrap').style.display = m === 'courier' ? '' : 'none';
+      };
+    });
+    document.getElementById('m-save').onclick = async function () {
+      var btn = this; btn.disabled = true;
+      try {
+        var method = (document.querySelector('input[name="tf-method"]:checked') || {}).value;
+        var tracking = document.getElementById('tf-tracking').value.trim();
+        var err = L.transferDispatchCheck(method, tracking, files.length);
+        if (err === 'method') { toast(t('new.fillRequired'), 'error'); btn.disabled = false; return; }
+        if (err === 'tracking') { toast(t('transfer.trackingRequired'), 'error'); btn.disabled = false; return; }
+        if (err === 'photo') { toast(t('transfer.photosRequired'), 'error'); btn.disabled = false; return; }
+        /* Upload the proof photos first, then dispatch — the RPC stores
+           the paths on the transfer row. Roll back uploads on failure. */
+        var paths = [];
+        try {
+          for (var i = 0; i < files.length; i++) {
+            var f = await prepareUploadFile(files[i]);
+            paths.push(await uploadTransferPhoto(tr.id, f));
+          }
+          var r = await sb.rpc('dispatch_transfer', {
+            p_transfer_id: tr.id, p_delivery_method: method,
+            p_tracking_no: method === 'courier' ? tracking : null,
+            p_photo_paths: paths
+          });
+          if (r.error) throw r.error;
+        } catch (e) {
+          if (paths.length) { try { await sb.storage.from('transfer-photos').remove(paths); } catch (e2) {} }
+          throw e;
+        }
+        close(); toast(t('transfer.dispatched'), 'ok'); done();
+      } catch (e) { apiError(e); btn.disabled = false; }
+    };
   }
 
   function openPartModal(part, done) {
@@ -6902,10 +7348,14 @@
       var p = partMap[x.part_id] || {};
       var w = whMap[x.warehouse_id] || {};
       var isIssue = Number(x.qty_delta) < 0;
+      /* v12 (M9-06): an issue row shows its reservation state (held /
+         deducted / released / returned); legacy rows have none. */
+      var resvLabel = (state.v12 && isIssue && x.reservation_status)
+        ? ' <span class="muted">' + esc(t('parts.reservation.' + x.reservation_status)) + '</span>' : '';
       return '<tr><td class="muted">' + esc(fmtDate(x.created_at)) + '</td>' +
         '<td><b>' + esc(p.code || '—') + '</b> ' + esc(p.name || '') + '</td>' +
         '<td>' + badge(isIssue ? 'pri-high' : 'sla-ok',
-          t(isIssue ? 'parts.tx.issue' : 'parts.tx.return')) + '</td>' +
+          t(isIssue ? 'parts.tx.issue' : 'parts.tx.return')) + resvLabel + '</td>' +
         '<td class="tnum">' + esc(String(Math.abs(Number(x.qty_delta)))) + ' ' + esc(p.unit || '') + '</td>' +
         '<td class="muted">' + esc(w.code || '—') + '</td>' +
         '<td class="muted">' + esc(x.note || '—') + '</td>' +
@@ -7003,9 +7453,17 @@
       stockMap = {}; stockLoaded = false;
       if (!whId) { refreshStockHint(); return; }
       try {
-        var sr = await sb.from('stock_levels').select('part_id,qty').eq('warehouse_id', whId);
+        /* v12 (M9-06): available = on hand − reserved; on an un-migrated
+           backend the reserved column does not exist, so fall back to
+           on-hand qty (the pre-v12 meaning of the hint). */
+        var cols = state.v12 ? 'part_id,qty,reserved_qty' : 'part_id,qty';
+        var sr = await sb.from('stock_levels').select(cols).eq('warehouse_id', whId);
         if (!sr.error) {
-          (sr.data || []).forEach(function (r) { stockMap[r.part_id] = Number(r.qty) || 0; });
+          (sr.data || []).forEach(function (r) {
+            stockMap[r.part_id] = state.v12
+              ? L.availableStock(r.qty, r.reserved_qty)
+              : (Number(r.qty) || 0);
+          });
           stockLoaded = true;
         }
       } catch (e) {}
@@ -7029,14 +7487,84 @@
           toast(t('parts.issue.overStock').replace('{n}', String(avNow)), 'error');
           btn.disabled = false; return;
         }
+        var whId = (document.getElementById('ip-wh') || {}).value || null;
         var r = await sb.rpc('issue_spare_part', {
           p_ticket_id: ticket.id, p_part_id: partId, p_qty: qty,
-          p_warehouse_id: document.getElementById('ip-wh').value || null
+          p_warehouse_id: whId
         });
         if (r.error) throw r.error;
-        close(); toast(t('parts.issued'), 'ok'); done();
+        /* v12 (M9-06): every issue auto-derives one approval sub-ticket
+           (decision §6: one per issue, post-issue approval, dispatcher
+           approves, Utility template). The issue itself already
+           succeeded — a derivation failure must not roll it back. */
+        var txnId = r.data || null;
+        var partRow = parts.filter(function (p) { return p.id === partId; })[0] || {};
+        var whRow = warehouses.filter(function (w) { return w.id === whId; })[0] || {};
+        close();
+        if (state.v12 && txnId) {
+          var apNo = null, apErr = null;
+          try { apNo = await deriveApprovalSubTicket(ticket, txnId, partRow, qty, whRow); }
+          catch (e) { apErr = e; }
+          if (apErr) toast(t('parts.approval.createFailed'), 'error');
+          else if (apNo) toast(t('parts.approval.created', { no: apNo }), 'ok');
+          else toast(t('parts.issued'), 'ok');
+        } else {
+          toast(t('parts.issued'), 'ok');
+        }
+        done();
       } catch (e) { apiError(e); btn.disabled = false; }
     };
+  }
+
+  /* v12 (M9-06): derive one approval sub-ticket for a parts issue.
+     One per issue (dedup on source_transaction_id, enforced by a
+     partial unique index too). Utility template, tracker 'spare',
+     approver = first active dispatcher (best-effort; unassigned when
+     none). Returns the formatted ticket number. Throws when creation
+     fails (the caller reports it; the issue itself already succeeded). */
+  async function deriveApprovalSubTicket(ticket, txnId, partRow, qty, whRow) {
+    var dup = await sb.from('tickets').select('id,ticket_no')
+      .eq('source_transaction_id', txnId).maybeSingle();
+    if (!dup.error && dup.data) return L.formatTicketNo(dup.data.ticket_no);
+    var partLabel = (partRow.code || '—') + (partRow.name ? ' — ' + partRow.name : '');
+    var insData = {
+      title: t('parts.approval.title', {
+        code: partRow.code || '', qty: qty, parent: ticket.title || ''
+      }),
+      description: t('parts.approval.body', {
+        part: partLabel,
+        qty: String(qty) + (partRow.unit ? ' ' + partRow.unit : ''),
+        wh: (whRow.code || '—') + (whRow.name ? ' — ' + whRow.name : ''),
+        by: state.profile.display_name || state.profile.email || '',
+        at: fmtDate(new Date()),
+        txn: txnId
+      }),
+      status: 'open',
+      priority: 'medium',
+      source: 'internal_discovery',
+      site_id: ticket.site_id || null,
+      tracker: 'spare',
+      workflow_key: 'utility',
+      parent_ticket_id: ticket.id,
+      source_transaction_id: txnId,
+      created_by: state.profile.id
+    };
+    /* Approver: first active dispatcher (decision §6.3). Best-effort:
+       the sub-ticket is still created when no dispatcher is found. */
+    try {
+      var dp = await sb.from('profiles').select('id').eq('role', 'dispatcher')
+        .eq('is_active', true).order('created_at').limit(1).maybeSingle();
+      if (!dp.error && dp.data) insData.assigned_to = dp.data.id;
+    } catch (e) { /* unassigned — a dispatcher picks it up from the queue */ }
+    var ins = await sb.from('tickets').insert(insData).select('id,ticket_no').single();
+    if (ins.error) {
+      /* Race: another derivation already created it — return that one. */
+      var again = await sb.from('tickets').select('id,ticket_no')
+        .eq('source_transaction_id', txnId).maybeSingle();
+      if (!again.error && again.data) return L.formatTicketNo(again.data.ticket_no);
+      throw ins.error;
+    }
+    return L.formatTicketNo(ins.data.ticket_no);
   }
 
   /* ============================ v2: site detail ============================ */

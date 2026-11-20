@@ -75,7 +75,12 @@
     /* v8 additions (Europe trial feedback) */
     'site.view':             ['admin', 'dispatcher', 'pm', 'engineer', 'tech_manager'], // read-only project view
     'settings.manage':       ['admin', 'dispatcher'],                   // dictionaries (segments / sources)
-    'tracker.manage':        ['admin', 'dispatcher']                     // tracker registry (opened to dispatchers 2026-10-23)
+    'tracker.manage':        ['admin', 'dispatcher'],                    // tracker registry (opened to dispatchers 2026-10-23)
+    /* v11 additions (M9-03 transfers) */
+    'transfer.create':       ['admin', 'pm'],                          // request a transfer (PM: own project)
+    'transfer.approve':      ['admin', 'dispatcher'],                 // approve / reject a transfer
+    'transfer.dispatch':     ['admin', 'dispatcher', 'pm'],           // dispatch with proof (PM: source project)
+    'transfer.receive':      ['admin', 'dispatcher', 'pm']            // confirm receipt (PM: destination project)
   };
 
   /**
@@ -654,6 +659,156 @@
     var q = Number(qty);
     if (qty == null || isNaN(q) || q <= 0) return 'invalid';
     if (available != null && !isNaN(Number(available)) && q > Number(available)) return 'over';
+    return null;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* v11 (M9-03) — cross-warehouse transfers. Statuses: pending →
+     approved (source deducted, in transit) → dispatched (proof
+     uploaded) → received (destination credited, closed); rejected
+     closes from pending. The RPCs enforce the same rules server-side;
+     these pure helpers drive the UI gating. */
+  /* ------------------------------------------------------------------ */
+  var TRANSFER_STATUSES = ['pending', 'approved', 'dispatched', 'received', 'rejected'];
+  var TRANSFER_FLOW = {
+    pending: ['approved', 'rejected'],
+    approved: ['dispatched'],
+    dispatched: ['received'],
+    received: [],
+    rejected: []
+  };
+
+  /* transferNextStatuses(status) → allowed next statuses ([] when unknown). */
+  function transferNextStatuses(status) {
+    return (TRANSFER_FLOW[status] || []).slice();
+  }
+
+  /* pmSiteInScope(profile, siteId) → does this PM's project_scope cover
+     the site? An empty/NULL scope means all sites; a site-less warehouse
+     (central, site_id NULL) is not covered by a scoped PM. */
+  function pmSiteInScope(profile, siteId) {
+    if (!profile || profile.role !== 'pm') return false;
+    var scope = profile.project_scope || [];
+    if (!scope.length) return true;
+    if (!siteId) return false;
+    return scope.indexOf(siteId) !== -1;
+  }
+
+  /* canCreateTransfer(profile, fromSiteId) — initiator: admin anywhere,
+     PM only for the source warehouse's project. */
+  function canCreateTransfer(profile, fromSiteId) {
+    if (!profile || !can('transfer.create', profile.role)) return false;
+    if (profile.role === 'pm') return pmSiteInScope(profile, fromSiteId);
+    return true;
+  }
+
+  /* canApproveTransfer(profile) — approver: dispatcher or admin. */
+  function canApproveTransfer(profile) {
+    return !!profile && can('transfer.approve', profile.role);
+  }
+
+  /* canDispatchTransfer(profile, fromSiteId) — dispatcher: admin,
+     dispatcher, or the source project's PM. */
+  function canDispatchTransfer(profile, fromSiteId) {
+    if (!profile || !can('transfer.dispatch', profile.role)) return false;
+    if (profile.role === 'pm') return pmSiteInScope(profile, fromSiteId);
+    return true;
+  }
+
+  /* canReceiveTransfer(profile, toSiteId) — receiver: admin, dispatcher,
+     or the destination project's PM. */
+  function canReceiveTransfer(profile, toSiteId) {
+    if (!profile || !can('transfer.receive', profile.role)) return false;
+    if (profile.role === 'pm') return pmSiteInScope(profile, toSiteId);
+    return true;
+  }
+
+  /* transferPhotoPath(transferId, fileName, uid) → storage path inside
+     the transfer-photos bucket: "<transfer_id>/<uuid>-<sanitized>". */
+  function transferPhotoPath(transferId, fileName, uid) {
+    var u = uid || ('u' + Math.random().toString(36).slice(2) + Date.now().toString(36));
+    return transferId + '/' + u + '-' + sanitizeFileName(fileName);
+  }
+
+  /* transferQtyCheck(qty, onHand) → null (ok), 'invalid' (not a positive
+     integer), 'over' (exceeds the source stock). onHand == null (stock
+     unknown) does not block. */
+  function transferQtyCheck(qty, onHand) {
+    var q = Number(qty);
+    if (qty == null || isNaN(q) || q <= 0 || Math.floor(q) !== q) return 'invalid';
+    if (onHand != null && !isNaN(Number(onHand)) && q > Number(onHand)) return 'over';
+    return null;
+  }
+
+  /* transferWarnsLowStock(qty, onHand, minQty) → true when the transfer
+     would take the source below its safety stock. Warning only — the
+     RPC never blocks on min_qty. Null/zero minQty never warns. */
+  function transferWarnsLowStock(qty, onHand, minQty) {
+    var m = minQty == null || minQty === '' ? null : Number(minQty);
+    if (m == null || isNaN(m) || m <= 0) return false;
+    if (qty == null || onHand == null) return false;
+    var q = Number(qty), o = Number(onHand);
+    if (isNaN(q) || isNaN(o)) return false;
+    return (o - q) < m;
+  }
+
+  /* transferDispatchCheck(method, trackingNo, photoCount) → null (ok) or
+     an error code: 'method' (unknown method), 'tracking' (courier needs
+     a tracking number), 'photo' (at least one proof photo required). */
+  function transferDispatchCheck(method, trackingNo, photoCount) {
+    if (method !== 'courier' && method !== 'self_carry') return 'method';
+    if (method === 'courier' && !(trackingNo && String(trackingNo).trim())) return 'tracking';
+    if (!(photoCount > 0)) return 'photo';
+    return null;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* v12 (M9-06) — spare-part approval sub-tickets + reserve model.     */
+  /* An issue reserves stock (available = on hand − reserved); the      */
+  /* approval sub-ticket finalizes the deduction on approval and        */
+  /* releases the hold on rejection. The finalize/release RPCs are      */
+  /* idempotent, so re-entering the same state is safe.                 */
+  /* ------------------------------------------------------------------ */
+
+  /* availableStock(qty, reservedQty) → stock free to issue (>= 0).
+     Null/NaN inputs count as 0. */
+  function availableStock(qty, reservedQty) {
+    var q = Number(qty), r = Number(reservedQty);
+    if (isNaN(q)) q = 0;
+    if (isNaN(r)) r = 0;
+    return Math.max(0, q - r);
+  }
+
+  /* isApprovalSubTicket(ticket) → true when the ticket was auto-derived
+     from a parts issue (source_transaction_id is set). */
+  function isApprovalSubTicket(ticket) {
+    return !!(ticket && ticket.source_transaction_id);
+  }
+
+  /* APPROVAL_DONE_STATUSES — an approval sub-ticket is "done" (approved
+     or rejected) once it reaches resolved or closed. */
+  var APPROVAL_DONE_STATUSES = ['resolved', 'closed'];
+
+  /* isApprovalDone(status) → the approval sub-ticket is finished. */
+  function isApprovalDone(status) {
+    return APPROVAL_DONE_STATUSES.indexOf(status) !== -1;
+  }
+
+  /* hasOpenApprovalSubTickets(subTickets) → any approval sub-ticket not
+     yet done. Used by the parent-close gate: a parent cannot close
+     while one of these is still open. */
+  function hasOpenApprovalSubTickets(subTickets) {
+    return (subTickets || []).some(function (x) {
+      return x && x.source_transaction_id && !isApprovalDone(x.status);
+    });
+  }
+
+  /* approvalInventoryAction(toStatus) → the stock action for an approval
+     sub-ticket entering toStatus: 'finalize' on approval (→resolved),
+     'release' on rejection/close (→closed), null otherwise. */
+  function approvalInventoryAction(toStatus) {
+    if (toStatus === 'resolved') return 'finalize';
+    if (toStatus === 'closed') return 'release';
     return null;
   }
 
@@ -1497,6 +1652,24 @@
     validateIssueQty: validateIssueQty,
     paginate: paginate,
     planCellDimmed: planCellDimmed,
+    /* v11 additions (M9-03 transfers) */
+    TRANSFER_STATUSES: TRANSFER_STATUSES,
+    transferNextStatuses: transferNextStatuses,
+    pmSiteInScope: pmSiteInScope,
+    canCreateTransfer: canCreateTransfer,
+    canApproveTransfer: canApproveTransfer,
+    canDispatchTransfer: canDispatchTransfer,
+    canReceiveTransfer: canReceiveTransfer,
+    transferPhotoPath: transferPhotoPath,
+    transferQtyCheck: transferQtyCheck,
+    transferWarnsLowStock: transferWarnsLowStock,
+    transferDispatchCheck: transferDispatchCheck,
+    /* v12 additions (M9-06 approval sub-tickets + reserve model) */
+    availableStock: availableStock,
+    isApprovalSubTicket: isApprovalSubTicket,
+    isApprovalDone: isApprovalDone,
+    hasOpenApprovalSubTickets: hasOpenApprovalSubTickets,
+    approvalInventoryAction: approvalInventoryAction,
     /* v6.2 additions */
     EMAIL_EVENTS: EMAIL_EVENTS,
     renderEmailTemplate: renderEmailTemplate,

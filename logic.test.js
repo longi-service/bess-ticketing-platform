@@ -955,6 +955,135 @@ eq('dayState Date object works', L.dayState(null, new Date(2026, 9, 10)), 'weeke
   eq('v9.1 dim field-only cell other project', L.planCellDimmed({ hasShift: false, fieldSiteId: 'A', selectedSiteId: 'B' }), true);
   eq('v9.1 dim field-only cell same project', L.planCellDimmed({ hasShift: false, fieldSiteId: 'B', selectedSiteId: 'B' }), false);
   eq('v9.1 dim empty cell fades when a project is selected', L.planCellDimmed({ hasShift: false, fieldSiteId: null, selectedSiteId: 'B' }), true);
+  eq('v9.1 dim empty cell never', L.planCellDimmed({ hasShift: false, fieldSiteId: null, selectedSiteId: '' }), false);
+})();
+
+/* ------------------------------------------------------------------ */
+/* v11 — M9-03 cross-warehouse transfers                               */
+/* ------------------------------------------------------------------ */
+(function () {
+  /* transferNextStatuses */
+  arrEq('v11 flow pending', L.transferNextStatuses('pending'), ['approved', 'rejected']);
+  arrEq('v11 flow approved', L.transferNextStatuses('approved'), ['dispatched']);
+  arrEq('v11 flow dispatched', L.transferNextStatuses('dispatched'), ['received']);
+  arrEq('v11 flow received', L.transferNextStatuses('received'), []);
+  arrEq('v11 flow rejected', L.transferNextStatuses('rejected'), []);
+  arrEq('v11 flow unknown', L.transferNextStatuses('nope'), []);
+
+  /* pmSiteInScope */
+  var pmAll = { role: 'pm', project_scope: [] };
+  var pmNull = { role: 'pm', project_scope: null };
+  var pmOne = { role: 'pm', project_scope: ['S1'] };
+  eq('v11 pm empty scope covers any site', L.pmSiteInScope(pmAll, 'S9'), true);
+  eq('v11 pm null scope covers any site', L.pmSiteInScope(pmNull, 'S9'), true);
+  eq('v11 pm scoped site hit', L.pmSiteInScope(pmOne, 'S1'), true);
+  eq('v11 pm scoped site miss', L.pmSiteInScope(pmOne, 'S2'), false);
+  eq('v11 pm scoped central warehouse denied', L.pmSiteInScope(pmOne, null), false);
+  eq('v11 pm empty scope central warehouse allowed', L.pmSiteInScope(pmAll, null), true);
+  eq('v11 admin is not a pm', L.pmSiteInScope({ role: 'admin', project_scope: [] }, 'S1'), false);
+  eq('v11 no profile', L.pmSiteInScope(null, 'S1'), false);
+
+  /* canCreateTransfer */
+  eq('v11 create admin anywhere', L.canCreateTransfer({ role: 'admin' }, 'S1'), true);
+  eq('v11 create pm own project', L.canCreateTransfer(pmOne, 'S1'), true);
+  eq('v11 create pm other project', L.canCreateTransfer(pmOne, 'S2'), false);
+  eq('v11 create dispatcher denied', L.canCreateTransfer({ role: 'dispatcher' }, 'S1'), false);
+  eq('v11 create engineer denied', L.canCreateTransfer({ role: 'engineer' }, 'S1'), false);
+  eq('v11 create customer denied', L.canCreateTransfer({ role: 'customer' }, 'S1'), false);
+
+  /* canApproveTransfer */
+  eq('v11 approve dispatcher', L.canApproveTransfer({ role: 'dispatcher' }), true);
+  eq('v11 approve admin', L.canApproveTransfer({ role: 'admin' }), true);
+  eq('v11 approve pm denied', L.canApproveTransfer({ role: 'pm' }), false);
+  eq('v11 approve engineer denied', L.canApproveTransfer({ role: 'engineer' }), false);
+
+  /* canDispatchTransfer / canReceiveTransfer */
+  eq('v11 dispatch dispatcher', L.canDispatchTransfer({ role: 'dispatcher' }, 'S1'), true);
+  eq('v11 dispatch admin', L.canDispatchTransfer({ role: 'admin' }, 'S1'), true);
+  eq('v11 dispatch pm source scope', L.canDispatchTransfer(pmOne, 'S1'), true);
+  eq('v11 dispatch pm other project', L.canDispatchTransfer(pmOne, 'S2'), false);
+  eq('v11 dispatch engineer denied', L.canDispatchTransfer({ role: 'engineer' }, 'S1'), false);
+  eq('v11 receive pm dest scope', L.canReceiveTransfer(pmOne, 'S1'), true);
+  eq('v11 receive pm other project', L.canReceiveTransfer(pmOne, 'S2'), false);
+  eq('v11 receive dispatcher', L.canReceiveTransfer({ role: 'dispatcher' }, 'S2'), true);
+
+  /* transferPhotoPath */
+  eq('v11 photo path shape', L.transferPhotoPath('T1', 'IMG_01.JPG', 'u1'), 'T1/u1-IMG_01.JPG');
+  eq('v11 photo path sanitizes', L.transferPhotoPath('T1', 'my photo (1).png', 'u1'), 'T1/u1-my_photo_1_.png');
+
+  /* transferQtyCheck */
+  eq('v11 qty ok', L.transferQtyCheck(3, 8), null);
+  eq('v11 qty exact stock ok', L.transferQtyCheck(8, 8), null);
+  eq('v11 qty over', L.transferQtyCheck(9, 8), 'over');
+  eq('v11 qty zero invalid', L.transferQtyCheck(0, 8), 'invalid');
+  eq('v11 qty negative invalid', L.transferQtyCheck(-2, 8), 'invalid');
+  eq('v11 qty fractional invalid', L.transferQtyCheck(1.5, 8), 'invalid');
+  eq('v11 qty unknown stock allowed', L.transferQtyCheck(5, null), null);
+  eq('v11 qty string number ok', L.transferQtyCheck('3', 8), null);
+
+  /* transferWarnsLowStock */
+  eq('v11 low warn below min', L.transferWarnsLowStock(3, 8, 6), true);
+  eq('v11 low no warn at min', L.transferWarnsLowStock(2, 8, 6), false);
+  eq('v11 low no warn above min', L.transferWarnsLowStock(1, 8, 6), false);
+  eq('v11 low null min never', L.transferWarnsLowStock(8, 8, null), false);
+  eq('v11 low zero min never', L.transferWarnsLowStock(8, 8, 0), false);
+  eq('v11 low unknown stock never', L.transferWarnsLowStock(3, null, 6), false);
+
+  /* transferDispatchCheck */
+  eq('v11 dispatch courier ok', L.transferDispatchCheck('courier', 'SF123', 2), null);
+  eq('v11 dispatch courier missing tracking', L.transferDispatchCheck('courier', '', 2), 'tracking');
+  eq('v11 dispatch courier blank tracking', L.transferDispatchCheck('courier', '   ', 1), 'tracking');
+  eq('v11 dispatch courier no photo', L.transferDispatchCheck('courier', 'SF123', 0), 'photo');
+  eq('v11 dispatch self carry ok', L.transferDispatchCheck('self_carry', '', 1), null);
+  eq('v11 dispatch self carry no photo', L.transferDispatchCheck('self_carry', '', 0), 'photo');
+  eq('v11 dispatch unknown method', L.transferDispatchCheck('pigeon', '', 1), 'method');
+})();
+
+/* ------------------------------------------------------------------ */
+/* v12 — M9-06 approval sub-tickets + reserve model                    */
+/* ------------------------------------------------------------------ */
+(function () {
+  /* availableStock */
+  eq('v12 avail plain', L.availableStock(8, 0), 8);
+  eq('v12 avail reserved', L.availableStock(8, 3), 5);
+  eq('v12 avail fully reserved', L.availableStock(2, 2), 0);
+  eq('v12 avail over reserved floors at 0', L.availableStock(2, 5), 0);
+  eq('v12 avail null reserved', L.availableStock(8, null), 8);
+  eq('v12 avail null qty', L.availableStock(null, 0), 0);
+  eq('v12 avail string numbers', L.availableStock('8', '3'), 5);
+
+  /* isApprovalSubTicket / isApprovalDone */
+  ok('v12 approval sub-ticket detected', L.isApprovalSubTicket({ source_transaction_id: 'abc' }));
+  ok('v12 normal ticket not approval', !L.isApprovalSubTicket({ source_transaction_id: null }));
+  ok('v12 no ticket not approval', !L.isApprovalSubTicket(null));
+  eq('v12 resolved is done', L.isApprovalDone('resolved'), true);
+  eq('v12 closed is done', L.isApprovalDone('closed'), true);
+  eq('v12 open is not done', L.isApprovalDone('open'), false);
+  eq('v12 hq_approval is not done', L.isApprovalDone('hq_approval'), false);
+  eq('v12 in_progress is not done', L.isApprovalDone('in_progress'), false);
+
+  /* hasOpenApprovalSubTickets — the parent-close gate */
+  ok('v12 parent blocked by open approval', L.hasOpenApprovalSubTickets([
+    { source_transaction_id: 't1', status: 'open' },
+    { source_transaction_id: 't2', status: 'resolved' }
+  ]));
+  ok('v12 parent free when all done', !L.hasOpenApprovalSubTickets([
+    { source_transaction_id: 't1', status: 'resolved' },
+    { source_transaction_id: 't2', status: 'closed' }
+  ]));
+  ok('v12 manual sub-tickets do not block', !L.hasOpenApprovalSubTickets([
+    { source_transaction_id: null, status: 'open' }
+  ]));
+  ok('v12 empty list does not block', !L.hasOpenApprovalSubTickets([]));
+  ok('v12 null list does not block', !L.hasOpenApprovalSubTickets(null));
+
+  /* approvalInventoryAction */
+  eq('v12 approve finalizes', L.approvalInventoryAction('resolved'), 'finalize');
+  eq('v12 reject releases', L.approvalInventoryAction('closed'), 'release');
+  eq('v12 in_progress no action', L.approvalInventoryAction('in_progress'), null);
+  eq('v12 hq_approval no action', L.approvalInventoryAction('hq_approval'), null);
+  eq('v12 open no action', L.approvalInventoryAction('open'), null);
+  eq('v12 pending_customer no action', L.approvalInventoryAction('pending_customer'), null);
 })();
 
 /* ------------------------------------------------------------------ */
