@@ -80,7 +80,8 @@
     'transfer.create':       ['admin', 'pm'],                          // request a transfer (PM: own project)
     'transfer.approve':      ['admin', 'dispatcher'],                 // approve / reject a transfer
     'transfer.dispatch':     ['admin', 'dispatcher', 'pm'],           // dispatch with proof (PM: source project)
-    'transfer.receive':      ['admin', 'dispatcher', 'pm']            // confirm receipt (PM: destination project)
+    'transfer.receive':      ['admin', 'dispatcher', 'pm'],           // confirm receipt (PM: destination project)
+    'transfer.cancel':       ['admin', 'pm']                          // cancel a pending/approved transfer (requester)
   };
 
   /**
@@ -666,16 +667,20 @@
   /* v11 (M9-03) — cross-warehouse transfers. Statuses: pending →
      approved (source deducted, in transit) → dispatched (proof
      uploaded) → received (destination credited, closed); rejected
-     closes from pending. The RPCs enforce the same rules server-side;
-     these pure helpers drive the UI gating. */
+     closes from pending. v13 adds 'cancelled': the requester (or an
+     admin) may cancel a pending or approved transfer; an approved one
+     returns its deducted stock to the source warehouse. The RPCs
+     enforce the same rules server-side; these pure helpers drive the
+     UI gating. */
   /* ------------------------------------------------------------------ */
-  var TRANSFER_STATUSES = ['pending', 'approved', 'dispatched', 'received', 'rejected'];
+  var TRANSFER_STATUSES = ['pending', 'approved', 'dispatched', 'received', 'rejected', 'cancelled'];
   var TRANSFER_FLOW = {
-    pending: ['approved', 'rejected'],
-    approved: ['dispatched'],
+    pending: ['approved', 'rejected', 'cancelled'],
+    approved: ['dispatched', 'cancelled'],
     dispatched: ['received'],
     received: [],
-    rejected: []
+    rejected: [],
+    cancelled: []
   };
 
   /* transferNextStatuses(status) → allowed next statuses ([] when unknown). */
@@ -705,6 +710,18 @@
   /* canApproveTransfer(profile) — approver: dispatcher or admin. */
   function canApproveTransfer(profile) {
     return !!profile && can('transfer.approve', profile.role);
+  }
+
+  /* v13: canCancelTransfer(profile, transfer) — canceller: the
+     requester (admin or PM who created it) or an admin. Only while the
+     transfer is pending or approved; once dispatched the goods are in
+     transit and only a reverse transfer can undo it. */
+  function canCancelTransfer(profile, transfer) {
+    if (!profile || !transfer) return false;
+    if (!can('transfer.cancel', profile.role)) return false;
+    if (transfer.status !== 'pending' && transfer.status !== 'approved') return false;
+    if (profile.role === 'admin') return true;
+    return transfer.requested_by === profile.id;
   }
 
   /* canDispatchTransfer(profile, fromSiteId) — dispatcher: admin,
@@ -1658,6 +1675,7 @@
     pmSiteInScope: pmSiteInScope,
     canCreateTransfer: canCreateTransfer,
     canApproveTransfer: canApproveTransfer,
+    canCancelTransfer: canCancelTransfer,
     canDispatchTransfer: canDispatchTransfer,
     canReceiveTransfer: canReceiveTransfer,
     transferPhotoPath: transferPhotoPath,

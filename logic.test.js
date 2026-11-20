@@ -963,11 +963,12 @@ eq('dayState Date object works', L.dayState(null, new Date(2026, 9, 10)), 'weeke
 /* ------------------------------------------------------------------ */
 (function () {
   /* transferNextStatuses */
-  arrEq('v11 flow pending', L.transferNextStatuses('pending'), ['approved', 'rejected']);
-  arrEq('v11 flow approved', L.transferNextStatuses('approved'), ['dispatched']);
+  arrEq('v11 flow pending', L.transferNextStatuses('pending'), ['approved', 'rejected', 'cancelled']);
+  arrEq('v11 flow approved', L.transferNextStatuses('approved'), ['dispatched', 'cancelled']);
   arrEq('v11 flow dispatched', L.transferNextStatuses('dispatched'), ['received']);
   arrEq('v11 flow received', L.transferNextStatuses('received'), []);
   arrEq('v11 flow rejected', L.transferNextStatuses('rejected'), []);
+  arrEq('v13 flow cancelled', L.transferNextStatuses('cancelled'), []);
   arrEq('v11 flow unknown', L.transferNextStatuses('nope'), []);
 
   /* pmSiteInScope */
@@ -996,6 +997,21 @@ eq('dayState Date object works', L.dayState(null, new Date(2026, 9, 10)), 'weeke
   eq('v11 approve admin', L.canApproveTransfer({ role: 'admin' }), true);
   eq('v11 approve pm denied', L.canApproveTransfer({ role: 'pm' }), false);
   eq('v11 approve engineer denied', L.canApproveTransfer({ role: 'engineer' }), false);
+
+  /* v13 canCancelTransfer — requester (admin/pm who created it) or admin,
+     only while pending or approved. */
+  var trPending = { status: 'pending', requested_by: 'pm-1' };
+  var trApproved = { status: 'approved', requested_by: 'pm-1' };
+  var trDispatched = { status: 'dispatched', requested_by: 'pm-1' };
+  eq('v13 cancel requester pending', L.canCancelTransfer({ role: 'pm', id: 'pm-1' }, trPending), true);
+  eq('v13 cancel requester approved', L.canCancelTransfer({ role: 'pm', id: 'pm-1' }, trApproved), true);
+  eq('v13 cancel other pm denied', L.canCancelTransfer({ role: 'pm', id: 'pm-2' }, trPending), false);
+  eq('v13 cancel admin any', L.canCancelTransfer({ role: 'admin', id: 'a-1' }, trApproved), true);
+  eq('v13 cancel dispatcher denied', L.canCancelTransfer({ role: 'dispatcher', id: 'd-1' }, trPending), false);
+  eq('v13 cancel dispatched denied', L.canCancelTransfer({ role: 'pm', id: 'pm-1' }, trDispatched), false);
+  eq('v13 cancel admin dispatched denied', L.canCancelTransfer({ role: 'admin', id: 'a-1' }, trDispatched), false);
+  eq('v13 cancel no profile', L.canCancelTransfer(null, trPending), false);
+  eq('v13 cancel no transfer', L.canCancelTransfer({ role: 'admin', id: 'a-1' }, null), false);
 
   /* canDispatchTransfer / canReceiveTransfer */
   eq('v11 dispatch dispatcher', L.canDispatchTransfer({ role: 'dispatcher' }, 'S1'), true);

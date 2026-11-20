@@ -515,6 +515,14 @@
       var v12p = await sb.from('tickets').select('source_transaction_id').limit(1);
       state.v12 = !v12p.error;
     } catch (e) { state.v12 = false; }
+    /* v13: transfer cancel — transfers.cancelled_by exists only after
+       migration_v13. The cancel button stays hidden on an un-migrated
+       backend (no cancel, as before). */
+    state.v13 = false;
+    try {
+      var v13p = await sb.from('transfers').select('cancelled_by').limit(1);
+      state.v13 = !v13p.error;
+    } catch (e) { state.v13 = false; }
   }
 
   /**
@@ -6159,6 +6167,12 @@
         acts += '<button class="btn btn-sm" data-tf-dispatch="' + x.id + '">' + esc(t('transfer.dispatch')) + '</button>';
       else if (x.status === 'dispatched' && L.canReceiveTransfer(state.profile, tw.site_id))
         acts += '<button class="btn btn-sm" data-tf-receive="' + x.id + '">' + esc(t('transfer.receive')) + '</button>';
+      /* v13: cancel — the requester (or an admin) may cancel a pending
+         or approved transfer. Independent of the approve/dispatch/
+         receive buttons above: a PM requester sees Cancel here even
+         though they cannot approve their own transfer. */
+      if (state.v13 && (x.status === 'pending' || x.status === 'approved') && L.canCancelTransfer(state.profile, x))
+        acts += (acts ? ' ' : '') + '<button class="btn btn-sm btn-danger" data-tf-cancel="' + x.id + '">' + esc(t('transfer.cancel')) + '</button>';
       return '<tr data-tf-row="' + x.id + '"><td class="tnum">' + esc(String(x.id).slice(0, 8)) + '</td>' +
         '<td class="muted">' + esc(fmtDate(x.created_at)) + '</td>' +
         '<td><b>' + esc(p.code || '—') + '</b> ' + esc(p.name || '') + '</td>' +
@@ -6345,6 +6359,23 @@
         };
       };
     });
+    /* v13: cancel a pending/approved transfer (requester or admin).
+       In-app confirm modal, same pattern as receive above. */
+    view.querySelectorAll('[data-tf-cancel]').forEach(function (b) {
+      b.onclick = function () {
+        var closeCf = openModal(t('transfer.cancel'), t('transfer.cancelConfirm'),
+          '<button class="btn" id="m-cancel">' + esc(t('common.cancel')) + '</button>' +
+          '<button class="btn btn-danger" id="m-ok">' + esc(t('transfer.cancel')) + '</button>');
+        document.getElementById('m-cancel').onclick = closeCf;
+        document.getElementById('m-ok').onclick = async function () {
+          try {
+            var r = await sb.rpc('cancel_transfer', { p_transfer_id: b.getAttribute('data-tf-cancel') });
+            if (r.error) throw r.error;
+            closeCf(); toast(t('transfer.cancelled'), 'ok'); render();
+          } catch (e) { closeCf(); apiError(e); }
+        };
+      };
+    });
   }
 
   /* ================= v11 (M9-03): cross-warehouse transfers ================= */
@@ -6474,6 +6505,7 @@
       row(t('transfer.approvedBy'), who(tr.approved_by, tr.approved_at)) +
       row(t('transfer.dispatchedBy'), who(tr.dispatched_by, tr.dispatched_at)) +
       row(t('transfer.receivedBy'), who(tr.received_by, tr.received_at)) +
+      (tr.cancelled_by ? row(t('transfer.cancelledBy'), who(tr.cancelled_by, tr.cancelled_at)) : '') +
       (tr.delivery_method ? row(t('transfer.deliveryMethod'), esc(t('transfer.delivery.' + tr.delivery_method))) : '') +
       (tr.tracking_no ? row(t('transfer.trackingNo'), esc(tr.tracking_no)) : '') +
       (tr.note ? row(t('transfer.note'), esc(tr.note)) : '') +
@@ -6493,6 +6525,9 @@
       foot += '<button class="btn btn-primary" id="tf-dispatch-btn">' + esc(t('transfer.dispatch')) + '</button>';
     if (tr.status === 'dispatched' && L.canReceiveTransfer(state.profile, tw.site_id))
       foot += '<button class="btn btn-primary" id="tf-receive-btn">' + esc(t('transfer.receive')) + '</button>';
+    /* v13: cancel — requester or admin, pending or approved. */
+    if (state.v13 && (tr.status === 'pending' || tr.status === 'approved') && L.canCancelTransfer(state.profile, tr))
+      foot += '<button class="btn btn-danger" id="tf-cancel-btn">' + esc(t('transfer.cancel')) + '</button>';
     var close = openModal(t('transfer.detail'), body, foot);
     document.getElementById('m-cancel').onclick = close;
     var ab = document.getElementById('tf-approve-btn');
@@ -6541,6 +6576,21 @@
           var r = await sb.rpc('receive_transfer', { p_transfer_id: tr.id });
           if (r.error) throw r.error;
           closeCf(); toast(t('transfer.received'), 'ok'); done();
+        } catch (e) { closeCf(); apiError(e); }
+      };
+    };
+    /* v13: cancel from the detail dialog (requester or admin). */
+    var xb = document.getElementById('tf-cancel-btn');
+    if (xb) xb.onclick = function () {
+      var closeCf = openModal(t('transfer.cancel'), t('transfer.cancelConfirm'),
+        '<button class="btn" id="m-cancel">' + esc(t('common.cancel')) + '</button>' +
+        '<button class="btn btn-danger" id="m-ok">' + esc(t('transfer.cancel')) + '</button>');
+      document.getElementById('m-cancel').onclick = closeCf;
+      document.getElementById('m-ok').onclick = async function () {
+        try {
+          var r = await sb.rpc('cancel_transfer', { p_transfer_id: tr.id });
+          if (r.error) throw r.error;
+          closeCf(); close(); toast(t('transfer.cancelled'), 'ok'); done();
         } catch (e) { closeCf(); apiError(e); }
       };
     };
