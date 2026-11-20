@@ -2443,6 +2443,21 @@
               btn.disabled = false; return;
             }
           }
+          /* v12.1 (M9-06): approving a returned issue must be blocked
+             BEFORE the status change. finalize() always fails for a
+             returned issue, and the old "status first" flow left the
+             sub-ticket resolved with no deduction — a false approval
+             record. A fetch failure is reported, not silently ignored. */
+          if (to === 'resolved' && state.v12 && L.isApprovalSubTicket(ticket) && ticket.source_transaction_id) {
+            var txn = await sb.from('part_transactions').select('reservation_status')
+              .eq('id', ticket.source_transaction_id);
+            if (txn.error) { apiError(txn.error); btn.disabled = false; return; }
+            var txnRow = (txn.data || [])[0];
+            if (txnRow && txnRow.reservation_status === 'returned') {
+              toast(t('parts.approval.alreadyReturned'), 'error');
+              btn.disabled = false; return;
+            }
+          }
           var patch = { status: to };
           // v2: resolved_at is set when entering resolved OR pending_customer
           // (customer confirmation); cleared when rework starts.
@@ -7379,7 +7394,7 @@
         '<td class="tnum">' + esc(String(Math.abs(Number(x.qty_delta)))) + ' ' + esc(p.unit || '') + '</td>' +
         '<td class="muted">' + esc(w.code || '—') + '</td>' +
         '<td class="muted">' + esc(x.note || '—') + '</td>' +
-        (canReturn && isIssue
+        (canReturn && isIssue && x.reservation_status !== 'returned'
           ? '<td><button class="btn btn-sm" data-return="' + x.id + '">' +
               esc(t('detail.parts.return')) + '</button></td>'
           : '<td></td>') +
