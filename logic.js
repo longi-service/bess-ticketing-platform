@@ -479,23 +479,21 @@
     return 'remoto';
   }
 
-  /* v9.1 (#18, R4): planning-grid dimming. A cell fades when a project is
-     selected and the cell belongs to another project — its shift's site,
-     or (no shift row) the site of the field ticket shown in the cell.
-     A shift row with no site (remote, no field ticket) keeps the legacy
-     behaviour and fades too; cells covering the selected project never
-     fade. */
+  /* v9.1 (#18, R4): planning-grid dimming. When a project is selected,
+     every cell that does not affirmatively belong to it fades — its
+     shift's site, a covered site, or the site of the field ticket shown
+     in the cell. A default remote cell (no shift row, no field ticket)
+     has no project, so it fades too; otherwise the filter looks dead
+     on an all-remote grid (R4 M20-09). */
   function planCellDimmed(opts) {
     opts = opts || {};
     var sel = opts.selectedSiteId;
     if (!sel) return false;
     var covered = opts.coveredSiteIds || [];
     if (covered.indexOf(sel) !== -1) return false;
-    if (opts.hasShift) {
-      var eff = opts.shiftSiteId || opts.fieldSiteId || null;
-      return eff !== sel;
-    }
-    return !!opts.fieldSiteId && opts.fieldSiteId !== sel;
+    if (opts.shiftSiteId === sel) return false;
+    if (opts.fieldSiteId === sel) return false;
+    return true;
   }
 
   /**

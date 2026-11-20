@@ -954,7 +954,7 @@ eq('dayState Date object works', L.dayState(null, new Date(2026, 9, 10)), 'weeke
   eq('v9.1 dim shift null site but field ticket other', L.planCellDimmed({ hasShift: true, shiftSiteId: null, fieldSiteId: 'A', selectedSiteId: 'B' }), true);
   eq('v9.1 dim field-only cell other project', L.planCellDimmed({ hasShift: false, fieldSiteId: 'A', selectedSiteId: 'B' }), true);
   eq('v9.1 dim field-only cell same project', L.planCellDimmed({ hasShift: false, fieldSiteId: 'B', selectedSiteId: 'B' }), false);
-  eq('v9.1 dim empty cell never', L.planCellDimmed({ hasShift: false, fieldSiteId: null, selectedSiteId: 'B' }), false);
+  eq('v9.1 dim empty cell fades when a project is selected', L.planCellDimmed({ hasShift: false, fieldSiteId: null, selectedSiteId: 'B' }), true);
 })();
 
 /* ------------------------------------------------------------------ */
