@@ -212,10 +212,18 @@
   }
 
   /** Human-readable Supabase/RLS error → toast + inline element message. */
+  /* v9.2.4: database RPCs raise English errors (e.g. approve_transfer
+     'Insufficient stock: have %, need %'). Translate the known ones so
+     the Chinese UI never shows a raw English database message. */
+  function translateRpcError(msg) {
+    var m = /Insufficient stock: have (\d+), need (\d+)/.exec(msg || '');
+    if (m) return t('transfer.insufficientStock', { have: m[1], need: m[2] });
+    return msg;
+  }
   function apiError(err, fallbackKey) {
     var msg = (err && err.message) ? err.message : t(fallbackKey || 'common.error');
     // RLS denials come back as plain errors — surface them plainly, never crash.
-    toast(msg, 'error');
+    toast(translateRpcError(msg), 'error');
     return msg;
   }
 
@@ -6124,9 +6132,11 @@
         '<td><b>' + esc(p.code || '—') + '</b> ' + esc(p.name || '') + '</td>' +
         '<td class="tnum">' + esc(String(Math.abs(Number(x.qty_delta)))) + ' ' + esc(p.unit || '') + '</td>' +
         '<td class="muted">' + esc(w.code || '—') + '</td>' +
-        '<td>' + (tno != null
-            ? '<a href="#/ticket/' + x.ticket_id + '">' + esc(L.formatTicketNo(tno)) + '</a>'
-            : '<span class="muted">—</span>') + '</td>' +
+        '<td>' + (isTfr
+            ? '<span class="tnum">' + esc(String(x.transfer_id).slice(0, 8)) + '</span>'
+            : (tno != null
+              ? '<a href="#/ticket/' + x.ticket_id + '">' + esc(L.formatTicketNo(tno)) + '</a>'
+              : '<span class="muted">—</span>')) + '</td>' +
         '<td class="muted">' + esc(displayName(x.actor_id)) + '</td>' +
         '<td class="muted">' + esc(x.note || '—') + '</td></tr>';
     }).join('');
@@ -6149,7 +6159,8 @@
         acts += '<button class="btn btn-sm" data-tf-dispatch="' + x.id + '">' + esc(t('transfer.dispatch')) + '</button>';
       else if (x.status === 'dispatched' && L.canReceiveTransfer(state.profile, tw.site_id))
         acts += '<button class="btn btn-sm" data-tf-receive="' + x.id + '">' + esc(t('transfer.receive')) + '</button>';
-      return '<tr data-tf-row="' + x.id + '"><td class="muted">' + esc(fmtDate(x.created_at)) + '</td>' +
+      return '<tr data-tf-row="' + x.id + '"><td class="tnum">' + esc(String(x.id).slice(0, 8)) + '</td>' +
+        '<td class="muted">' + esc(fmtDate(x.created_at)) + '</td>' +
         '<td><b>' + esc(p.code || '—') + '</b> ' + esc(p.name || '') + '</td>' +
         '<td class="tnum">' + esc(String(x.qty)) + ' ' + esc(p.unit || '') + '</td>' +
         '<td class="muted">' + esc(fw.code || '—') + '</td>' +
@@ -6200,11 +6211,11 @@
       /* v11 (M9-03): transfer list — hidden entirely until migration_v11. */
       (state.v11 ? '<div class="card"><h2>' + esc(t('transfer.title')) + '</h2>' +
         '<div style="overflow-x:auto"><table class="tbl"><thead><tr>' +
-        '<th>' + esc(t('common.createdAt')) + '</th><th>' + esc(t('transfer.part')) + '</th>' +
+        '<th>' + esc(t('transfer.no')) + '</th><th>' + esc(t('common.createdAt')) + '</th><th>' + esc(t('transfer.part')) + '</th>' +
         '<th>' + esc(t('transfer.qty')) + '</th><th>' + esc(t('transfer.from')) + '</th>' +
         '<th>' + esc(t('transfer.to')) + '</th><th>' + esc(t('common.status')) + '</th>' +
         '<th>' + esc(t('transfer.requestedBy')) + '</th><th>' + esc(t('common.actions')) + '</th>' +
-        '</tr></thead><tbody>' + (transferRows || '<tr><td colspan="8"><div class="empty">' +
+        '</tr></thead><tbody>' + (transferRows || '<tr><td colspan="9"><div class="empty">' +
         esc(t('transfer.noTransfers')) + '</div></td></tr>') +
         '</tbody></table></div></div>' : '');
 
@@ -6446,6 +6457,7 @@
     }
     var body =
       '<table class="tbl"><tbody>' +
+      row(t('transfer.no'), '<span class="tnum">' + esc(String(tr.id).slice(0, 8)) + '</span>') +
       row(t('transfer.part'), '<b>' + esc(p.code || '—') + '</b> ' + esc(p.name || '')) +
       row(t('transfer.qty'), esc(String(tr.qty)) + ' ' + esc(p.unit || '')) +
       row(t('transfer.from'), esc(fw.code || '—') + ' — ' + esc(fw.name || '')) +
@@ -7605,6 +7617,16 @@
       if (!again.error && again.data) return L.formatTicketNo(again.data.ticket_no);
       throw ins.error;
     }
+    /* v9.2.4: notify the assignee (dispatcher) — the sub-ticket is a real
+       ticket and its approver needs to know it exists. Same ticket_created
+       event as a manually created ticket. Best-effort: a mail failure
+       must not fail the derivation (notifyTicketEvent swallows its own
+       errors, and this call is wrapped too). The race path above does
+       not notify — the winning derivation already did. */
+    try {
+      var full = await sb.from('tickets').select('*').eq('id', ins.data.id).single();
+      if (!full.error && full.data) notifyTicketEvent('ticket_created', full.data, null);
+    } catch (e) { /* notification is best-effort */ }
     return L.formatTicketNo(ins.data.ticket_no);
   }
 
