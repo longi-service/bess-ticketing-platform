@@ -6303,13 +6303,20 @@
       };
     });
     view.querySelectorAll('[data-tf-receive]').forEach(function (b) {
-      b.onclick = async function () {
-        if (!window.confirm(t('transfer.receiveConfirm'))) return;
-        try {
-          var r = await sb.rpc('receive_transfer', { p_transfer_id: b.getAttribute('data-tf-receive') });
-          if (r.error) throw r.error;
-          toast(t('transfer.received'), 'ok'); render();
-        } catch (e) { apiError(e); }
+      b.onclick = function () {
+        /* v9.2.1: window.confirm blocks the JS thread and hangs in
+           automated browsers (same as v9.1 #6) — use the in-app modal. */
+        var closeCf = openModal(t('transfer.receive'), t('transfer.receiveConfirm'),
+          '<button class="btn" id="m-cancel">' + esc(t('common.cancel')) + '</button>' +
+          '<button class="btn btn-primary" id="m-ok">' + esc(t('common.confirm')) + '</button>');
+        document.getElementById('m-cancel').onclick = closeCf;
+        document.getElementById('m-ok').onclick = async function () {
+          try {
+            var r = await sb.rpc('receive_transfer', { p_transfer_id: b.getAttribute('data-tf-receive') });
+            if (r.error) throw r.error;
+            closeCf(); toast(t('transfer.received'), 'ok'); render();
+          } catch (e) { closeCf(); apiError(e); }
+        };
       };
     });
   }
@@ -6464,31 +6471,44 @@
       } catch (e) { apiError(e); ab.disabled = false; }
     };
     var rb = document.getElementById('tf-reject-btn');
-    if (rb) rb.onclick = async function () {
+    if (rb) rb.onclick = function () {
+      /* Read the reason before the confirm modal replaces this dialog. */
       var reason = document.getElementById('tf-reason').value.trim();
       if (!reason) { toast(t('new.fillRequired'), 'error'); return; }
-      if (!window.confirm(t('transfer.rejectConfirm'))) return;
-      rb.disabled = true;
-      try {
-        /* reject_transfer takes the reason as p_note (migration_v11). */
-        var r = await sb.rpc('reject_transfer', { p_transfer_id: tr.id, p_note: reason });
-        if (r.error) throw r.error;
-        close(); toast(t('transfer.rejected'), 'ok'); done();
-      } catch (e) { apiError(e); rb.disabled = false; }
+      /* v9.2.1: window.confirm blocks the JS thread and hangs in
+         automated browsers (same as v9.1 #6) — use the in-app modal. */
+      var closeCf = openModal(t('transfer.reject'), t('transfer.rejectConfirm'),
+        '<button class="btn" id="m-cancel">' + esc(t('common.cancel')) + '</button>' +
+        '<button class="btn btn-danger" id="m-ok">' + esc(t('transfer.reject')) + '</button>');
+      document.getElementById('m-cancel').onclick = closeCf;
+      document.getElementById('m-ok').onclick = async function () {
+        try {
+          /* reject_transfer takes the reason as p_note (migration_v11). */
+          var r = await sb.rpc('reject_transfer', { p_transfer_id: tr.id, p_note: reason });
+          if (r.error) throw r.error;
+          closeCf(); toast(t('transfer.rejected'), 'ok'); done();
+        } catch (e) { closeCf(); apiError(e); }
+      };
     };
     var db = document.getElementById('tf-dispatch-btn');
     if (db) db.onclick = function () {
       close(); openTransferDispatchDialog(tr, partMap, whMap, done);
     };
     var cb = document.getElementById('tf-receive-btn');
-    if (cb) cb.onclick = async function () {
-      if (!window.confirm(t('transfer.receiveConfirm'))) return;
-      cb.disabled = true;
-      try {
-        var r = await sb.rpc('receive_transfer', { p_transfer_id: tr.id });
-        if (r.error) throw r.error;
-        close(); toast(t('transfer.received'), 'ok'); done();
-      } catch (e) { apiError(e); cb.disabled = false; }
+    if (cb) cb.onclick = function () {
+      /* v9.2.1: window.confirm blocks the JS thread and hangs in
+         automated browsers (same as v9.1 #6) — use the in-app modal. */
+      var closeCf = openModal(t('transfer.receive'), t('transfer.receiveConfirm'),
+        '<button class="btn" id="m-cancel">' + esc(t('common.cancel')) + '</button>' +
+        '<button class="btn btn-primary" id="m-ok">' + esc(t('common.confirm')) + '</button>');
+      document.getElementById('m-cancel').onclick = closeCf;
+      document.getElementById('m-ok').onclick = async function () {
+        try {
+          var r = await sb.rpc('receive_transfer', { p_transfer_id: tr.id });
+          if (r.error) throw r.error;
+          closeCf(); toast(t('transfer.received'), 'ok'); done();
+        } catch (e) { closeCf(); apiError(e); }
+      };
     };
     /* Proof photos load after the modal opens (same pattern as the
        ticket photo gallery) so the dialog never blocks on signed URLs. */
