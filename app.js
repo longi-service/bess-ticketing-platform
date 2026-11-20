@@ -77,7 +77,10 @@
     listFilters: { status: '', tracker: '', priority: '', source: '', site: '', assignee: '', q: '', tag: '', customer: '',
                  unassignedOnly: false, contractOnly: false }, // v3 U6: quick filters
     listPage: 0,           // v3 D7: pagination cursor (page index), reset on filter change
-    siteSearch: ''       // v2: sites tree search text
+    listSort: { key: 'updated_at', dir: 'desc' }, // v9.1 (#5): column sort
+    _listSig: null,        // v9.1 (#5): filter+sort signature — page resets only when it changes
+    siteSearch: '',        // v2: sites tree search text
+    siteSegment: ''        // v9.1 (#15): sites tree business-line filter
   };
 
   /* ================= v4: table-driven status/duty definitions ============= */
@@ -577,7 +580,10 @@
 
   async function fetchTickets(filters, opts) {
     opts = opts || {};
-    var q = applyTicketFilters(baseTicketQuery(), filters).order('updated_at', { ascending: false });
+    /* v9.1 (#5, R4): column sorting — default stays updated_at desc. */
+    var sort = opts.sort || { key: 'updated_at', dir: 'desc' };
+    var q = applyTicketFilters(baseTicketQuery(), filters)
+      .order(sort.key, { ascending: sort.dir === 'asc' });
     // v3 D7: pagination. Default keeps the old behavior (first 500 rows).
     var limit = opts.limit != null ? opts.limit : 500;
     if (opts.offset) q = q.range(opts.offset, opts.offset + limit - 1);
@@ -599,6 +605,11 @@
       else q = q.eq('site_id', filters.site);
     }
     if (filters.assignee) q = q.eq('assigned_to', filters.assignee);
+    /* v9.1 (#15, R4): business-line filter resolves to that line's projects. */
+    if (filters.segment) {
+      var segIds = L.siteIdsForSegment(state.sites, filters.segment);
+      q = segIds.length ? q.in('site_id', segIds) : q.eq('site_id', '00000000-0000-0000-0000-000000000000');
+    }
     /* v6.1: support group filter (column only exists after migration_v6_1). */
     if (filters.group) q = q.eq('assigned_group_id', filters.group);
     if (filters.tag) q = q.contains('tags', [filters.tag]);
@@ -1339,8 +1350,9 @@
     });
     var slaPct = closed30.length ? Math.round(100 * compliant.length / closed30.length) : null;
 
-    function counter(label, n, danger, hash) {
-      return '<div class="card counter kpi' + (danger ? ' danger' : '') + ' clickable" data-nav="' + hash + '">' +
+    function counter(label, n, danger, hash, filter) {
+      return '<div class="card counter kpi' + (danger ? ' danger' : '') + ' clickable" data-nav="' + hash + '"' +
+        (filter ? ' data-list-filter="' + esc(JSON.stringify(filter)) + '"' : '') + '>' +
         '<div class="kpi-accent"></div>' +
         '<div class="num">' + esc(String(n)) + '</div><div class="lbl">' + esc(label) + '</div></div>';
     }
@@ -1475,8 +1487,8 @@
       ' — ' + esc(t('dash.hint.' + state.profile.role)) + '</p></div></div>' +
       '<div class="grid-4">' +
         counter(t('dash.openTickets'), open.length, false, '#/tickets') +
-        counter(t('dash.contractOpen'), contractOpen.length, contractOpen.length > 0, '#/tickets') +
-        counter(t('dash.unassigned'), unassigned.length, unassigned.length > 0, '#/tickets') +
+        counter(t('dash.contractOpen'), contractOpen.length, contractOpen.length > 0, '#/tickets', { contractOnly: true }) +
+        counter(t('dash.unassigned'), unassigned.length, unassigned.length > 0, '#/tickets', { unassignedOnly: true }) +
         /* v3 F8: breached-SLA counter navigates to the SLA alerts view (staff only). */
         counter(t('dash.breachedSla'), breached.length, breached.length > 0,
                 ['admin', 'dispatcher', 'pm'].indexOf(state.profile.role) !== -1 ? '#/sla-alerts' : '#/tickets') +
@@ -1516,7 +1528,7 @@
       '<div class="card kpi-rail" style="margin-top:16px"><h2>' + esc(t('dash.contractKpi')) + '</h2>' +
         '<div class="grid-4">' +
           counter(t('dash.contractSites'), activeContracts.length, false, '#/sites') +
-          counter(t('dash.contractOpenTickets'), contractOpen.length, contractOpen.length > 0, '#/tickets') +
+          counter(t('dash.contractOpenTickets'), contractOpen.length, contractOpen.length > 0, '#/tickets', { contractOnly: true }) +
           counter(t('dash.contractBreached'), contractBreached.length, contractBreached.length > 0, '#/tickets') +
           '<div></div>' +
         '</div>' +
@@ -1675,19 +1687,28 @@
       ';border:1px solid ' + tr.color + '55">' + esc(trackerName(tr.key)) + '</span>';
   }
 
-  function ticketTable(tickets) {
+  /* v9.1 (#5, R4): sortable columns — server-side order via fetchTickets.
+     Priority sorts alphabetically server-side (high/low/medium/urgent). */
+  var SORTABLE_COLS = { ticket_no: 'list.columns.ticket', title: 'list.columns.title',
+    status: 'common.status', priority: 'common.priority', updated_at: 'common.updatedAt' };
+  function sortTh(key, sort) {
+    var arrow = sort && sort.key === key ? (sort.dir === 'asc' ? ' ▲' : ' ▼') : '';
+    return '<th class="sortable" data-sort="' + key + '" style="cursor:pointer;white-space:nowrap">' +
+      esc(t(SORTABLE_COLS[key])) + arrow + '</th>';
+  }
+  function ticketTable(tickets, sort) {
     if (!tickets.length) return '<div class="empty">' + esc(t('list.noResults')) + '</div>';
     var rows = tickets.map(ticketRowHtml).join('');
     return '<div style="overflow-x:auto"><table class="tbl"><thead><tr>' +
-      '<th>' + esc(t('list.columns.ticket')) + '</th>' +
+      sortTh('ticket_no', sort) +
       (state.v7 ? '<th>' + esc(t('tickets.tracker')) + '</th>' : '') +
-      '<th>' + esc(t('list.columns.title')) + '</th>' +
-      '<th>' + esc(t('common.status')) + '</th>' +
-      '<th>' + esc(t('common.priority')) + '</th>' +
+      sortTh('title', sort) +
+      sortTh('status', sort) +
+      sortTh('priority', sort) +
       '<th>' + esc(t('list.columns.site')) + '</th>' +
       '<th>' + esc(t('list.columns.assignee')) + '</th>' +
       '<th>SLA</th>' +
-      '<th>' + esc(t('common.updatedAt')) + '</th>' +
+      sortTh('updated_at', sort) +
       '</tr></thead><tbody>' + rows + '</tbody></table></div>';
   }
 
@@ -1698,7 +1719,18 @@
 
   function bindTableNav(view) {
     view.querySelectorAll('[data-nav]').forEach(function (el) {
-      el.onclick = function () { nav(el.getAttribute('data-nav')); };
+      el.onclick = function () {
+        /* v9.1 (#1, R4): dashboard quick-filter cards carry their filter
+           preset — apply it before navigating to the ticket list. */
+        var f = el.getAttribute('data-list-filter');
+        if (f) {
+          try {
+            state.listFilters = Object.assign(blankFilters(), JSON.parse(f));
+            state.listPage = 0;
+          } catch (e) {}
+        }
+        nav(el.getAttribute('data-nav'));
+      };
     });
     view.querySelectorAll('tr.clickable[data-id]').forEach(function (el) {
       el.onclick = function () { nav('#/ticket/' + el.getAttribute('data-id')); };
@@ -1706,8 +1738,8 @@
   }
 
   /* ----------------------------- ticket list ---------------------------- */
-  /* v3 D7: page size for the ticket list ("Load more" pagination). */
-  var LIST_PAGE_SIZE = 50;
+  /* v3 D7: page size for the ticket list. v9.1 (#5, R4): 20 rows + pager. */
+  var LIST_PAGE_SIZE = 20;
 
   /* v3 U5: statuses shown as tracker tabs (excludes the unused 'pending'). */
   var TRACKER_STATUSES = ['open', 'in_progress', 'pending_customer', 'resolved', 'closed'];
@@ -1716,7 +1748,7 @@
      Ticket/user data is NEVER written to localStorage (old-demo bug). */
   var VIEWS_KEY = 'bess_views';
   function blankFilters() {
-    return { status: '', tracker: '', priority: '', source: '', site: '', assignee: '', q: '', tag: '', customer: '',
+    return { status: '', tracker: '', priority: '', source: '', site: '', segment: '', assignee: '', q: '', tag: '', customer: '',
              unassignedOnly: false, contractOnly: false, group: '' /* v6.1 */, subtree: false /* v9 */ };
   }
   function loadSavedViews() {
@@ -1732,8 +1764,18 @@
 
   async function viewTicketList(view) {
     var f = state.listFilters;
-    state.listPage = 0; // v3 D7: pagination cursor resets on every filter change
-    var tickets = await fetchTickets(f, { limit: LIST_PAGE_SIZE });
+    /* v9.1 (#5, R4): reset to page 0 only when the filters/sort changed —
+       pager clicks re-render with the same signature and keep their page. */
+    var listSig = JSON.stringify({ f: f, s: state.listSort });
+    if (state._listSig !== listSig) { state._listSig = listSig; state.listPage = 0; }
+    var tickets = await fetchTickets(f, { limit: LIST_PAGE_SIZE, offset: state.listPage * LIST_PAGE_SIZE, sort: state.listSort });
+    /* v9.1 (#4, R4): assignee-filter options — the assignable pool. */
+    var assignees = [];
+    try {
+      var ar = await sb.from('profiles').select('id,display_name,email')
+        .in('role', ['engineer', 'tech_manager']).eq('is_active', true).order('display_name');
+      assignees = ar.data || [];
+    } catch (e) {}
     await runEscalationJob(tickets);
     await resolveNames(collectIds(tickets));
 
@@ -1756,9 +1798,21 @@
       tabCounts[tst] = await countTickets(Object.assign({}, fNoStatus, { status: tst }));
     }
 
+    /* v9.1 (#5, R4): the page may be out of range after the filters
+       shrank the result — clamp and re-fetch the page once. */
+    var pg = L.paginate(filteredCount, state.listPage, LIST_PAGE_SIZE);
+    if (pg.page !== state.listPage) {
+      state.listPage = pg.page;
+      if (filteredCount > 0) {
+        tickets = await fetchTickets(f, { limit: LIST_PAGE_SIZE, offset: pg.offset, sort: state.listSort });
+        await runEscalationJob(tickets);
+        await resolveNames(collectIds(tickets));
+      }
+    }
+
     var role = state.profile.role;
-    var filtersActive = !!(f.status || f.priority || f.source || f.site || f.q || f.tag || f.customer ||
-                           f.unassignedOnly || f.contractOnly || f.group); // v3 U6 quick filters count too
+    var filtersActive = !!(f.status || f.priority || f.source || f.site || f.segment || f.assignee ||
+                           f.q || f.tag || f.customer || f.unassignedOnly || f.contractOnly || f.group);
     var scopeLimited = role === 'engineer' || role === 'tech_manager' || role === 'customer' ||
       (role === 'pm' && (state.profile.project_scope || []).length > 0);
     /* v3 D7: "Showing X of Y" = loaded rows vs. filter matches (all pages). */
@@ -1831,6 +1885,20 @@
         '<div class="f"><label>&nbsp;</label><label class="checkbox" style="padding-top:6px">' +
           '<input type="checkbox" id="f-subtree"' + (f.subtree ? ' checked' : '') + '> ' +
           esc(t('list.filter.subtree')) + '</label></div>' +
+        /* v9.1 (#15, R4): business-line filter */
+        '<div class="f"><label>' + esc(t('list.filter.segment')) + '</label>' +
+          '<select id="f-segment"><option value="">' + esc(t('common.all')) + '</option>' +
+          state.segments.map(function (sg) {
+            return '<option value="' + esc(sg.key) + '"' + (f.segment === sg.key ? ' selected' : '') + '>' +
+              esc(segmentLabel(sg.key)) + '</option>';
+          }).join('') + '</select></div>' +
+        /* v9.1 (#4, R4): per-person assignee filter */
+        '<div class="f"><label>' + esc(t('list.filter.assignee')) + '</label>' +
+          '<select id="f-assignee"><option value="">' + esc(t('common.all')) + '</option>' +
+          assignees.map(function (a) {
+            return '<option value="' + a.id + '"' + (f.assignee === a.id ? ' selected' : '') + '>' +
+              esc(a.display_name || a.email || a.id) + '</option>';
+          }).join('') + '</select></div>' +
         /* v6.1: support group filter */
         (state.v61
           ? '<div class="f"><label>' + esc(t('list.filter.group')) + '</label>' +
@@ -1845,7 +1913,7 @@
             '<input type="text" id="f-tag" placeholder="' + esc(t('list.filter.tagPh')) +
             '" value="' + esc(f.tag || '') + '"></div>'
           : '') +
-        (state.v3 && state.customers.length
+        (state.v3
           ? '<div class="f"><label>' + esc(t('list.filter.customer')) + '</label>' +
             '<select id="f-customer"><option value="">' + esc(t('common.all')) + '</option>' +
             state.customers.map(function (c) {
@@ -1869,12 +1937,14 @@
         '<button class="btn btn-sm btn-danger" id="view-del">' + esc(t('list.viewDelete')) + '</button>' +
       '</div>' +
       '<div class="list-scope-line" id="list-scope-line">' + scopeLineInner(tickets.length) + '</div>' +
-      '<div id="list-result">' + ticketTable(tickets) + '</div>' +
-      /* v3 D7: shown when the fetched page is full (more may exist) */
-      (tickets.length === LIST_PAGE_SIZE
-        ? '<div style="margin-top:12px;text-align:center"><button class="btn" id="load-more">' +
-          esc(t('list.loadMore')) + '</button></div>'
-        : '') +
+      '<div id="list-result">' + ticketTable(tickets, state.listSort) + '</div>' +
+      /* v9.1 (#5, R4): pager — "load more" is replaced by prev/next. */
+      '<div style="margin-top:12px;display:flex;gap:8px;align-items:center;justify-content:center">' +
+        '<button class="btn btn-sm" id="page-prev"' + (pg.hasPrev ? '' : ' disabled') + '>' +
+          esc(t('list.pagePrev')) + '</button>' +
+        '<span class="muted">' + esc(t('list.pageOf').replace('{p}', String(pg.page + 1)).replace('{n}', String(pg.pages))) + '</span>' +
+        '<button class="btn btn-sm" id="page-next"' + (pg.hasNext ? '' : ' disabled') + '>' +
+          esc(t('list.pageNext')) + '</button></div>' +
       '</div>';
 
     if (L.can('ticket.create', role)) {
@@ -1897,11 +1967,27 @@
       if (tagEl) f.tag = tagEl.value.trim();
       var custEl = document.getElementById('f-customer');
       if (custEl) f.customer = custEl.value;
+      var segEl = document.getElementById('f-segment');
+      if (segEl) f.segment = segEl.value;
+      var asgEl = document.getElementById('f-assignee');
+      if (asgEl) f.assignee = asgEl.value;
       render();
     }
     /* v3 U5: tab click sets the status filter and re-renders. */
     view.querySelectorAll('#status-tabs button').forEach(function (b) {
       b.onclick = function () { f.status = b.getAttribute('data-tab'); render(); };
+    });
+    /* v9.1 (#5, R4): column-header sorting — same key toggles direction,
+       a new key starts asc (desc for updated_at); page resets via the
+       signature change. */
+    view.querySelectorAll('th[data-sort]').forEach(function (th) {
+      th.onclick = function () {
+        var key = th.getAttribute('data-sort');
+        var cur = state.listSort || { key: 'updated_at', dir: 'desc' };
+        if (cur.key === key) state.listSort = { key: key, dir: cur.dir === 'asc' ? 'desc' : 'asc' };
+        else state.listSort = { key: key, dir: key === 'updated_at' ? 'desc' : 'asc' };
+        render();
+      };
     });
     /* v3 U6: quick-filter chips toggle and re-render. */
     document.getElementById('qf-unassigned').onclick = function () {
@@ -1910,7 +1996,7 @@
     document.getElementById('qf-contract').onclick = function () {
       f.contractOnly = !f.contractOnly; render();
     };
-    ['f-status', 'f-tracker', 'f-priority', 'f-source', 'f-site', 'f-group'].forEach(function (id) {
+    ['f-status', 'f-tracker', 'f-priority', 'f-source', 'f-site', 'f-segment', 'f-assignee', 'f-group'].forEach(function (id) {
       var el = document.getElementById(id);
       if (el) el.onchange = refetch;
     });
@@ -1940,6 +2026,7 @@
       if (dup) { toast(t('list.viewExists'), 'error'); return; }
       arr.push({ name: name, filters: {
         status: f.status, priority: f.priority, source: f.source, site: f.site,
+        segment: f.segment || '', assignee: f.assignee || '',
         tag: f.tag || '', customer: f.customer || '',
         unassignedOnly: !!f.unassignedOnly, contractOnly: !!f.contractOnly, q: f.q || ''
       } });
@@ -1971,27 +2058,12 @@
     /* v3 U11: CSV export (all pages of the current filters, capped). */
     var expBtn = document.getElementById('export-csv');
     if (expBtn) expBtn.onclick = function () { exportTicketsCsv(f, expBtn); };
-    /* v3 D7: load more appends rows without a full re-render. */
-    var loadBtn = document.getElementById('load-more');
-    if (loadBtn) loadBtn.onclick = async function () {
-      var btn = this; btn.disabled = true;
-      state.listPage++;
-      var more = await fetchTickets(f, { limit: LIST_PAGE_SIZE, offset: state.listPage * LIST_PAGE_SIZE });
-      await runEscalationJob(more);
-      await resolveNames(collectIds(more));
-      var tbody = view.querySelector('#list-result tbody');
-      if (tbody && more.length) {
-        tbody.insertAdjacentHTML('beforeend', more.map(ticketRowHtml).join(''));
-        bindTableNav(view);
-      }
-      var scopeEl = document.getElementById('list-scope-line');
-      if (scopeEl) {
-        var loadedNow = (view.querySelectorAll('#list-result tbody tr') || []).length;
-        scopeEl.innerHTML = scopeLineInner(loadedNow);
-      }
-      if (more.length < LIST_PAGE_SIZE) { if (btn.parentNode) btn.parentNode.remove(); }
-      else btn.disabled = false;
-    };
+    /* v9.1 (#5, R4): pager — same filters/sort, so the signature keeps
+       the page instead of resetting to 0. */
+    var prevBtn = document.getElementById('page-prev');
+    if (prevBtn) prevBtn.onclick = function () { if (state.listPage > 0) { state.listPage--; render(); } };
+    var nextBtn = document.getElementById('page-next');
+    if (nextBtn) nextBtn.onclick = function () { state.listPage++; render(); };
     bindTableNav(view);
   }
 
@@ -2150,6 +2222,11 @@
             '<dt>' + esc(t('detail.firmwareVersion')) + '</dt><dd>' + esc(ticket.firmware_version || '—') + '</dd>' +
             '<dt>' + esc(t('detail.errorCode')) + '</dt><dd>' + esc(ticket.error_code || '—') + '</dd>' +
             '<dt>' + esc(t('detail.actionsTaken')) + '</dt><dd>' + esc(ticket.actions_taken || '—') + '</dd>' +
+            /* v9.1 (#4, R4): tags are a visible, labelled field — the header
+               pills only render when tags exist, so an untagged ticket
+               showed no tags field at all. */
+            (state.v3 ? '<dt>' + esc(t('new.field.tags')) + '</dt><dd>' +
+              (ticket.tags && ticket.tags.length ? tagPills(ticket.tags) : '—') + '</dd>' : '') +
           '</dl></div>' +
         '<div class="card"><h2>' + esc(t('detail.description')) + '</h2>' +
           '<div style="white-space:pre-wrap">' + esc(ticket.description || '—') + '</div>' +
@@ -2930,20 +3007,28 @@
       } catch (e) { apiError(e); btn.disabled = false; }
     };
     var un = document.getElementById('unassign-btn');
-    if (un) un.onclick = async function () {
-      if (!window.confirm(t('detail.unassignConfirm'))) return;
-      try {
-        // "assigned → open" is an allowed transition for dispatcher/admin.
-        var allowed = ticketTransitions(ticket, state.profile.role,
-          L.transitionCtx(ticket, state.profile));
-        if (allowed.indexOf('open') === -1) { toast(t('common.noPermission'), 'error'); return; }
-        var r = await sb.from('tickets').update({ assigned_to: null, status: 'open' }).eq('id', ticket.id);
-        if (r.error) throw r.error;
-        /* v8.2: audit event for the implied status change. */
-        logTicketEvent(ticket.id, 'status', ticket.status + ' → open');
-        toast(t('common.saved'), 'ok');
-        done();
-      } catch (e) { apiError(e); }
+    if (un) un.onclick = function () {
+      /* v9.1 (#6, R4): window.confirm blocks the JS thread and hung the
+         page twice in automated browsers — use the in-app modal instead. */
+      var closeUn = openModal(t('detail.unassign'), t('detail.unassignConfirm'),
+        '<button class="btn" id="m-cancel">' + esc(t('common.cancel')) + '</button>' +
+        '<button class="btn btn-primary" id="m-ok">' + esc(t('common.confirm')) + '</button>');
+      document.getElementById('m-cancel').onclick = closeUn;
+      document.getElementById('m-ok').onclick = async function () {
+        try {
+          // "assigned → open" is an allowed transition for dispatcher/admin.
+          var allowed = ticketTransitions(ticket, state.profile.role,
+            L.transitionCtx(ticket, state.profile));
+          if (allowed.indexOf('open') === -1) { toast(t('common.noPermission'), 'error'); closeUn(); return; }
+          var r = await sb.from('tickets').update({ assigned_to: null, status: 'open' }).eq('id', ticket.id);
+          if (r.error) throw r.error;
+          /* v8.2: audit event for the implied status change. */
+          logTicketEvent(ticket.id, 'status', ticket.status + ' → open');
+          toast(t('common.saved'), 'ok');
+          closeUn();
+          done();
+        } catch (e) { closeUn(); apiError(e); }
+      };
     };
   }
 
@@ -3678,7 +3763,7 @@
            v8 (#19/#21): options come from the governed tracker registry. */
         (state.v7
           ? '<div class="field"><label>' + esc(t('new.tracker')) + '</label>' +
-            '<select id="nt-tracker">' + state.trackers.map(function (tr) {
+            '<select id="nt-tracker">' + L.availableTrackers(state.trackers, null).map(function (tr) {
               return '<option value="' + esc(tr.key) + '"' + (tr.key === 'support' ? ' selected' : '') + '>' +
                 esc(trackerName(tr.key)) + '</option>';
             }).join('') + '</select></div>'
@@ -3689,7 +3774,9 @@
             return '<option value="' + s.id + '">' + esc(s.code + ' — ' + s.name) + '</option>';
           }).join('') + '</select>' +
           '<div class="inline-err" id="nt-contract-notice" style="display:none;margin-top:8px;margin-bottom:0">' +
-            esc(t('new.contractNotice')) + '</div></div>' +
+            esc(t('new.contractNotice')) + '</div>' +
+          /* v9.1 (#15, R4): the selected project's business line, read-only. */
+          '<div class="muted" id="nt-segment-line" style="margin-top:4px"></div></div>' +
         /* v6.1: support group assignment — defaults to the site's
            default group (Massimo's dispatch rule). */
         (state.v61
@@ -3712,7 +3799,8 @@
         /* v5 P2: photo/video picker right on the form. Customers must
            attach at least one file (it replaces the technical fields). */
         '<div class="field span2"><label>' + esc(t('new.field.attachments')) +
-          (isCustomer ? '<span class="req">*</span>' : '') + '</label>' +
+          '<span class="req" id="nt-files-req" style="display:' +
+            (L.requiresPhoto(sources[0]) ? 'inline' : 'none') + '">*</span></label>' +
           '<input type="file" id="nt-files" accept="image/*,video/*" multiple>' +
           '<div class="hint">' + esc(t('new.attachments.hint')) + '</div>' +
           '<div id="nt-preview" class="nt-preview"></div></div>' +
@@ -3827,14 +3915,24 @@
       }
       /* v6.1: route to the site's default support group. */
       var gsel = document.getElementById('nt-group');
-      if (gsel) {
-        var st = state.sites.filter(function (x) { return x.id === siteSel.value; })[0];
-        gsel.value = (st && st.default_group_id) || '';
+      var st = state.sites.filter(function (x) { return x.id === siteSel.value; })[0];
+      if (gsel) gsel.value = (st && st.default_group_id) || '';
+      /* v9.1 (#15, R4): show the selected project's business line. */
+      var segLine = document.getElementById('nt-segment-line');
+      if (segLine) {
+        segLine.textContent = (st && st.segment)
+          ? t('sites.segment') + (lang === 'zh' ? '：' : ': ') + segmentLabel(st.segment) : '';
       }
       refreshTrackerOptions();
     }
     siteSel.onchange = refreshContractState;
     refreshContractState();
+    /* v9.1 (#3, R4): the photo-required star follows the source. */
+    var srcSel = document.getElementById('nt-source');
+    if (srcSel) srcSel.onchange = function () {
+      var req = document.getElementById('nt-files-req');
+      if (req) req.style.display = L.requiresPhoto(srcSel.value) ? 'inline' : 'none';
+    };
     /* v5 P2: live preview thumbnails for the picked files. */
     var ntPrevUrls = [];
     document.getElementById('nt-files').onchange = function () {
@@ -3861,10 +3959,11 @@
       /* v5 P1: required set depends on the role. */
       var missing = reqIds.some(function (id) { return !get(id); });
       if (missing) { toast(t('new.fillRequired'), 'error'); return; }
-      /* v5 P2: collect the picked files; customers must attach ≥1. */
+      /* v9.1 (#3, R4): a photo/video is mandatory when the source is
+         customer feedback — the rule follows the source, not the role. */
       var pickedFiles = Array.prototype.slice.call(
         (document.getElementById('nt-files') || {}).files || []);
-      if (isCustomer && !pickedFiles.length) {
+      if (L.requiresPhoto(get('nt-source')) && !pickedFiles.length) {
         toast(t('new.attachments.required'), 'error'); return;
       }
       /* v5 P4: hard media limits before anything is uploaded. */
@@ -4376,9 +4475,11 @@
       '</div>';
     }
     var bodyHtml;
-    if (q) {
+    var segF = state.siteSegment || '';
+    if (q || segF) {
       var hits = state.sites.filter(function (s) {
-        return ((s.code || '') + ' ' + (s.name || '')).toLowerCase().indexOf(q) !== -1;
+        var okQ = !q || ((s.code || '') + ' ' + (s.name || '')).toLowerCase().indexOf(q) !== -1;
+        return okQ && (!segF || s.segment === segF);
       });
       bodyHtml = hits.map(function (s) { return nodeHtml(s, 0); }).join('') ||
         '<div class="empty">' + esc(t('list.noResults')) + '</div>';
@@ -4403,8 +4504,16 @@
         ? '<button class="btn btn-primary" id="site-new">+ ' + esc(t('sites.new')) + '</button>'
         : '<span class="muted">' + esc(t('sites.readOnly')) + '</span>') + '</div>' +
       '<div class="card"><h2 class="section-title">' + esc(t('sites.tree')) + '</h2>' +
-      '<div class="field" style="max-width:360px"><input type="text" id="site-q" placeholder="' +
+      '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">' +
+      '<div class="field" style="max-width:360px;margin-bottom:0"><input type="text" id="site-q" placeholder="' +
         esc(t('sites.searchPh')) + '" value="' + esc(state.siteSearch || '') + '"></div>' +
+      /* v9.1 (#15, R4): business-line filter for the project list */
+      '<div class="field" style="max-width:220px;margin-bottom:0"><select id="site-segment">' +
+        '<option value="">' + esc(t('common.all')) + ' · ' + esc(t('list.filter.segment')) + '</option>' +
+        state.segments.map(function (sg) {
+          return '<option value="' + esc(sg.key) + '"' + (segF === sg.key ? ' selected' : '') + '>' +
+            esc(segmentLabel(sg.key)) + '</option>';
+        }).join('') + '</select></div></div>' +
       '<div id="site-tree">' + bodyHtml + '</div></div>' +
       (state.v3 && canManageSites ? '<div class="card" id="customers-card"></div>' : '');
     var deb = null;
@@ -4413,6 +4522,8 @@
       clearTimeout(deb);
       deb = setTimeout(function () { state.siteSearch = v; render(); }, 400);
     };
+    var segSel = document.getElementById('site-segment');
+    if (segSel) segSel.onchange = function () { state.siteSegment = this.value; render(); };
     var siteNewBtn = document.getElementById('site-new');
     if (siteNewBtn) siteNewBtn.onclick = function () {
       openSiteModal(null, function () { render(); });
@@ -5885,7 +5996,9 @@
             ? '<button class="btn btn-sm" data-whedit="' + w.id + '">' + esc(t('common.edit')) + '</button> ' +
               '<button class="btn btn-sm btn-danger" data-whdel="' + w.id + '">' + esc(t('common.delete')) + '</button>'
             : '<span class="muted">—</span>') + '</td></tr>';
-        whHtml += stockRowsFor(w.id);
+        var sRows = stockRowsFor(w.id);
+        whHtml += sRows ||
+          '<tr><td></td><td colspan="4"><span class="muted">' + esc(t('parts.noStock')) + '</span></td><td></td></tr>';
         walk(w.id, depth + 1);
       });
     })('__root', 0);
@@ -6861,13 +6974,48 @@
             (p.unit ? ' (' + esc(p.unit) + ')' : '') + '</option>';
         }).join('') + '</select></div>' +
       '<div class="field"><label>' + esc(t('parts.qty')) + '<span class="req">*</span></label>' +
-        '<input type="number" id="ip-qty" min="1" step="1" value="1"></div>';
+        '<input type="number" id="ip-qty" min="1" step="1" value="1">' +
+        '<div class="muted" id="ip-stock" style="margin-top:4px"></div></div>';
     var close = openModal(t('parts.issueTitle'), body,
       '<button class="btn" id="m-cancel">' + esc(t('common.cancel')) + '</button>' +
       (warehouses.length
         ? '<button class="btn btn-primary" id="m-save">' + esc(t('parts.issueTitle')) + '</button>'
         : ''));
     document.getElementById('m-cancel').onclick = close;
+    /* v9.1 (#11, R4): live stock for the selected warehouse+part. A part
+       with no stock row in this warehouse counts as 0 on hand; when the
+       stock lookup itself fails, the guard is skipped (never block on
+       unknown stock). */
+    var stockMap = {}, stockLoaded = false;
+    function availFor(pid) {
+      if (!stockLoaded) return null;
+      return stockMap[pid] == null ? 0 : stockMap[pid];
+    }
+    function refreshStockHint() {
+      var hint = document.getElementById('ip-stock');
+      if (!hint) return;
+      var pid = (document.getElementById('ip-part') || {}).value || '';
+      var av = pid ? availFor(pid) : null;
+      hint.textContent = av == null ? '' : t('parts.stockAvailable').replace('{n}', String(av));
+    }
+    async function loadStock() {
+      var whId = (document.getElementById('ip-wh') || {}).value || null;
+      stockMap = {}; stockLoaded = false;
+      if (!whId) { refreshStockHint(); return; }
+      try {
+        var sr = await sb.from('stock_levels').select('part_id,qty').eq('warehouse_id', whId);
+        if (!sr.error) {
+          (sr.data || []).forEach(function (r) { stockMap[r.part_id] = Number(r.qty) || 0; });
+          stockLoaded = true;
+        }
+      } catch (e) {}
+      refreshStockHint();
+    }
+    var ipWh = document.getElementById('ip-wh');
+    if (ipWh) ipWh.onchange = loadStock;
+    var ipPart = document.getElementById('ip-part');
+    if (ipPart) ipPart.onchange = refreshStockHint;
+    loadStock();
     var saveBtn = document.getElementById('m-save');
     if (saveBtn) saveBtn.onclick = async function () {
       var btn = this; btn.disabled = true;
@@ -6875,6 +7023,12 @@
         var partId = document.getElementById('ip-part').value;
         var qty = Number(document.getElementById('ip-qty').value);
         if (!partId || !(qty > 0)) { toast(t('new.fillRequired'), 'error'); btn.disabled = false; return; }
+        /* v9.1 (#11, R4): never issue more than the warehouse holds. */
+        var avNow = availFor(partId);
+        if (L.validateIssueQty(qty, avNow) === 'over') {
+          toast(t('parts.issue.overStock').replace('{n}', String(avNow)), 'error');
+          btn.disabled = false; return;
+        }
         var r = await sb.rpc('issue_spare_part', {
           p_ticket_id: ticket.id, p_part_id: partId, p_qty: qty,
           p_warehouse_id: document.getElementById('ip-wh').value || null
@@ -6990,7 +7144,9 @@
     } catch (e) {}
     /* v7.12: yearly planned-maintenance plan for this site — 12 tickets
        (tracker=maintenance, planned_date per month) + progress + print. */
-    var maintYear = (new Date()).getFullYear();
+    /* v9.1 (#7, R4): year is selectable (state.maintYear persists across
+       renders); default is the current year. */
+    var maintYear = state.maintYear || (new Date()).getFullYear();
     var maintTickets = [];
     async function loadMaintTickets() {
       if (!state.v7) return;
@@ -7018,7 +7174,15 @@
           '</td></tr>';
       }).join('');
       var pct = Math.round(100 * prog.done / 12);
-      return '<div class="card"><h2>' + esc(t('maint.planTitle')) + ' (' + maintYear + ')</h2>' +
+      var allDone = maintTickets.length >= 12;
+      var cy = (new Date()).getFullYear();
+      var yearOpts = [cy - 1, cy, cy + 1, cy + 2].map(function (y) {
+        return '<option value="' + y + '"' + (y === maintYear ? ' selected' : '') + '>' + y + '</option>';
+      }).join('');
+      return '<div class="card"><h2>' + esc(t('maint.planTitle')) + '</h2>' +
+        '<div style="display:flex;gap:8px;align-items:center;margin-bottom:8px"><label class="muted">' +
+          esc(t('maint.year')) + '</label><select id="maint-year" style="max-width:110px">' + yearOpts + '</select>' +
+          (allDone ? '<span class="muted">' + esc(t('maint.alreadyGenerated')) + '</span>' : '') + '</div>' +
         '<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px"><div class="loadbar" style="flex:1">' +
           '<div style="width:' + pct + '%"></div></div><b>' + prog.done + '/12</b></div>' +
         '<div style="overflow-x:auto;max-height:280px;overflow-y:auto"><table class="tbl"><thead><tr>' +
@@ -7026,7 +7190,7 @@
         '</tr></thead><tbody>' + rows + '</tbody></table></div>' +
         (L.can('ticket.create', state.profile.role)
           ? '<div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">' +
-            '<button class="btn btn-sm btn-primary" id="maint-gen">' + esc(t('maint.generate')) + '</button>' +
+            '<button class="btn btn-sm btn-primary" id="maint-gen"' + (allDone ? ' disabled' : '') + '>' + esc(t('maint.generate')) + '</button>' +
             '<button class="btn btn-sm" id="maint-print">' + esc(t('maint.printYear')) + '</button></div>'
           : '') +
       '</div>';
@@ -7083,9 +7247,9 @@
         '<dt>' + esc(t('contract.coverage')) + '</dt><dd>' + esc(contract.coverage || '—') + '</dd>' +
         '<dt>' + esc(t('contract.validFrom')) + ' – ' + esc(t('contract.validTo')) + '</dt><dd>' +
           esc(contract.valid_from || '—') + ' – ' + esc(contract.valid_to || '—') + '</dd>' +
-        '<dt>' + esc(t('contract.penaltyResponse')) + '</dt><dd>' + esc(contract.penalty_response || '—') + '</dd>' +
-        '<dt>' + esc(t('contract.penaltyOnsite')) + '</dt><dd>' + esc(contract.penalty_onsite || '—') + '</dd>' +
-        '<dt>' + esc(t('contract.penaltyResolve')) + '</dt><dd>' + esc(contract.penalty_resolve || '—') + '</dd>' +
+        '<dt>' + esc(t('contract.penaltyResponse')) + '</dt><dd>' + esc(contract.penalty_response || t('contract.penaltyNotSpecified')) + '</dd>' +
+        '<dt>' + esc(t('contract.penaltyOnsite')) + '</dt><dd>' + esc(contract.penalty_onsite || t('contract.penaltyNotSpecified')) + '</dd>' +
+        '<dt>' + esc(t('contract.penaltyResolve')) + '</dt><dd>' + esc(contract.penalty_resolve || t('contract.penaltyNotSpecified')) + '</dd>' +
         '</dl>'
       : '<div class="empty">' + esc(t('sites.contract.none')) + '</div>';
     var ccard =
@@ -7144,7 +7308,8 @@
       '<div class="card"><h2>' + esc(t('sites.warehouses')) + '</h2>' +
       (whRows || '<div class="empty">—</div>') +
       (canPartManage ? '<div class="form-actions"><button class="btn btn-sm btn-primary" id="wh-new">+ ' +
-        esc(t('parts.newWarehouse')) + '</button></div>' : '') +
+        esc(t('parts.newWarehouse')) + '</button> ' +
+        '<button class="btn btn-sm" id="wh-link">' + esc(t('parts.linkWarehouse')) + '</button></div>' : '') +
       '</div>';
 
     var tcard = '<div class="card"><h2>' + esc(t('sites.recentTickets')) + '</h2>' +
@@ -7378,6 +7543,12 @@
       } catch (e) { apiError(e); ptSave.disabled = false; }
     };
     /* v7.12: generate the yearly plan (12 maintenance tickets) + print. */
+    /* v9.1 (#7, R4): year switch re-loads that year's plan. */
+    var mySel = document.getElementById('maint-year');
+    if (mySel) mySel.onchange = function () {
+      state.maintYear = Number(this.value) || (new Date()).getFullYear();
+      render();
+    };
     var mgBtn = document.getElementById('maint-gen');
     if (mgBtn) mgBtn.onclick = async function () {
       mgBtn.disabled = true;
@@ -7406,7 +7577,8 @@
           if (ins.error) throw ins.error;
           created++;
         }
-        toast(t('maint.generatedCount').replace('{n}', String(created)), 'ok');
+        if (!created) toast(t('maint.alreadyGenerated'), 'error');
+        else toast(t('maint.generatedCount').replace('{n}', String(created)), 'ok');
         render();
       } catch (e) { apiError(e); mgBtn.disabled = false; }
     };
@@ -7476,6 +7648,45 @@
       var whNew = document.getElementById('wh-new');
       if (whNew) whNew.onclick = function () {
         openWarehouseModal(site, null, warehouses, function () { render(); });
+      };
+      /* v9.1 (#8, R4): link an existing warehouse (e.g. a central warehouse)
+         to this project — the issue dialog lists this project's warehouses,
+         so linking is what makes issuing work for the project. */
+      var whLink = document.getElementById('wh-link');
+      if (whLink) whLink.onclick = async function () {
+        var all = [];
+        try {
+          var ar = await sb.from('warehouses').select('id,code,name,site_id').order('code');
+          if (!ar.error) all = ar.data || [];
+        } catch (e) {}
+        var mine = {};
+        warehouses.forEach(function (w) { mine[w.id] = true; });
+        var cands = all.filter(function (w) { return !mine[w.id]; });
+        if (!cands.length) { toast(t('parts.noWarehouseToLink'), 'error'); return; }
+        var siteName = function (sid) {
+          if (!sid) return t('parts.noSite');
+          var s = state.sites.filter(function (x) { return x.id === sid; })[0];
+          return s ? s.code : sid;
+        };
+        var close = openModal(t('parts.linkWarehouse'),
+          '<div class="field"><label>' + esc(t('parts.linkWarehouseSelect')) + '</label>' +
+          '<select id="wl-sel">' + cands.map(function (w) {
+            return '<option value="' + w.id + '">' + esc(w.code + ' — ' + w.name) +
+              ' (' + esc(siteName(w.site_id)) + ')</option>';
+          }).join('') + '</select></div>' +
+          '<div class="hint">' + esc(t('parts.linkWarehouseHint')) + '</div>',
+          '<button class="btn" id="m-cancel">' + esc(t('common.cancel')) + '</button>' +
+          '<button class="btn btn-primary" id="m-save">' + esc(t('common.save')) + '</button>');
+        document.getElementById('m-cancel').onclick = close;
+        document.getElementById('m-save').onclick = async function () {
+          var btn = this; btn.disabled = true;
+          try {
+            var wid = document.getElementById('wl-sel').value;
+            var r = await sb.from('warehouses').update({ site_id: site.id }).eq('id', wid);
+            if (r.error) throw r.error;
+            close(); toast(t('parts.warehouseLinked'), 'ok'); render();
+          } catch (e) { apiError(e); btn.disabled = false; }
+        };
       };
       view.querySelectorAll('[data-whedit]').forEach(function (b) {
         b.onclick = function () {
@@ -7777,9 +7988,9 @@
     /* v4: ticket onsite ranges also mark field days (demo precedence #1).
        Booking always writes shift rows too; this covers ranges set directly
        on the ticket (e.g. before the booking flow existed). */
-    var fieldTicketMap = {}, fieldTicketId = {};
+    var fieldTicketMap = {}, fieldTicketId = {}, fieldTicketSite = {};
     try {
-      var oqr = await baseTicketQuery('id,ticket_no,assigned_to,onsite_from,onsite_to')
+      var oqr = await baseTicketQuery('id,ticket_no,assigned_to,site_id,onsite_from,onsite_to')
         .not('onsite_from', 'is', null).not('onsite_to', 'is', null)
         .lte('onsite_from', to).gte('onsite_to', from)
         .not('status', 'in', '(resolved,closed,pending_customer)').limit(500);
@@ -7789,6 +8000,7 @@
           if (dd >= from && dd <= to) {
             fieldTicketMap[x.assigned_to + '|' + dd] = x.ticket_no;
             fieldTicketId[x.assigned_to + '|' + dd] = x.id;
+            fieldTicketSite[x.assigned_to + '|' + dd] = x.site_id;
           }
         });
       });
@@ -7858,10 +8070,13 @@
         var isToday = key === todayKey;
         var cellCls = 'plan-cell cell-' + stKey + (canWrite ? ' clickable' : '') +
           (isToday ? ' plan-today' : '');
-        /* v9 (#25): project filter — shifts belonging to other
-           projects (not on site there, not covering it) fade out. */
-        if (planUi.site && sh && sh.site_id !== planUi.site &&
-            (sh.covered_site_ids || []).indexOf(planUi.site) === -1) {
+        /* v9.1 (#18, R4): project filter — a cell fades when it belongs
+           to another project: its shift's site, or (no shift row) the
+           site of the field ticket shown in the cell. */
+        if (L.planCellDimmed({ hasShift: !!sh, shiftSiteId: sh && sh.site_id,
+              coveredSiteIds: sh && sh.covered_site_ids,
+              fieldSiteId: fieldTicketSite[ftKey] || null,
+              selectedSiteId: planUi.site })) {
           cellCls += ' plan-offsite';
         }
         /* Merge key for the visual run-merge: same resolved state + day-part,

@@ -479,6 +479,25 @@
     return 'remoto';
   }
 
+  /* v9.1 (#18, R4): planning-grid dimming. A cell fades when a project is
+     selected and the cell belongs to another project — its shift's site,
+     or (no shift row) the site of the field ticket shown in the cell.
+     A shift row with no site (remote, no field ticket) keeps the legacy
+     behaviour and fades too; cells covering the selected project never
+     fade. */
+  function planCellDimmed(opts) {
+    opts = opts || {};
+    var sel = opts.selectedSiteId;
+    if (!sel) return false;
+    var covered = opts.coveredSiteIds || [];
+    if (covered.indexOf(sel) !== -1) return false;
+    if (opts.hasShift) {
+      var eff = opts.shiftSiteId || opts.fieldSiteId || null;
+      return eff !== sel;
+    }
+    return !!opts.fieldSiteId && opts.fieldSiteId !== sel;
+  }
+
   /**
    * Region model for assignment recommendation (v4).
    * Region set: DACH, South EU, West EU, North EU, East EU.
@@ -596,6 +615,13 @@
     return errs;
   }
 
+  /* v9.1 (#3, R4): a photo/video is mandatory when the ticket source is
+     customer feedback — the rule follows the source, not the creator's
+     role (a customer always creates with this source, staff may too). */
+  function requiresPhoto(source) {
+    return source === 'customer_feedback';
+  }
+
   /** computeTargetSize(w, h, maxDim) → {w,h} scaled to fit, or null when
       no scaling is needed. Pure — the canvas work lives in app.js. */
   function computeTargetSize(w, h, maxDim) {
@@ -621,6 +647,26 @@
     if (q >= m) return 'ok';
     if (q >= Math.floor(m * 0.5)) return 'low';
     return 'critical';
+  }
+
+  /* v9.1 (#11, R4): spare-part issue quantity guard. Returns null when
+     the issue is allowed, otherwise an error code the caller maps to
+     an i18n message. available == null (stock unknown) does not block. */
+  function validateIssueQty(qty, available) {
+    var q = Number(qty);
+    if (qty == null || isNaN(q) || q <= 0) return 'invalid';
+    if (available != null && !isNaN(Number(available)) && q > Number(available)) return 'over';
+    return null;
+  }
+
+  /* v9.1 (#5, R4): pager math. total = filtered row count, page = 0-based
+     requested page (clamped into range). */
+  function paginate(total, page, pageSize) {
+    var size = pageSize > 0 ? pageSize : 20;
+    var pages = Math.max(1, Math.ceil((total || 0) / size));
+    var p = Math.max(0, Math.min(page || 0, pages - 1));
+    return { pages: pages, page: p, offset: p * size,
+             hasPrev: p > 0, hasNext: p < pages - 1 };
   }
 
   /**
@@ -930,6 +976,15 @@
     (segments || DEFAULT_SEGMENTS).forEach(function (s) { if (s.key === segmentKey) seg = s; });
     if (seg && seg.workflow_key) return seg.workflow_key;
     return segmentKey === 'utility' ? 'utility' : 'ci';
+  }
+
+  /* v9.1 (#15, R4): site ids of one business line — the ticket-list
+     segment filter resolves a segment to its projects, then filters
+     tickets by site_id. null = no segment selected (no filtering). */
+  function siteIdsForSegment(sites, segmentKey) {
+    if (!segmentKey) return null;
+    return (sites || []).filter(function (s) { return s.segment === segmentKey; })
+      .map(function (s) { return s.id; });
   }
 
   /* ------------------------------------------------------------------ */
@@ -1438,6 +1493,12 @@
     canCloseTicket: canCloseTicket,
     monthlyPlanDates: monthlyPlanDates,
     maintenanceProgress: maintenanceProgress,
+    /* v9.1 additions (R4 fixes) */
+    siteIdsForSegment: siteIdsForSegment,
+    requiresPhoto: requiresPhoto,
+    validateIssueQty: validateIssueQty,
+    paginate: paginate,
+    planCellDimmed: planCellDimmed,
     /* v6.2 additions */
     EMAIL_EVENTS: EMAIL_EVENTS,
     renderEmailTemplate: renderEmailTemplate,

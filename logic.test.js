@@ -900,5 +900,63 @@ eq('dayState Date object works', L.dayState(null, new Date(2026, 9, 10)), 'weeke
 })();
 
 /* ------------------------------------------------------------------ */
+/* v9.1 — R4 fixes: segment filter, photo rule, issue guard, pager,    */
+/* planning dimming, custom-tracker workflow, maint year               */
+/* ------------------------------------------------------------------ */
+(function () {
+  /* #15 siteIdsForSegment */
+  var segSites = [
+    { id: 'A', segment: 'utility' },
+    { id: 'B', segment: 'ci' },
+    { id: 'C', segment: 'utility' },
+    { id: 'D', segment: null }
+  ];
+  arrEq('v9.1 seg sites utility', L.siteIdsForSegment(segSites, 'utility'), ['A', 'C']);
+  arrEq('v9.1 seg sites ci', L.siteIdsForSegment(segSites, 'ci'), ['B']);
+  eq('v9.1 seg sites none selected', L.siteIdsForSegment(segSites, ''), null);
+  arrEq('v9.1 seg sites unknown segment', L.siteIdsForSegment(segSites, 'other'), []);
+
+  /* #2 custom tracker workflow binding */
+  eq('v9.1 workflow: custom tracker binding wins', L.resolveWorkflowKey({ workflow_key: 'sma' }, 'utility', L.segmentDict(null)), 'sma');
+  eq('v9.1 workflow: tracker without binding falls back to segment', L.resolveWorkflowKey({ workflow_key: null }, 'utility', L.segmentDict(null)), 'utility');
+
+  /* #3 requiresPhoto — source-based, not role-based */
+  eq('v9.1 photo required for customer_feedback', L.requiresPhoto('customer_feedback'), true);
+  eq('v9.1 photo not required for email', L.requiresPhoto('email'), false);
+  eq('v9.1 photo not required when empty', L.requiresPhoto(''), false);
+
+  /* #7 monthlyPlanDates takes any year */
+  eq('v9.1 monthlyPlanDates other year', L.monthlyPlanDates(2027)[0], '2027-01-01');
+  eq('v9.1 monthlyPlanDates 2027 last', L.monthlyPlanDates(2027)[11], '2027-12-01');
+
+  /* #11 validateIssueQty */
+  eq('v9.1 issue ok within stock', L.validateIssueQty(3, 8), null);
+  eq('v9.1 issue exact stock ok', L.validateIssueQty(8, 8), null);
+  eq('v9.1 issue over stock', L.validateIssueQty(9, 8), 'over');
+  eq('v9.1 issue zero invalid', L.validateIssueQty(0, 8), 'invalid');
+  eq('v9.1 issue negative invalid', L.validateIssueQty(-2, 8), 'invalid');
+  eq('v9.1 issue unknown stock allowed', L.validateIssueQty(5, null), null);
+
+  /* #5 paginate */
+  eq('v9.1 paginate first page', L.paginate(43, 0, 20), { pages: 3, page: 0, offset: 0, hasPrev: false, hasNext: true });
+  eq('v9.1 paginate last page', L.paginate(43, 2, 20), { pages: 3, page: 2, offset: 40, hasPrev: true, hasNext: false });
+  eq('v9.1 paginate clamps high page', L.paginate(43, 9, 20), { pages: 3, page: 2, offset: 40, hasPrev: true, hasNext: false });
+  eq('v9.1 paginate empty list', L.paginate(0, 0, 20), { pages: 1, page: 0, offset: 0, hasPrev: false, hasNext: false });
+  eq('v9.1 paginate exact multiple', L.paginate(40, 1, 20), { pages: 2, page: 1, offset: 20, hasPrev: true, hasNext: false });
+
+  /* #18 planCellDimmed */
+  eq('v9.1 dim none selected', L.planCellDimmed({ hasShift: true, shiftSiteId: 'A', selectedSiteId: '' }), false);
+  eq('v9.1 dim shift same project', L.planCellDimmed({ hasShift: true, shiftSiteId: 'A', selectedSiteId: 'A' }), false);
+  eq('v9.1 dim shift other project', L.planCellDimmed({ hasShift: true, shiftSiteId: 'A', selectedSiteId: 'B' }), true);
+  eq('v9.1 dim remote shift legacy', L.planCellDimmed({ hasShift: true, shiftSiteId: null, selectedSiteId: 'B' }), true);
+  eq('v9.1 dim shift covered keeps', L.planCellDimmed({ hasShift: true, shiftSiteId: 'A', coveredSiteIds: ['B'], selectedSiteId: 'B' }), false);
+  eq('v9.1 dim shift null site but field ticket selected', L.planCellDimmed({ hasShift: true, shiftSiteId: null, fieldSiteId: 'B', selectedSiteId: 'B' }), false);
+  eq('v9.1 dim shift null site but field ticket other', L.planCellDimmed({ hasShift: true, shiftSiteId: null, fieldSiteId: 'A', selectedSiteId: 'B' }), true);
+  eq('v9.1 dim field-only cell other project', L.planCellDimmed({ hasShift: false, fieldSiteId: 'A', selectedSiteId: 'B' }), true);
+  eq('v9.1 dim field-only cell same project', L.planCellDimmed({ hasShift: false, fieldSiteId: 'B', selectedSiteId: 'B' }), false);
+  eq('v9.1 dim empty cell never', L.planCellDimmed({ hasShift: false, fieldSiteId: null, selectedSiteId: 'B' }), false);
+})();
+
+/* ------------------------------------------------------------------ */
 console.log(`\nlogic.test.js: ${pass} passed, ${fail} failed`);
 if (fail) { console.log('Failed:', failures.join(' | ')); process.exit(1); }
