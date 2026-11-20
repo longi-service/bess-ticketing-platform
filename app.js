@@ -7405,14 +7405,20 @@
       };
     }
     el.querySelectorAll('[data-return]').forEach(function (b) {
-      b.onclick = async function () {
-        if (!window.confirm(t('parts.returnConfirm'))) return;
-        try {
-          var r = await sb.rpc('return_spare_part', { p_transaction_id: b.getAttribute('data-return') });
-          if (r.error) throw r.error;
-          toast(t('parts.returned'), 'ok');
-          render();
-        } catch (e) { apiError(e); }
+      b.onclick = function () {
+        /* v9.2.2: window.confirm blocks the JS thread and hangs in
+           automated browsers (same as v9.1 #6, v9.2.1) — use the in-app modal. */
+        var closeCf = openModal(t('detail.parts.return'), t('parts.returnConfirm'),
+          '<button class="btn" id="m-cancel">' + esc(t('common.cancel')) + '</button>' +
+          '<button class="btn btn-primary" id="m-ok">' + esc(t('common.confirm')) + '</button>');
+        document.getElementById('m-cancel').onclick = closeCf;
+        document.getElementById('m-ok').onclick = async function () {
+          try {
+            var r = await sb.rpc('return_spare_part', { p_transaction_id: b.getAttribute('data-return') });
+            if (r.error) throw r.error;
+            closeCf(); toast(t('parts.returned'), 'ok'); render();
+          } catch (e) { closeCf(); apiError(e); }
+        };
       };
     });
   }
